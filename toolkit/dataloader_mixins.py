@@ -2516,13 +2516,16 @@ class TextEmbeddingFileItemDTOMixin:
     def load_prompt_embedding(self, device=None):
         if not self.is_text_embedding_cached:
             return
+        # dataset_config can be absent on a bare mixin (unit tests construct the
+        # mixin directly); treat that as "no dropout / no DOP".
+        dataset_config = getattr(self, 'dataset_config', None)
         if self.prompt_embeds is None:
             te_path = self.get_text_embedding_path()
             self._caption_was_dropped = False
-            if self.dataset_config.caption_dropout_rate > 0:
+            if dataset_config is not None and dataset_config.caption_dropout_rate > 0:
                 # get a random float form 0 to 1
                 rand = random.random()
-                if rand < self.dataset_config.caption_dropout_rate:
+                if rand < dataset_config.caption_dropout_rate:
                     # drop the caption by using the cached blank embedding
                     te_path = self.get_blank_text_embedding_path()
                     self._caption_was_dropped = True
@@ -2534,7 +2537,7 @@ class TextEmbeddingFileItemDTOMixin:
                 'text embedding',
             )
             self._loaded_text_embedding_path = te_path
-        if self.dataset_config.diff_output_preservation and self.dop_prompt_embeds is None:
+        if dataset_config is not None and dataset_config.diff_output_preservation and self.dop_prompt_embeds is None:
             if self._caption_was_dropped:
                 # match live encoding, which builds the DOP caption from the
                 # dropped caption (trigger word replaced with the class)

@@ -43,7 +43,9 @@ def _run_test(name, fn):
 # ---------------------------------------------------------------------------
 
 def test_safetensor_error_module_unmasked():
-    assert SafetensorError.__module__ == 'safetensors', SafetensorError.__module__
+    # newer safetensors exposes the class from the rust submodule; both are
+    # picklable, which is what this probe actually protects
+    assert SafetensorError.__module__ in ('safetensors', 'safetensors._safetensors_rust'), SafetensorError.__module__
 
 
 def test_safetensor_error_class_and_instance_pickle():
