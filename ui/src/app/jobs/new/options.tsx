@@ -179,7 +179,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'chroma',
     label: 'Chroma 1 Base',
-    group: 'experimental',
+    group: 'image',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['lodestones/Chroma1-Base', defaultNameOrPath],
@@ -195,7 +195,7 @@ export const modelArchs: ModelArch[] = [
     // config_modules), just defaults to the Chroma1-HD checkpoint.
     name: 'chroma:hd',
     label: 'Chroma 1 HD',
-    group: 'experimental',
+    group: 'image',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['lodestones/Chroma1-HD', defaultNameOrPath],
@@ -209,7 +209,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'chroma_radiance',
     label: 'Chroma Radiance',
-    group: 'experimental',
+    group: 'image',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['lodestones/Chroma1-Radiance/latest_x0.safetensors', defaultNameOrPath],
@@ -713,7 +713,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'zimage',
     label: 'Z-Image',
-    group: 'experimental',
+    group: 'image',
     defaults: {
       // default updates when [selected, unselected] in the UI
       'config.process[0].model.name_or_path': ['Tongyi-MAI/Z-Image', defaultNameOrPath],
@@ -1155,7 +1155,7 @@ export const modelArchs: ModelArch[] = [
   {
     name: 'ltx2.3',
     label: 'LTX-2.3 (22B)',
-    group: 'experimental',
+    group: 'video',
     isVideoModel: true,
     defaults: {
       // default updates when [selected, unselected] in the UI
@@ -1734,36 +1734,67 @@ export const modelArchs: ModelArch[] = [
   return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' });
 }) as any;
 
-// Models exposed in the UI selector (split across the supported + experimental groups)
-const enabledModelNames = new Set([
-  'sdxl',
-  'flux2_klein_9b',
-  'zimage',
-  'zimage:turbo',
-  'ltx2.3',
+// Archs whose latent space is fully plumbed into the fork's perceptual
+// pipeline (perceptor x0 decode + anchors). Derived from SDTrainer's decode
+// dispatch — keep in sync with _perceptual_decode_family in
+// extensions_built_in/sd_trainer/SDTrainer.py. Used ONLY to derive the
+// "perceptual-enhanced" selector group; nothing is hidden.
+const PERCEPTUAL_ENHANCED = new Set([
+  // TAEF1 family (Flux VAE, 16ch)
+  'flux',
+  'flux_kontext',
+  'flex1',
+  'flex2',
   'chroma',
   'chroma:hd',
+  'zimage',
+  'zimage:turbo',
+  'zimage:deturbo',
+  // TAEF2 family (Flux2 VAE, 32ch)
+  'flux2',
+  'flux2_klein_4b',
+  'flux2_klein_9b',
+  'ernie_image',
+  // classic SD latents
+  'sdxl',
+  'sd15',
+  // pixel-space (no VAE)
   'chroma_radiance',
+  'zeta_chroma',
+  'prx_pixel',
+  'zimage_l2p',
+  // 5D video latents with a TAEHV tiny decoder (wan22_5b excluded: new 48ch
+  // 16x VAE has no tiny decoder yet)
+  'ltx2',
+  'ltx2.3',
+  'ltx2.5',
+  'wan21:1b',
+  'wan21:14b',
+  'wan21_i2v:14b480p',
+  'wan21_i2v:14b',
+  'wan22_14b:t2v',
+  'wan22_14b_i2v',
 ]);
 
 export const groupedModelOptions: GroupedSelectOption[] = modelArchs
-  .filter(arch => enabledModelNames.has(arch.name))
   .reduce((acc, arch) => {
-    const group = acc.find(g => g.label === arch.group);
+    // Split into "perceptual-enhanced" (full fork-feature support) vs the
+    // model's modality group. Every model is shown; this only affects grouping.
+    const groupLabel = PERCEPTUAL_ENHANCED.has(arch.name) ? 'perceptual-enhanced' : arch.group;
+    const group = acc.find(g => g.label === groupLabel);
     if (group) {
       group.options.push({ value: arch.name, label: arch.label });
     } else {
       acc.push({
-        label: arch.group,
+        label: groupLabel,
         options: [{ value: arch.name, label: arch.label }],
       });
     }
     return acc;
   }, [] as GroupedSelectOption[])
-  // Render groups in a stable order (supported image models first, experimental
-  // last) instead of by whichever group label happens to sort first.
+  // Stable group order: perceptual-enhanced first, then modality groups.
   .sort((a, b) => {
-    const order = ['image', 'instruction', 'video', 'audio', 'experimental'];
+    const order = ['perceptual-enhanced', 'image', 'instruction', 'video', 'audio', 'experimental'];
     return order.indexOf(a.label) - order.indexOf(b.label);
   });
 
