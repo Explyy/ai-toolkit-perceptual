@@ -1,10 +1,12 @@
 'use client';
 
-import { useMemo, use } from 'react';
+import { useMemo, useState, use } from 'react';
 import { FaChevronLeft } from 'react-icons/fa';
+import { MdDashboard, MdImage, MdShowChart, MdCode, MdExtension } from 'react-icons/md';
 import { Button } from '@headlessui/react';
 import { TopBar, MainContent } from '@/components/layout';
 import useJob from '@/hooks/useJob';
+import usePollLoop from '@/hooks/usePollLoop';
 import SampleImages, { SampleImagesMenu } from '@/components/SampleImages';
 import JobOverview from '@/components/JobOverview';
 import { redirect, useRouter, useSearchParams } from 'next/navigation';
@@ -16,32 +18,59 @@ import DepthPreviews from '@/components/DepthPreviews';
 import IdentityPreviews from '@/components/IdentityPreviews';
 import useDepthPreviews from '@/hooks/useDepthPreviews';
 import useIdentityPreviews from '@/hooks/useIdentityPreviews';
+import JobLossGraph from '@/components/JobLossGraph';
+import JobPlugin from '@/components/JobPlugin';
 import { Job } from '@prisma/client';
+import { apiClient } from '@/utils/api';
 
-type PageKey = 'overview' | 'samples' | 'depth_previews' | 'identity_previews' | 'config' | 'metrics' | 'metrics_compare';
-const PAGE_KEYS = new Set<PageKey>(['overview', 'samples', 'depth_previews', 'identity_previews', 'config', 'metrics', 'metrics_compare']);
+type PageKey =
+  | 'overview'
+  | 'samples'
+  | 'depth_previews'
+  | 'identity_previews'
+  | 'config'
+  | 'metrics'
+  | 'metrics_compare'
+  | 'loss_log'
+  | 'plugin';
+const PAGE_KEYS = new Set<PageKey>([
+  'overview',
+  'samples',
+  'depth_previews',
+  'identity_previews',
+  'config',
+  'metrics',
+  'metrics_compare',
+  'loss_log',
+  'plugin',
+]);
 
 interface Page {
   name: string;
   value: PageKey;
+  icon?: React.ComponentType<{ className?: string }>;
   component: React.ComponentType<{ job: Job }>;
   menuItem?: React.ComponentType<{ job?: Job | null }> | null;
   mainCss?: string;
+  jobTypes?: string[]; // if specified, only show this page for these job types
 }
 
 const pages: Page[] = [
   {
     name: 'Overview',
     value: 'overview',
+    icon: MdDashboard,
     component: JobOverview,
     mainCss: 'pt-24',
   },
   {
     name: 'Samples',
     value: 'samples',
+    icon: MdImage,
     component: SampleImages,
     menuItem: SampleImagesMenu,
     mainCss: 'pt-24',
+    jobTypes: ['train'],
   },
   {
     name: 'Depth Previews',
@@ -71,9 +100,25 @@ const pages: Page[] = [
     mainCss: 'pt-24',
   },
   {
+    name: 'Loss Graph',
+    value: 'loss_log',
+    icon: MdShowChart,
+    component: JobLossGraph,
+    mainCss: 'pt-24 pb-4',
+    jobTypes: ['train'],
+  },
+  {
     name: 'Config File',
     value: 'config',
+    icon: MdCode,
     component: JobConfigViewer,
+    mainCss: 'pt-[80px] px-0 pb-0',
+  },
+  {
+    name: 'Plugin',
+    value: 'plugin',
+    icon: MdExtension,
+    component: JobPlugin,
     mainCss: 'pt-[80px] px-0 pb-0',
   },
 ];
@@ -90,6 +135,19 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
   // instead of flashing its own loading state.
   const depth = useDepthPreviews(jobID, 5000);
   const identity = useIdentityPreviews(jobID, 5000);
+  const [hasPlugin, setHasPlugin] = useState(false);
+
+  // poll for plugin.html in the job folder; show the Plugin tab if it exists
+  usePollLoop(
+    () =>
+      apiClient
+        .get(`/api/jobs/${jobID}/plugin?check=1`)
+        .then(res => res.data)
+        .then(data => setHasPlugin(!!data.exists))
+        .catch(() => {}),
+    5000,
+    [jobID],
+  );
 
   // Tab selection lives in the URL (`?tab=…`) so refresh + tab-switch-and-return
   // both preserve it, and the URL is shareable. Per-tab interior state (filters,
@@ -107,14 +165,17 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
 
   // Content-gated tabs: hide Depth/Identity Previews until their folder has at
   // least one file. Every other tab is always shown.
+  const jobTypeForTabs = job?.job_type || 'unknown';
   const visiblePages = useMemo(
     () =>
       pages.filter(p => {
+        if (p.jobTypes && !p.jobTypes.includes(jobTypeForTabs)) return false;
         if (p.value === 'depth_previews') return depth.previews.length > 0;
         if (p.value === 'identity_previews') return identity.previews.length > 0;
+        if (p.value === 'plugin') return hasPlugin;
         return true;
       }),
-    [depth.previews.length, identity.previews.length],
+    [depth.previews.length, identity.previews.length, hasPlugin, jobTypeForTabs],
   );
   // If the previously selected tab no longer applies (e.g. a preview tab whose
   // folder is still empty, or whose files were removed), bounce to the first
@@ -122,17 +183,24 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
   const page = visiblePages.find(p => p.value === pageKey) ?? visiblePages[0];
   const effectivePageKey = page?.value ?? 'overview';
 
+  const jobType = job?.job_type || 'unknown';
+
+  let title = `Job: ${job?.name || 'Loading...'}`;
+  if (jobType === 'caption') {
+    title = `Captioning: ${job?.job_ref || 'Loading...'}`;
+  }
+
   return (
     <>
       {/* Fixed top bar */}
       <TopBar>
-        <div>
-          <Button className="text-gray-500 dark:text-gray-300 px-3 mt-1" onClick={() => redirect('/jobs')}>
+        <div className="flex-shrink-0">
+          <Button className="text-gray-500 dark:text-gray-300 pl-0 pr-1 sm:px-3 mt-1" onClick={() => redirect('/jobs')}>
             <FaChevronLeft />
           </Button>
         </div>
-        <div>
-          <h1 className="text-lg">Job: {job?.name}</h1>
+        <div className="min-w-0 flex-shrink">
+          <h1 className="text-base sm:text-lg truncate">{title}</h1>
         </div>
         <div className="flex-1"></div>
         {job && (
@@ -179,19 +247,20 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
           </>
         )}
       </MainContent>
-      <div className="bg-gray-800 absolute top-12 left-0 w-full h-8 flex items-center px-2 text-sm">
+      <div className="bg-gray-800 absolute top-12 left-0 w-full h-8 flex items-center px-0 sm:px-2 text-sm sm:overflow-x-auto whitespace-nowrap">
         {visiblePages.map(p => (
           <Button
             key={p.value}
             onClick={() => setPageKey(p.value)}
-            className={`px-4 py-1 h-8  ${p.value === effectivePageKey ? 'bg-gray-300 dark:bg-gray-700' : ''}`}
+            className={`flex-1 sm:flex-initial justify-center px-2 sm:px-4 py-1 h-8 flex items-center gap-1.5 sm:flex-shrink-0 ${p.value === effectivePageKey ? 'bg-gray-300 dark:bg-gray-700 text-white' : ''}`}
           >
-            {p.name}
+            {p.icon && <p.icon className="text-sm" />}
+            <span className={p.icon ? 'hidden sm:inline' : ''}>{p.name}</span>
           </Button>
         ))}
         {page?.menuItem && (
           <>
-            <div className="flex-grow"></div>
+            <div className="hidden sm:block flex-grow"></div>
             <page.menuItem job={job} />
           </>
         )}

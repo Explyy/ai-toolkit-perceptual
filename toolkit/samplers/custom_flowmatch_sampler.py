@@ -81,7 +81,7 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 device=timesteps.device,
                 dtype=timesteps.dtype
             )
-        if v2:
+        elif v2:
             weights = self.linear_timesteps_weights2[step_indices].flatten()
         elif timestep_type == "weighted_low":
             # Half-bell peaked at the low-t end of the schedule.

@@ -637,6 +637,67 @@ This extension is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), a
 
 
 
+## Supported Models
+
+### Image
+- [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) (FLUX.1)
+- [black-forest-labs/FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) (FLUX.2)
+- [black-forest-labs/FLUX.2-klein-base-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B) (FLUX.2-klein-base-4B)
+- [black-forest-labs/FLUX.2-klein-base-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) (FLUX.2-klein-base-9B)
+- [ostris/Flex.1-alpha](https://huggingface.co/ostris/Flex.1-alpha) (Flex.1)
+- [ostris/Flex.2-preview](https://huggingface.co/ostris/Flex.2-preview) (Flex.2)
+- [lodestones/Chroma1-Base](https://huggingface.co/lodestones/Chroma1-Base) (Chroma)
+- [Alpha-VLLM/Lumina-Image-2.0](https://huggingface.co/Alpha-VLLM/Lumina-Image-2.0) (Lumina2)
+- [Qwen/Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) (Qwen-Image)
+- [Qwen/Qwen-Image-2512](https://huggingface.co/Qwen/Qwen-Image-2512) (Qwen-Image-2512)
+- [HiDream-ai/HiDream-I1-Full](https://huggingface.co/HiDream-ai/HiDream-I1-Full) (HiDream I1)
+- [OmniGen2/OmniGen2](https://huggingface.co/OmniGen2/OmniGen2) (OmniGen2)
+- [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) (Z-Image Turbo)
+- [Tongyi-MAI/Z-Image](https://huggingface.co/Tongyi-MAI/Z-Image) (Z-Image)
+- [ostris/Z-Image-De-Turbo](https://huggingface.co/ostris/Z-Image-De-Turbo) (Z-Image De-Turbo)
+- [zhen-nan/L2P](https://huggingface.co/zhen-nan/L2P) (Z-Image L2P)
+- [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) (SDXL)
+- [stable-diffusion-v1-5/stable-diffusion-v1-5](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) (SD 1.5)
+- [baidu/ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) (ERNIE-Image)
+- [NucleusAI/Nucleus-Image](https://huggingface.co/NucleusAI/Nucleus-Image) (Nucleus-Image)
+- [Boogu/Boogu-Image-0.1-Base](https://huggingface.co/Boogu/Boogu-Image-0.1-Base) (Boogu Image 0.1)
+- [HiDream-ai/HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image) (HiDream O1)
+- [ideogram-ai/ideogram-4-fp8](https://huggingface.co/ideogram-ai/ideogram-4-fp8) (Ideogram 4 FP8)
+- [Photoroom/prxpixel-t2i](https://huggingface.co/Photoroom/prxpixel-t2i) (PRXPixel)
+- [circlestone-labs/Anima-Base-v1.0-Diffusers](https://huggingface.co/circlestone-labs/Anima-Base-v1.0-Diffusers) (Anima)
+- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2)
+- [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo)
+- [microsoft/Mage-Flow-Base](https://huggingface.co/microsoft/Mage-Flow-Base) (Mage-Flow)
+
+### Instruction / Edit
+- [black-forest-labs/FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) (FLUX.1-Kontext-dev)
+- [Qwen/Qwen-Image-Edit](https://huggingface.co/Qwen/Qwen-Image-Edit) (Qwen-Image-Edit)
+- [Qwen/Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) (Qwen-Image-Edit-2509)
+- [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) (Qwen-Image-Edit-2511)
+- [HiDream-ai/HiDream-E1-1](https://huggingface.co/HiDream-ai/HiDream-E1-1) (HiDream E1)
+- [Boogu/Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit) (Boogu Image Edit)
+- [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2 Edit Training)
+- [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo Edit Training)
+- [microsoft/Mage-Flow-Edit-Base](https://huggingface.co/microsoft/Mage-Flow-Edit-Base) (Mage-Flow Edit)
+
+### Video
+- [Wan-AI/Wan2.1-T2V-1.3B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) (Wan 2.1 1.3B)
+- [Wan-AI/Wan2.1-I2V-14B-480P-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers) (Wan 2.1 I2V 14B-480P)
+- [Wan-AI/Wan2.1-I2V-14B-720P-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P-Diffusers) (Wan 2.1 I2V 14B-720P)
+- [Wan-AI/Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) (Wan 2.1 14B)
+- [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) (Wan 2.2 14B)
+- [Wan-AI/Wan2.2-I2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers) (Wan 2.2 I2V 14B)
+- [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) (Wan 2.2 TI2V 5B)
+- [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) (LTX-2)
+- [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) (LTX-2.3)
+- [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (MiniMaxAI/MiniMax-H3)
+
+### Audio
+- [ACE-Step/Ace-Step1.5](https://huggingface.co/ACE-Step/Ace-Step1.5) (Ace Step 1.5)
+- [ACE-Step/acestep-v15-xl-base](https://huggingface.co/ACE-Step/acestep-v15-xl-base) (Ace Step 1.5 XL)
+
+### Experimental
+- [lodestones/Zeta-Chroma](https://huggingface.co/lodestones/Zeta-Chroma) (Zeta Chroma)
 
 ## Installation
 
@@ -650,6 +711,62 @@ Requirements:
 - Python 3.12 (3.10 and 3.11 are fine too). Don't use 3.13 or newer yet, see the note below.
 - Nvidia GPU with enough VRAM for what you're training
 - Python venv
+
+### Install with the AI Toolkit Manager (experimental)
+
+The recommended way to install and run AI Toolkit is with the **AI Toolkit
+Manager**, built into this repo. The manager detects your hardware and sets up
+the right PyTorch build, creates the python environment, and grabs local copies
+of Node.js and FFmpeg — everything stays inside the ai-toolkit folder, nothing
+is installed system-wide. On every launch the manager checks for updates and
+applies them (your local changes are never overwritten — if you have modified
+files, the update is skipped with a warning), then starts the UI at
+`http://localhost:8675`.
+
+The manager is still **experimental** — please let me know if you have any
+issues with it. The manual instructions below still work if you prefer them
+or run into problems.
+
+The only requirement is **git** (on Windows the manager can even fetch a
+portable git for updates, but you need one installed to clone the repo first).
+
+```bash
+git clone https://github.com/ostris/ai-toolkit.git
+cd ai-toolkit
+```
+
+Then start the manager with the script for your platform:
+
+Linux:
+```bash
+chmod +x run_linux.sh
+./run_linux.sh
+```
+
+MacOS (Apple Silicon, experimental):
+```bash
+chmod +x run_mac.zsh
+./run_mac.zsh
+```
+
+Windows: double-click `run_windows.bat` (or run it from a terminal).
+
+You can also use the manager directly from a terminal (handy on headless
+servers):
+
+```bash
+python3 -m manager install   # first-time setup
+python3 -m manager update    # pull updates + sync dependencies
+python3 -m manager launch    # start the UI
+python3 -m manager doctor    # diagnose problems
+```
+
+### Manual installation
+
+Requirements:
+- python >=3.10 (3.12 recommended)
+- Nvidia GPU with enough ram to do what you need
+- python venv
 - git
 
 **Heads up on Python 3.13:** a few of the native dependencies (insightface, onnxruntime, torchcodec) don't ship wheels for 3.13 yet, especially on Windows. If you build your venv with 3.13 the install ends up broken and the trainer dies during startup before it can even write a log file, so from the UI it just looks like the job is stuck on "starting" forever with no error in the log. Use 3.12 and you'll be fine.
@@ -668,7 +785,7 @@ cd ai-toolkit-perceptual
 python3 -m venv venv
 source venv/bin/activate
 # install torch first
-pip3 install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
+pip3 install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip3 install -r requirements.txt
 ```
 
@@ -678,7 +795,7 @@ git clone https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual.
 cd ai-toolkit-perceptual
 python -m venv venv
 .\venv\Scripts\activate
-pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
+pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
 ```
 
@@ -703,4 +820,19 @@ npm run build_and_start
 This installs the UI's Node dependencies, initializes its database, builds, and serves the app at **http://localhost:8675** (requires Node.js 18+). The first run does the full build; afterwards `npm run start` restarts it without rebuilding.
 
 > Using the RunPod template? The UI is already running, so just open port **8675** from the pod's **Connect** menu.
+
+If you are hosting the UI on a cloud provider or any network that is not secure, I highly recommend securing it with an auth token. 
+You can do this by setting the environment variable `AI_TOOLKIT_AUTH` to super secure password. This token will be required to access
+the UI. You can set this when starting the UI like so:
+
+```bash
+# Linux
+AI_TOOLKIT_AUTH=super_secure_password npm run build_and_start
+
+# Windows
+set AI_TOOLKIT_AUTH=super_secure_password && npm run build_and_start
+
+# Windows Powershell
+$env:AI_TOOLKIT_AUTH="super_secure_password"; npm run build_and_start
+```
 

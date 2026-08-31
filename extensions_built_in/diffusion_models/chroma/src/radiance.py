@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from toolkit.models.v2._mixin import OstrisModelMixin
 
 import torch
 from torch import Tensor, nn
@@ -101,10 +103,46 @@ def modify_mask_to_attend_padding(mask, max_seq_length, num_extra_padding=8):
     return modified_mask
 
 
-class Chroma(nn.Module):
+class Chroma(nn.Module, OstrisModelMixin):
     """
     Transformer model for flow matching on sequences.
     """
+
+    @classmethod
+    def aitk_config_from_state_dict(cls, state_dict):
+        # block counts come from the checkpoint's key indices
+        double_blocks = 0
+        single_blocks = 0
+        for key in state_dict.keys():
+            if "double_blocks" in key:
+                block_num = int(key.split(".")[1]) + 1
+                if block_num > double_blocks:
+                    double_blocks = block_num
+            elif "single_blocks" in key:
+                block_num = int(key.split(".")[1]) + 1
+                if block_num > single_blocks:
+                    single_blocks = block_num
+        print(f"Double Blocks: {double_blocks}")
+        print(f"Single Blocks: {single_blocks}")
+        # Chroma1-Radiance "latest_x0*" checkpoints carry a zero-size "__x0__"
+        # marker flagging an x0-prediction checkpoint. Configure the transformer
+        # to register a matching __x0__ buffer (so the key loads) and to convert
+        # its x0 output to flow velocity in forward(). Mirrors Zeta-Chroma.
+        return replace(
+            chroma_params,
+            depth=double_blocks,
+            depth_single_blocks=single_blocks,
+            use_x0="__x0__" in state_dict,
+        )
+
+    @classmethod
+    def aitk_from_config(cls, config):
+        with torch.device("meta"):
+            return cls(config)
+
+    @classmethod
+    def get_transformer_block_names(cls):
+        return ["double_blocks", "single_blocks"]
 
     def __init__(self, params: ChromaParams):
         super().__init__()

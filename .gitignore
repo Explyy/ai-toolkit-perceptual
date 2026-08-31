@@ -122,6 +122,11 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.python
+.node
+.ffmpeg
+.mingit
+.uv
 env/
 venv/
 ENV/
@@ -180,11 +185,14 @@ cython_debug/
 .DS_Store
 ._.DS_Store
 aitk_db.db
+aitk_db.db-wal
+aitk_db.db-shm
 /notes.md
 /data
 
 # Session-local / scratchpad
 /.claude/
+.claude
 /style_clustering/
 /timestep_curves/
 /timestep_distributions/
@@ -198,3 +206,6 @@ aitk_db.db
 
 # playwright-cli scratch (snapshots, console/request logs)
 /.playwright-cli/
+original_repo
+.next
+testing/.model_test_outputs
