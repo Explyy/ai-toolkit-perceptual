@@ -847,6 +847,9 @@ const docs: { [key: string]: ConfigDoc } = {
         Trades a small amount of compute for a large VRAM reduction during backward through DA2. Keep this
         on unless you have verified extra VRAM to spare — roughly 3× activation memory savings at a ~20–30%
         fwd+bwd time cost on the perceptor.
+      </>
+    ),
+  },
   'datasets.auto_frame_count': {
     title: 'Auto Frame Count',
     description: (
