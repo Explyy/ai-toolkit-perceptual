@@ -787,6 +787,118 @@ class SDTrainer(BaseSDTrainProcess):
             lat = cfg.get('latent_channels', None)
         return lat == 3
 
+    def _vae_latent_channels(self):
+        """Best-effort latent channel count of the model VAE (None if unknown)."""
+        vae = getattr(self.sd, 'vae', None)
+        if vae is None:
+            return None
+        cfg = getattr(vae, 'config', None)
+        if cfg is not None:
+            lat = getattr(cfg, 'latent_channels', None)
+            if lat is None and hasattr(cfg, 'get'):
+                lat = cfg.get('latent_channels', None)
+            if lat is not None:
+                return lat
+        if hasattr(vae, 'params'):
+            return getattr(vae.params, 'z_channels', None)
+        return None
+
+    def _perceptual_decode_family(self):
+        """Classify the model's latent space for the perceptor x0 -> pixels
+        decode. Mirrors the tiny-decoder dispatch in hook_before_train_loop —
+        keep the two in sync (and the PERCEPTUAL_ENHANCED set in
+        ui/src/app/jobs/new/options.tsx).
+
+        Returns one of:
+          'pixel'    — FakeVAE / pixel-space (x0 already is the image)
+          'video5d'  — LTX-2/2.3/2.5 or Wan 2.1 / Wan 2.2-14B (TAEHV decoders)
+          'taef2'    — Flux2 VAE (32-ch)
+          'taef1'    — Flux-family VAE (flux/flex/zimage/chroma)
+          'taesdxl'  — SDXL
+          'taesd'    — classic SD 4-ch latents
+          None       — no decoder exists for this latent space
+        """
+        arch = (getattr(self.sd.model_config, 'arch', '') or '')
+        if self._is_pixel_space_vae():
+            return 'pixel'
+        if arch == 'wan22_5b':
+            # Wan 2.2 5B uses the new 48-ch / 16x VAE; the TAEHV wan21 tiny
+            # decoder does NOT match its latent space. No decoder available.
+            return None
+        if arch.startswith(('ltx', 'wan')):
+            return 'video5d'
+        vae_channels = self._vae_latent_channels()
+        if vae_channels == 32:
+            return 'taef2'
+        if (
+            getattr(self.sd, 'is_flux', False)
+            or 'flex' in arch
+            or arch in ('zimage', 'chroma')
+        ):
+            return 'taef1'
+        if getattr(self.model_config, 'is_xl', False):
+            return 'taesdxl'
+        if vae_channels == 4:
+            return 'taesd'
+        return None
+
+    def _validate_perceptual_model_support(
+        self,
+        need_x0_decode: bool,
+        face_conditioning: bool,
+        region_weighting: bool,
+    ):
+        """Fail fast, with a clear message, when a perceptual feature is enabled
+        on a model whose latent space it was never wired for — instead of
+        loading a mismatched tiny decoder (silently wrong losses) or crashing
+        mid-train on a shape error.
+
+        Model-agnostic features are never gated here: weight_noise,
+        gradient_noise, and depth_as_control work on every arch.
+        """
+        arch = (getattr(self.sd.model_config, 'arch', '') or '')
+        family = self._perceptual_decode_family()
+
+        if face_conditioning and arch not in ('flux2', 'flux2_klein_4b', 'flux2_klein_9b'):
+            raise ValueError(
+                f"face_id.enabled (identity token conditioning) is only wired into the "
+                f"FLUX.2 family (flux2, flux2_klein_4b, flux2_klein_9b); model arch "
+                f"'{arch}' does not accept face_tokens and would silently ignore them. "
+                f"Disable face_id.enabled for this model (the identity/depth LOSS anchors "
+                f"are configured separately and stay available on supported latent spaces)."
+            )
+
+        if need_x0_decode and family is None:
+            ch = self._vae_latent_channels()
+            raise ValueError(
+                f"Perceptual anchor losses (identity/landmark/body/normal/vae-anchor/"
+                f"depth-consistency) are enabled, but model arch '{arch}' "
+                f"(VAE latent channels: {ch}) has no perceptor decode path: no tiny "
+                f"decoder is wired for its latent space, so the losses cannot see "
+                f"pixels and would be silently wrong or crash. Supported latent "
+                f"families: SD (4ch), SDXL, Flux/Flex/Z-Image/Chroma (TAEF1), FLUX.2 "
+                f"(TAEF2), pixel-space models, and LTX-2/Wan video latents. Disable the "
+                f"perceptual anchors for this model, or train it with only the "
+                f"model-agnostic features (weight_noise, gradient_noise, "
+                f"depth_as_control, auto-masking datasets as plain control inputs)."
+            )
+
+        if region_weighting and (family == 'video5d' or arch.startswith(('ltx', 'wan'))):
+            raise ValueError(
+                f"subject_mask region loss weighting and face_suppression build 4D "
+                f"(B,C,H,W) latent weight maps and are not implemented for the 5D "
+                f"video latents of arch '{arch}'. Disable subject_mask / "
+                f"face_suppression_weight for this model."
+            )
+
+        if need_x0_decode and arch == 'ltx2.5':
+            print_acc(
+                "WARNING: perceptual losses on LTX-2.5 decode x0 with the LTX-2.3 "
+                "TAEHV tiny decoder (2.5 keeps the 2.3 transformer/latent layout, "
+                "but its default VAE file is new). Validate visually on a GPU run "
+                "before trusting the anchors."
+            )
+
     def _get_video_x0_frames(self, noise_pred, noisy_latents, timesteps, needs_grad):
         """Decode the x0 prediction to ``(B, 3, T, H, W)`` pixel frames in [0, 1].
 
@@ -1219,6 +1331,36 @@ class SDTrainer(BaseSDTrainProcess):
         # → single-frame-video routing (below + in the depth block) on this.
         # Image-latent models (SD/SDXL/Flux/Flux2) keep the unchanged 4D path.
         _vae_wants_5d = (getattr(self.sd.model_config, 'arch', '') or '').startswith(('ltx', 'wan'))
+
+        # ---- Perceptual-feature / model compatibility gate (fail fast) ----
+        _decode_needs = (
+            (self.face_id_config is not None and (
+                self.face_id_config.identity_loss_weight > 0
+                or self.face_id_config.landmark_loss_weight > 0
+                or self.face_id_config.body_proportion_loss_weight > 0
+                or self.face_id_config.body_shape_loss_weight > 0
+                or self.face_id_config.normal_loss_weight > 0
+                or self.face_id_config.identity_metrics
+            ))
+            or _vae_anchor_enabled
+            or _ds_identity or _ds_landmark or _ds_body_prop
+            or _ds_body_shape or _ds_normal
+            or (self.depth_consistency_config is not None and (
+                self.depth_consistency_config.loss_weight > 0
+                or self.depth_consistency_config.preview_only
+            ))
+            or _ds_depth
+        )
+        self._validate_perceptual_model_support(
+            need_x0_decode=bool(_decode_needs),
+            face_conditioning=bool(
+                self.face_id_config is not None and self.face_id_config.enabled
+            ),
+            region_weighting=bool(
+                (self.subject_mask_config is not None and self.subject_mask_config.enabled)
+                or _any_face_suppression
+            ),
+        )
 
         # LoRA+ID: cache face embeddings for all datasets
         # Run if face conditioning is enabled OR identity loss is enabled OR landmark loss is enabled OR face suppression is active
@@ -1715,13 +1857,24 @@ class SDTrainer(BaseSDTrainProcess):
                 self.taesd.to(dtype=get_torch_dtype(self.train_config.dtype), device=self.device_torch)
                 self.taesd.eval()
                 self.taesd.requires_grad_(False)
-            else:
+            elif vae_channels == 4:
                 print_acc("  Loading TAESD (madebyollin/taesd) for face losses...")
                 self.taesd = AutoencoderTiny.from_pretrained(
                     "madebyollin/taesd", torch_dtype=get_torch_dtype(self.train_config.dtype))
                 self.taesd.to(dtype=get_torch_dtype(self.train_config.dtype), device=self.device_torch)
                 self.taesd.eval()
                 self.taesd.requires_grad_(False)
+            else:
+                # Defense in depth: _validate_perceptual_model_support should have
+                # rejected this arch already. Never fall back to the SD1.5 taesd
+                # for an unknown latent space — decoding through the wrong tiny
+                # decoder produces silently wrong perceptual losses.
+                raise ValueError(
+                    f"No tiny decoder available for arch "
+                    f"'{(getattr(self.sd.model_config, 'arch', '') or '')}' "
+                    f"(VAE latent channels: {vae_channels}); cannot enable "
+                    f"perceptual face/identity losses on this model."
+                )
 
         # Depth consistency: cache GT depth maps (DA2 output) for all datasets.
         # v3 caches GT from VAE-encode → trainer-decoder pixels so the live
@@ -2130,10 +2283,14 @@ class SDTrainer(BaseSDTrainProcess):
             return None
 
         if len(noisy_latents_shape) == 5:
-            # Video B,C,T,H,W
-            lat_h, lat_w = noisy_latents_shape[3], noisy_latents_shape[4]
-        else:
-            lat_h, lat_w = noisy_latents_shape[2], noisy_latents_shape[3]
+            # Safety net — _validate_perceptual_model_support rejects video-latent
+            # archs at startup; a 4D (B,C,H,W) weight map multiplied into a 5D
+            # loss would broadcast wrongly, never silently allow it.
+            raise ValueError(
+                "subject_mask region loss weighting is not implemented for 5D "
+                "video latents; disable subject_mask for this model."
+            )
+        lat_h, lat_w = noisy_latents_shape[2], noisy_latents_shape[3]
         device = getattr(self, 'device_torch', torch.device('cpu'))
 
         def _resize_mask(stacked):

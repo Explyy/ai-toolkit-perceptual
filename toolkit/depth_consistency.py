@@ -659,7 +659,16 @@ def load_taehv_ltx2(device: str = "cuda", dtype: torch.dtype = torch.bfloat16, v
     if _taehv_dir not in sys.path:
         sys.path.insert(0, _taehv_dir)
     from taehv import TAEHV  # noqa: E402
-    fname = "taeltx2_3.pth" if str(version) == "2.3" else "taeltx_2.pth"
+    if str(version) in ("2.3", "2.5"):
+        # LTX-2.5 keeps the 2.3 transformer/latent layout (see
+        # convert_ltx2_to_diffusers.get_ltx2_transformer_config), so decode its
+        # latents with the 2.3 tiny decoder. Pending GPU validation — the 2.5
+        # default VAE file is new even though the conv VAE matches 2.3.
+        if str(version) == "2.5":
+            print("DepthConsistency: LTX-2.5 uses the LTX-2.3 TAEHV tiny decoder (pending GPU validation)")
+        fname = "taeltx2_3.pth"
+    else:
+        fname = "taeltx_2.pth"
     ckpt = os.path.join(_taehv_dir, fname)
     if not os.path.exists(ckpt):
         import urllib.request
