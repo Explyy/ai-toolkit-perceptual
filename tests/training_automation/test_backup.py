@@ -108,11 +108,12 @@ def test_missing_remote_sha_downloads_and_rejects_same_size_content_mismatch(tmp
     checkpoint = tmp_path / "job_000000001.safetensors"
     checkpoint.write_bytes(b"checkpoint")
     backup = make_backup(tmp_path, MissingHashClient(), max_attempts=1)
-    with pytest.raises(BackupError, match="downloaded-byte hash verification"):
+    with pytest.raises(BackupError, match="checkpoint backup failed") as caught:
         backup.protect(
             job_id="job", checkpoint_id="step-000000001", step=1,
             paths=[checkpoint], final=False,
         )
+    assert "downloaded-byte hash verification" in str(caught.value.__cause__)
     entry = next(iter(json.loads((tmp_path / "backup.json").read_text())["checkpoints"].values()))
     assert entry["status"] == "pending"
     assert not entry.get("verified", False)

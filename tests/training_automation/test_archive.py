@@ -69,6 +69,9 @@ def test_archive_missing_remote_sha_rejects_same_size_download_mismatch(tmp_path
         remote_prefix="training-runs", run_id="run-1", shard_id="a",
         state_path=tmp_path / "archive-state.json", max_attempts=1,
     )
-    with pytest.raises(BackupError, match="downloaded-byte hash verification"):
+    with pytest.raises(BackupError, match="evidence archive failed") as caught:
         archive.publish([(report, "job/evaluation.json")], {"job_count": 1})
-    assert json.loads((tmp_path / "archive-state.json").read_text())["status"] == "failed"
+    assert "downloaded-byte hash verification" in str(caught.value.__cause__)
+    state = json.loads((tmp_path / "archive-state.json").read_text())
+    assert state["status"] == "failed"
+    assert "downloaded-byte hash verification" in state["error"]
