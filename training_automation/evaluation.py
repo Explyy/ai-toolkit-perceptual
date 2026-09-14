@@ -243,6 +243,31 @@ def shortlist_checkpoints(
     return items[:3]
 
 
+def shortlist_unavailable_reason(
+    checkpoints: list[dict[str, Any]],
+    *, ranking_error: str | None, identity_ranking_error: str | None,
+) -> str | None:
+    if ranking_error:
+        return f"configured prompt/seed evidence is not comparable: {ranking_error}"
+    incomplete = [
+        int(checkpoint["step"])
+        for checkpoint in checkpoints
+        if checkpoint.get("sample_run_status") != "complete"
+    ]
+    if incomplete:
+        return f"checkpoint sample runs are incomplete at steps {incomplete}"
+    unverified = [
+        int(checkpoint["step"])
+        for checkpoint in checkpoints
+        if checkpoint.get("remote_association", {}).get("status") != "unique"
+    ]
+    if unverified:
+        return f"checkpoint samples lack a unique verified remote association at steps {unverified}"
+    if identity_ranking_error:
+        return identity_ranking_error
+    return None
+
+
 def _choose_latest_complete_run(
     samples: list[dict[str, Any]], expected_indices: set[int]
 ) -> tuple[list[dict[str, Any]], str, int]:
@@ -382,7 +407,11 @@ def evaluate_job(
     expected_signature = {(index, item["seed"]) for index, item in expected.items()}
     ranked, ranking_error = rank_checkpoints(checkpoints, expected_signature)
     identity_ranked, identity_ranking_error = rank_identity(checkpoints)
-    shortlist = shortlist_checkpoints(checkpoints, identity_ranked) if not identity_ranking_error else []
+    shortlist_error = shortlist_unavailable_reason(
+        checkpoints, ranking_error=ranking_error,
+        identity_ranking_error=identity_ranking_error,
+    )
+    shortlist = shortlist_checkpoints(checkpoints, identity_ranked) if not shortlist_error else []
     report = {
         "schema_version": REPORT_SCHEMA,
         "job_config": str(job_config_path),
@@ -406,7 +435,7 @@ def evaluate_job(
         },
         "automatic_shortlist": {
             "status": "available" if shortlist else "unavailable",
-            "reason": identity_ranking_error,
+            "reason": shortlist_error,
             "method": "top three by mean face cosine descending on the common valid-face prompt subset, then mean clipping ascending, then step ascending; evidence shortlist only",
             "items": shortlist,
         },

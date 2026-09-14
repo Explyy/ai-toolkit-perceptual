@@ -275,6 +275,23 @@ def test_shortlist_ties_use_clipping_then_step():
     assert [item["step"] for item in evaluation.shortlist_checkpoints(checkpoints, identity)] == [400, 100, 200]
 
 
+@pytest.mark.parametrize(
+    "checkpoint,ranking_error,expected",
+    [
+        ({"step": 100, "sample_run_status": "incomplete", "remote_association": {"status": "unique"}}, None, "incomplete"),
+        ({"step": 100, "sample_run_status": "complete", "remote_association": {"status": "ambiguous"}}, None, "unique verified"),
+        ({"step": 100, "sample_run_status": "complete", "remote_association": {"status": "unique"}}, "not comparable", "not comparable"),
+    ],
+)
+def test_shortlist_requires_complete_comparable_uniquely_associated_evidence(
+    checkpoint, ranking_error, expected,
+):
+    reason = evaluation.shortlist_unavailable_reason(
+        [checkpoint], ranking_error=ranking_error, identity_ranking_error=None
+    )
+    assert expected in reason
+
+
 def test_evaluate_cli_processes_existing_samples_without_training(tmp_path):
     config_path, output = setup_job(tmp_path)
     assert cli.main(["evaluate", str(config_path), str(output)]) == 0

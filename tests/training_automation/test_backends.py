@@ -88,6 +88,7 @@ class FakePoseModel:
         self.count = count
 
     def predict(self, **kwargs):
+        self.last_kwargs = kwargs
         xy = np.zeros((self.count, 17, 2))
         confidence = np.ones((self.count, 17))
         keypoints = SimpleNamespace(xyn=ArrayTensor(xy), conf=ArrayTensor(confidence))
@@ -105,3 +106,18 @@ def test_ultralytics_backend_does_not_choose_from_missing_or_multiple_people(cou
     result = backend.metrics(np.zeros((100, 200, 3), dtype=np.uint8))
     assert result["status"] == status
     assert result["values"] is None
+
+
+def test_ultralytics_backend_converts_rgb_to_contiguous_bgr_before_prediction():
+    backend = object.__new__(UltralyticsPoseCPUBackend)
+    backend._model = FakePoseModel(0)
+    backend._image_size = 640
+    backend._min_detection_confidence = 0.25
+    backend._min_keypoint_confidence = 0.5
+    backend._iou_threshold = 0.7
+    rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+    rgb[0, 0] = [10, 20, 30]
+    backend.metrics(rgb)
+    source = backend._model.last_kwargs["source"]
+    assert source.flags.c_contiguous
+    assert source[0, 0].tolist() == [30, 20, 10]

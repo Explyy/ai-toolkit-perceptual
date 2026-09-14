@@ -201,8 +201,9 @@ class UltralyticsPoseCPUBackend:
         self._image_size = int(image_size)
 
     def metrics(self, image: np.ndarray) -> dict[str, Any]:
+        bgr = np.ascontiguousarray(image[:, :, ::-1])
         results = self._model.predict(
-            source=image, device="cpu", verbose=False, imgsz=self._image_size,
+            source=bgr, device="cpu", verbose=False, imgsz=self._image_size,
             conf=self._min_detection_confidence, iou=self._iou_threshold,
             max_det=2, augment=False, deterministic=True, save=False,
         )
