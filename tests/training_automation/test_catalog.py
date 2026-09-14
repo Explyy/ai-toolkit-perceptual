@@ -174,6 +174,7 @@ def test_imported_weight_does_not_claim_stateful_training_resume(tmp_path):
         restore_training(
             client=client, repo_id="owner/private", repo_type="dataset",
             catalog=catalog, identifier="legacy", target_root=tmp_path / "resume",
+            checkpoint_id="imported",
         )
 
 
