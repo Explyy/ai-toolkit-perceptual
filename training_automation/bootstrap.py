@@ -14,6 +14,7 @@ import yaml
 from .archive import EvidenceArchive
 from .backup import BackupError, HuggingFaceBackupClient
 from .catalog import CatalogStore, resolve_model, safe_relative_path
+from .evaluation import preflight_evaluation_backends
 from .lifecycle import SimplePodClient, verify_instance_identity, wait_for_binding
 from .queue import TrainingQueue
 from .staging import COMMIT_RE, PinnedDatasetStager
@@ -30,6 +31,11 @@ MODEL_SOURCE_KINDS = {"base_model", "depth_model", "text_encoder", "vae"}
 REQUIRED_MODEL_SOURCE_KINDS = {"base_model", "depth_model"}
 NATIVE_KLEIN_FILENAME = "flux-2-klein-base-9b.safetensors"
 FLUX2_VAE_FILENAME = "ae.safetensors"
+LEGACY_TRAINING_STEPS = 1200
+SAMPLE_EVERY = 100
+RESOLUTION_REPEATS = [16, 4, 1]
+TRAIN_BATCH_SIZE = 4
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def _component(value: Any, field: str) -> str:
@@ -37,6 +43,62 @@ def _component(value: Any, field: str) -> str:
     if not COMPONENT_RE.fullmatch(text):
         raise BackupError(f"{field} must be one safe path component")
     return text
+
+
+def _positive_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise BackupError(f"{field} must be a positive integer")
+    return value
+
+
+def _validate_training_schedule(item: Mapping[str, Any]) -> None:
+    has_steps = "training_steps" in item
+    has_accounting = "training_accounting" in item
+    if has_steps != has_accounting:
+        raise BackupError("training_steps and training_accounting must be supplied together")
+    if not has_steps:
+        return
+    steps = _positive_int(item["training_steps"], "training_steps")
+    accounting = item["training_accounting"]
+    required = {
+        "source_image_count", "loader_batches_per_epoch", "loader_epochs",
+        "resolution_repeats", "batch_size", "original_image_exposures",
+        "partial_bucket_batches",
+    }
+    if not isinstance(accounting, Mapping) or set(accounting) != required:
+        raise BackupError(f"training_accounting requires exactly {sorted(required)}")
+    source_count = _positive_int(accounting["source_image_count"], "source_image_count")
+    batches = _positive_int(accounting["loader_batches_per_epoch"], "loader_batches_per_epoch")
+    epochs = _positive_int(accounting["loader_epochs"], "loader_epochs")
+    exposures = _positive_int(accounting["original_image_exposures"], "original_image_exposures")
+    if accounting["resolution_repeats"] != RESOLUTION_REPEATS:
+        raise BackupError(f"resolution_repeats must equal {RESOLUTION_REPEATS}")
+    if accounting["batch_size"] != TRAIN_BATCH_SIZE:
+        raise BackupError(f"batch_size must equal {TRAIN_BATCH_SIZE}")
+    if accounting["partial_bucket_batches"] != "un-padded":
+        raise BackupError("partial_bucket_batches must be 'un-padded'")
+    staged_images = sum(
+        Path(str(spec.get("relative_path", ""))).suffix.casefold() in IMAGE_SUFFIXES
+        for spec in item.get("files", [])
+    )
+    if source_count != staged_images:
+        raise BackupError("source_image_count must equal staged image file count")
+    if steps != batches * epochs:
+        raise BackupError("training_steps must equal loader_batches_per_epoch * loader_epochs")
+    if exposures != sum(RESOLUTION_REPEATS) * epochs:
+        raise BackupError("original_image_exposures must equal resolution repeats * loader epochs")
+
+
+def _validate_checkpoint_policy(manifest: Mapping[str, Any]) -> None:
+    raw = manifest.get("checkpoint_policy")
+    if raw is None:
+        return
+    if not isinstance(raw, Mapping) or set(raw) != {"save_every", "max_local_step_saves"}:
+        raise BackupError("checkpoint_policy requires exactly save_every and max_local_step_saves")
+    save_every = _positive_int(raw["save_every"], "checkpoint_policy.save_every")
+    _positive_int(raw["max_local_step_saves"], "checkpoint_policy.max_local_step_saves")
+    if save_every != SAMPLE_EVERY:
+        raise BackupError(f"checkpoint_policy.save_every must equal sample cadence {SAMPLE_EVERY}")
 
 
 def validate_manifest(
@@ -81,6 +143,7 @@ def validate_manifest(
     if any(value <= 0 for value in catalog_ids) or len(catalog_ids) != len(set(catalog_ids)):
         raise BackupError("expected catalog ids must be positive and globally unique across shards")
     for item in normalized:
+        _validate_training_schedule(item)
         if int(item.get("expected_catalog_id", 0)) <= 0:
             raise BackupError("each dataset requires its pre-reserved expected_catalog_id")
         if not item.get("catalog_name") or not item.get("trigger_word"):
@@ -136,6 +199,27 @@ def validate_manifest(
         raise BackupError(
             "parallel deployment requires training-set-provenance InsightFace identity evaluation"
         )
+    reference_filter = evaluation.get("reference_identity_filter")
+    if reference_filter is not None:
+        if not isinstance(reference_filter, Mapping) or set(reference_filter) != {
+            "single_face_only", "minimum_valid_count", "minimum_valid_fraction"
+        }:
+            raise BackupError("reference_identity_filter has unsupported fields")
+        if reference_filter["single_face_only"] is not True:
+            raise BackupError("reference_identity_filter requires single_face_only=true")
+        if _positive_int(reference_filter["minimum_valid_count"], "minimum_valid_count") < 3:
+            raise BackupError("minimum_valid_count must be at least three")
+        fraction = reference_filter["minimum_valid_fraction"]
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0.5 <= fraction <= 1:
+            raise BackupError("minimum_valid_fraction must be at least 0.5 and at most one")
+    landmark = evaluation.get("landmark_backend")
+    if landmark is not None:
+        if landmark != "training_automation.backends:UltralyticsPoseCPUBackend":
+            raise BackupError("parallel deployment supports only the pinned Ultralytics pose backend")
+        options = evaluation.get("landmark_backend_options") or {}
+        if not options.get("model_path") or not re.fullmatch(r"[0-9a-f]{64}", str(options.get("expected_sha256", ""))):
+            raise BackupError("Ultralytics pose backend requires model_path and expected_sha256")
+    _validate_checkpoint_policy(manifest)
     return selected
 
 
@@ -342,6 +426,8 @@ def _write_queue_config(
             "dataset_revision": str(item.get("dataset_revision", manifest["dataset_revision"])),
             "shard_id": shard_id,
             "reference_images": [str(dataset_root / safe_relative_path(path)) for path in item["reference_paths"]],
+            **({"training_steps": item["training_steps"]} if "training_steps" in item else {}),
+            **({"training_accounting": item["training_accounting"]} if "training_accounting" in item else {}),
         })
     evaluation = dict(manifest.get("evaluation") or {})
     evaluation.setdefault("enabled", True)
@@ -371,6 +457,7 @@ def _write_queue_config(
             },
         },
         "evaluation": evaluation,
+        **({"checkpoint_policy": manifest["checkpoint_policy"]} if "checkpoint_policy" in manifest else {}),
         "datasets": datasets,
     }
     queue_path = run_root / "queue.yaml"
@@ -426,10 +513,10 @@ def _completion_evidence(
         expected_sample_count = len(configured_samples) if isinstance(configured_samples, list) else 0
         final_step = int(process.get("train", {}).get("steps", 0))
         sample_every = int(sample_config.get("sample_every", 0))
-        if expected_sample_count != 23 or final_step != 1200 or sample_every != 100:
+        if expected_sample_count != 23 or final_step <= 0 or sample_every != SAMPLE_EVERY:
             raise BackupError(f"job {job.job_id} does not retain the required evaluation schedule")
         checkpoints_by_step = {int(item.get("step", -1)): item for item in report_checkpoints}
-        expected_steps = set(range(sample_every, final_step + 1, sample_every))
+        expected_steps = set(range(sample_every, final_step, sample_every)) | {final_step}
         if not expected_steps.issubset(checkpoints_by_step):
             raise BackupError(f"job {job.job_id} is missing scheduled checkpoint evaluations")
         for step in sorted(expected_steps):
@@ -437,6 +524,7 @@ def _completion_evidence(
             if (
                 checkpoint.get("sample_run_status") != "complete"
                 or len(checkpoint.get("samples") or []) != expected_sample_count
+                or checkpoint.get("remote_association", {}).get("status") != "unique"
             ):
                 raise BackupError(
                     f"job {job.job_id} has incomplete configured sample evidence at step {step}"
@@ -449,6 +537,18 @@ def _completion_evidence(
             ranking_status = report.get("identity_ranking", {}).get("status")
             if ranking_status not in {"available", "unavailable"}:
                 raise BackupError(f"job {job.job_id} has no completed identity ranking outcome")
+        landmark_configured = bool((queue.config.get("evaluation") or {}).get("landmark_backend"))
+        pose_status = (report.get("pose_backend") or {}).get("status")
+        if landmark_configured:
+            if pose_status != "available":
+                raise BackupError(f"job {job.job_id} pose backend did not execute")
+            allowed_pose = {"available", "missing", "ambiguous", "occluded", "degenerate"}
+            if any(
+                sample.get("pose_body_landmarks", {}).get("status") not in allowed_pose
+                for step in expected_steps
+                for sample in checkpoints_by_step[step].get("samples", [])
+            ):
+                raise BackupError(f"job {job.job_id} has incomplete pose evaluation evidence")
         prefix = f"jobs/{job.job_id}"
         files.extend([
             (job.config_path, f"{prefix}/trainer.yaml"),
@@ -474,6 +574,16 @@ def _completion_evidence(
             "sample_files": len(samples),
             "identity_ranking_status": report.get("identity_ranking", {}).get("status"),
             "reference_provenance": report.get("reference_provenance", "unspecified"),
+            "pose_backend_status": pose_status,
+            "training_schedule": (
+                trainer.get("meta", {}).get("training_automation_schedule")
+                or {
+                    "base_training_steps": LEGACY_TRAINING_STEPS,
+                    "resolved_training_steps": final_step,
+                    "training_accounting": None,
+                    "checkpoint_policy": None,
+                }
+            ),
         })
     return files, {"jobs": completion_jobs, "job_count": len(completion_jobs)}
 
@@ -580,6 +690,7 @@ def run_parallel_bootstrap(
         model_paths = _resolve_model_paths(
             list(manifest["model_sources"]), staged_model_roots
         )
+        preflight_evaluation_backends(manifest.get("evaluation") or {})
         queue_path = _write_queue_config(
             manifest=manifest,
             selected=selected,

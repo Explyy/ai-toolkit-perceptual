@@ -26,6 +26,11 @@ MANIFEST_REVISION = "a" * 40
 DATASET_REVISION = "b" * 40
 
 
+@pytest.fixture(autouse=True)
+def fake_backend_preflight(monkeypatch):
+    monkeypatch.setattr(bootstrap, "preflight_evaluation_backends", lambda config: {})
+
+
 class Pod:
     def __init__(self, *, valid=True):
         self.valid = valid
@@ -46,23 +51,35 @@ class CompletedQueue:
     def __init__(
         self, path, *, reference_available=True,
         identity_ranking_status="available", write_sample=True,
+        pose_backend_available=True,
     ):
         config = yaml.safe_load(Path(path).read_text())
         self.state_path = Path(config["state_path"])
         self.reference_available = reference_available
         self.identity_ranking_status = identity_ranking_status
         self.write_sample = write_sample
+        self.config = config
+        self.pose_configured = bool((config.get("evaluation") or {}).get("landmark_backend"))
+        self.pose_backend_available = pose_backend_available
         self.jobs = []
         for index, dataset in enumerate(config["datasets"]):
             job_id = f"{dataset['name']}-job"
             config_path = Path(config["generated_dir"]) / f"{job_id}.yaml"
             config_path.parent.mkdir(parents=True, exist_ok=True)
+            final_step = int(dataset.get("training_steps", 1200))
+            policy = config.get("checkpoint_policy")
             config_path.write_text(yaml.safe_dump({
                 "job": "extension",
+                **({"meta": {"training_automation_schedule": {
+                    "base_training_steps": 1200,
+                    "resolved_training_steps": final_step,
+                    "training_accounting": dataset.get("training_accounting"),
+                    "checkpoint_policy": policy,
+                }}} if dataset.get("training_steps") or policy else {}),
                 "config": {
                     "name": job_id,
                     "process": [{
-                        "train": {"steps": 1200},
+                        "train": {"steps": final_step},
                         "sample": {
                             "sample_every": 100,
                             "seed": 42,
@@ -78,6 +95,9 @@ class CompletedQueue:
             self.jobs.append(QueueJob(
                 job_id=job_id, config_path=config_path,
                 output_root=Path(config["training_folder"]), reference_images=(),
+                training_steps=final_step,
+                training_accounting=dataset.get("training_accounting"),
+                checkpoint_policy=policy,
             ))
 
     def materialize(self):
@@ -94,7 +114,11 @@ class CompletedQueue:
             report_checkpoints = []
             if not self.write_sample:
                 (samples / "not-a-sample-file").mkdir()
-            for step in range(100, 1201, 100):
+            trainer = yaml.safe_load(job.config_path.read_text())
+            final_step = trainer["config"]["process"][0]["train"]["steps"]
+            expected_steps = list(range(100, final_step, 100)) + [final_step]
+            receipts = {}
+            for step in expected_steps:
                 checkpoint_samples = []
                 for prompt_index in range(23):
                     sample_path = samples / f"1__{step:09d}_{prompt_index}.png"
@@ -112,19 +136,25 @@ class CompletedQueue:
                                 else "available"
                             )
                         },
+                        "pose_body_landmarks": {
+                            "status": "available" if self.pose_configured else "unavailable",
+                            "values": {} if self.pose_configured else None,
+                        },
                     })
                 report_checkpoints.append({
                     "step": step,
-                    "final": step == 1200,
+                    "final": step == final_step,
                     "sample_run_status": "complete",
+                    "remote_association": {"status": "unique", "reason": None},
                     "samples": checkpoint_samples,
                 })
+                receipts[str(step)] = {
+                    "status": "backed_up", "verified": True, "cataloged": True,
+                    "final": step == final_step,
+                }
             (automation / "backup-state.json").write_text(json.dumps({
                 "schema_version": 2,
-                "checkpoints": {"final": {
-                    "status": "backed_up", "verified": True,
-                    "cataloged": True, "final": True,
-                }},
+                "checkpoints": receipts,
             }), encoding="utf-8")
             reference = "available" if self.reference_available else "unavailable"
             (automation / "evaluation.json").write_text(json.dumps({
@@ -137,6 +167,9 @@ class CompletedQueue:
                     ),
                 },
                 "ranking": {"status": "available"},
+                "pose_backend": {
+                    "status": "available" if self.pose_configured and self.pose_backend_available else "unavailable"
+                },
                 "checkpoints": report_checkpoints,
                 "reference_provenance": "training-set",
             }), encoding="utf-8")
@@ -382,6 +415,78 @@ def test_manifest_requires_exact_three_job_assignment_and_pinned_models():
         validate_manifest(manifest, run_id="run-1", shard_id="a")
 
 
+def test_manifest_validates_adaptive_accounting_and_checkpoint_policy():
+    manifest, _ = private_manifest()
+    manifest["checkpoint_policy"] = {"save_every": 100, "max_local_step_saves": 5}
+    manifest["datasets"][0].update({
+        "training_steps": 1590,
+        "training_accounting": {
+            "source_image_count": 1, "loader_batches_per_epoch": 265,
+            "loader_epochs": 6, "resolution_repeats": [16, 4, 1],
+            "batch_size": 4, "original_image_exposures": 126,
+            "partial_bucket_batches": "un-padded",
+        },
+    })
+    assert len(validate_manifest(manifest, run_id="run-1", shard_id="a")) == 3
+    manifest["datasets"][0]["training_accounting"]["loader_batches_per_epoch"] = 264
+    with pytest.raises(BackupError, match="training_steps must equal"):
+        validate_manifest(manifest, run_id="run-1", shard_id="a")
+
+
+def test_nonround_final_schedule_and_pose_evidence_archive_before_delete(tmp_path):
+    client = setup_client()
+    manifest = json.loads(client.snapshots[MANIFEST_REVISION]["private/manifest.json"])
+    manifest["checkpoint_policy"] = {"save_every": 100, "max_local_step_saves": 5}
+    manifest["datasets"][0].update({
+        "training_steps": 1590,
+        "training_accounting": {
+            "source_image_count": 1, "loader_batches_per_epoch": 265,
+            "loader_epochs": 6, "resolution_repeats": [16, 4, 1],
+            "batch_size": 4, "original_image_exposures": 126,
+            "partial_bucket_batches": "un-padded",
+        },
+    })
+    manifest["evaluation"].update({
+        "landmark_backend": "training_automation.backends:UltralyticsPoseCPUBackend",
+        "landmark_backend_options": {
+            "model_path": "/opt/training-automation-models/ultralytics/yolo11n-pose.pt",
+            "expected_sha256": "a" * 64,
+        },
+    })
+    client.snapshots[MANIFEST_REVISION]["private/manifest.json"] = json.dumps(manifest).encode()
+    pod = Pod()
+    result = run_parallel_bootstrap(
+        env=env(tmp_path), hub_client=client, pod_client=pod,
+        queue_factory=CompletedQueue, snapshot_fetch=snapshot_fetch,
+        recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+    )
+    assert result["status"] == "delete-accepted"
+    completion = json.loads(client.remote["training-runs/run-1/a/completion.json"])
+    first = next(item for item in completion["completion"]["jobs"] if item["job_id"] == "subject-0-job")
+    assert first["training_schedule"]["resolved_training_steps"] == 1590
+    assert first["pose_backend_status"] == "available"
+    assert pod.deleted == [42]
+
+
+def test_configured_pose_backend_failure_never_deletes(tmp_path):
+    client = setup_client()
+    manifest = json.loads(client.snapshots[MANIFEST_REVISION]["private/manifest.json"])
+    manifest["evaluation"].update({
+        "landmark_backend": "training_automation.backends:UltralyticsPoseCPUBackend",
+        "landmark_backend_options": {"model_path": "/pose.pt", "expected_sha256": "a" * 64},
+    })
+    client.snapshots[MANIFEST_REVISION]["private/manifest.json"] = json.dumps(manifest).encode()
+    pod = Pod()
+    with pytest.raises(BackupError, match="pose backend did not execute"):
+        run_parallel_bootstrap(
+            env=env(tmp_path), hub_client=client, pod_client=pod,
+            queue_factory=lambda path: CompletedQueue(path, pose_backend_available=False),
+            snapshot_fetch=snapshot_fetch,
+            recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+        )
+    assert pod.deleted == []
+
+
 @pytest.mark.parametrize("field", ["id", "catalog_name", "expected_catalog_id"])
 def test_manifest_rejects_global_identity_duplicates_across_shards(field):
     manifest, _ = private_manifest()
@@ -480,6 +585,23 @@ def test_disk_preflight_stops_before_staging_or_delete(tmp_path, monkeypatch):
         )
     assert pod.deleted == []
     assert not (tmp_path / "storage/datasets/run-1/a").exists()
+
+
+def test_evaluation_backend_preflight_failure_stops_before_training_or_delete(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bootstrap, "preflight_evaluation_backends",
+        lambda config: (_ for _ in ()).throw(ValueError("pose hash mismatch")),
+    )
+    trainer_calls = []
+    pod = Pod()
+    with pytest.raises(ValueError, match="pose hash mismatch"):
+        run_parallel_bootstrap(
+            env=env(tmp_path), hub_client=setup_client(), pod_client=pod,
+            queue_factory=lambda path: trainer_calls.append(path), snapshot_fetch=snapshot_fetch,
+            recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+        )
+    assert trainer_calls == []
+    assert pod.deleted == []
 
 
 def test_shipped_manifest_assigns_two_disjoint_three_job_shards():

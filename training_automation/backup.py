@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -139,6 +140,46 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def verify_remote_artifacts(
+    client: BackupClient,
+    *,
+    repo_id: str,
+    repo_type: str,
+    artifacts: Iterable[LocalArtifact],
+    revision: str,
+    context: str,
+) -> None:
+    artifacts = list(artifacts)
+    metadata = client.path_metadata(
+        repo_id, repo_type, [item.remote_path for item in artifacts], revision
+    )
+    for artifact in artifacts:
+        remote = metadata.get(artifact.remote_path)
+        if remote is None or int(remote.get("size", -1)) != artifact.size:
+            raise BackupError(f"{context} size verification failed for {artifact.remote_path}")
+        remote_sha = remote.get("sha256")
+        if remote_sha:
+            if str(remote_sha).removeprefix("sha256:") != artifact.sha256:
+                raise BackupError(f"{context} hash verification failed for {artifact.remote_path}")
+            continue
+        fd, temporary_name = tempfile.mkstemp(prefix="training-automation-verify-")
+        os.close(fd)
+        temporary = Path(temporary_name)
+        try:
+            client.download_file(
+                repo_id, repo_type, artifact.remote_path, revision, temporary
+            )
+            if (
+                temporary.stat().st_size != artifact.size
+                or sha256_file(temporary) != artifact.sha256
+            ):
+                raise BackupError(
+                    f"{context} downloaded-byte hash verification failed for {artifact.remote_path}"
+                )
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _files(paths: Iterable[Path]) -> list[Path]:
@@ -403,19 +444,14 @@ class CheckpointBackup:
                     artifacts,
                     f"Backup {entry['job_id']} checkpoint {entry['checkpoint_id']}",
                 )
-                metadata = self.client.path_metadata(
-                    self.repo_id,
-                    self.repo_type,
-                    [item.remote_path for item in artifacts],
-                    commit_id,
+                verify_remote_artifacts(
+                    self.client,
+                    repo_id=self.repo_id,
+                    repo_type=self.repo_type,
+                    artifacts=artifacts,
+                    revision=commit_id,
+                    context="remote",
                 )
-                for artifact in artifacts:
-                    remote = metadata.get(artifact.remote_path)
-                    if remote is None or int(remote.get("size", -1)) != artifact.size:
-                        raise BackupError(f"remote size verification failed for {artifact.remote_path}")
-                    remote_sha = remote.get("sha256")
-                    if remote_sha and str(remote_sha).removeprefix("sha256:") != artifact.sha256:
-                        raise BackupError(f"remote hash verification failed for {artifact.remote_path}")
                 state = self._state()
                 entry = state["checkpoints"][key]
                 weights = []

@@ -49,6 +49,9 @@ class QueueJob:
     config_path: Path
     output_root: Path
     reference_images: tuple[Path, ...]
+    training_steps: int | None = None
+    training_accounting: Mapping[str, Any] | None = None
+    checkpoint_policy: Mapping[str, int] | None = None
 
 
 class TrainingQueue:
@@ -88,6 +91,59 @@ class TrainingQueue:
             if not datasets:
                 raise QueueConfigurationError(f"no datasets assigned to shard {self.shard_id!r}")
         return datasets
+
+    @staticmethod
+    def _positive_int(value: Any, field: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise QueueConfigurationError(f"{field} must be a positive integer")
+        return value
+
+    def _checkpoint_policy(self, process: Mapping[str, Any]) -> dict[str, int] | None:
+        raw = self.config.get("checkpoint_policy")
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping) or set(raw) != {"save_every", "max_local_step_saves"}:
+            raise QueueConfigurationError(
+                "checkpoint_policy requires exactly save_every and max_local_step_saves"
+            )
+        save_every = self._positive_int(raw["save_every"], "checkpoint_policy.save_every")
+        max_local = self._positive_int(
+            raw["max_local_step_saves"], "checkpoint_policy.max_local_step_saves"
+        )
+        sample_every = self._positive_int(
+            (process.get("sample") or {}).get("sample_every"), "sample.sample_every"
+        )
+        if save_every != sample_every:
+            raise QueueConfigurationError(
+                "checkpoint_policy.save_every must equal sample.sample_every"
+            )
+        return {"save_every": save_every, "max_local_step_saves": max_local}
+
+    def _assert_pending_duration_change(
+        self, job_id: str, target: Path, requested_steps: int
+    ) -> None:
+        if not target.is_file():
+            return
+        existing = _load_one_yaml(target)
+        try:
+            existing_steps = int(existing["config"]["process"][0]["train"]["steps"])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise QueueConfigurationError(
+                f"existing generated config for {job_id} has no valid train.steps"
+            ) from exc
+        if existing_steps == requested_steps:
+            return
+        state = read_json(self.state_path, {"jobs": {}})
+        entry = (state.get("jobs") or {}).get(job_id, {})
+        training_status = entry.get("training_status")
+        if training_status is None:
+            legacy = entry.get("status")
+            training_status = "pending" if legacy in {None, "pending"} else legacy
+        if training_status != "pending":
+            raise QueueConfigurationError(
+                f"training_steps for {job_id} may change only while training is pending "
+                f"({existing_steps} -> {requested_steps}, status={training_status})"
+            )
 
     def materialize(self) -> list[QueueJob]:
         template_bytes = self.trainer_path.read_bytes()
@@ -134,6 +190,14 @@ class TrainingQueue:
                 dataset = defaults
             dataset["folder_path"] = identity["folder"]
             process["datasets"] = [dataset]
+            base_steps = self._positive_int(
+                process.get("train", {}).get("steps"), "train.steps"
+            )
+            requested_steps = self._positive_int(
+                raw.get("training_steps", base_steps), "training_steps"
+            )
+            accounting = copy.deepcopy(raw.get("training_accounting"))
+            policy = self._checkpoint_policy(process)
             output_root = Path(process.get("training_folder", "output"))
             if not output_root.is_absolute():
                 output_root = (self.repo_root / output_root).resolve()
@@ -152,6 +216,19 @@ class TrainingQueue:
                 )
                 process["checkpoint_backup"] = backup
             target = self.generated_dir / f"{job_id}.yaml"
+            self._assert_pending_duration_change(job_id, target, requested_steps)
+            process["train"]["steps"] = requested_steps
+            if policy is not None:
+                save = process.setdefault("save", {})
+                save["save_every"] = policy["save_every"]
+                save["max_step_saves_to_keep"] = policy["max_local_step_saves"]
+            if requested_steps != base_steps or accounting is not None or policy is not None:
+                document.setdefault("meta", {})["training_automation_schedule"] = {
+                    "base_training_steps": base_steps,
+                    "resolved_training_steps": requested_steps,
+                    "training_accounting": accounting,
+                    "checkpoint_policy": policy,
+                }
             target.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
             jobs.append(
                 QueueJob(
@@ -159,6 +236,9 @@ class TrainingQueue:
                     target,
                     output_root,
                     tuple(Path(item) for item in identity["reference_images"]),
+                    requested_steps,
+                    accounting,
+                    policy,
                 )
             )
         return jobs
@@ -186,6 +266,11 @@ class TrainingQueue:
                     "attempts": 0,
                 },
             )
+            entry["resolved_training_steps"] = job.training_steps
+            if job.training_accounting is not None:
+                entry["training_accounting"] = dict(job.training_accounting)
+            if job.checkpoint_policy is not None:
+                entry["checkpoint_policy"] = dict(job.checkpoint_policy)
             if entry.get("training_status") == "running":
                 entry["training_status"] = "pending"
                 entry["interrupted"] = True

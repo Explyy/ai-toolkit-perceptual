@@ -93,6 +93,31 @@ def test_failed_verification_never_marks_backed_up(tmp_path):
     assert not backup.can_delete(checkpoint)
 
 
+def test_missing_remote_sha_downloads_and_rejects_same_size_content_mismatch(tmp_path):
+    class MissingHashClient(FakeHubClient):
+        def path_metadata(self, repo_id, repo_type, paths, revision):
+            return {
+                path: {"size": len(self.snapshots[revision][path]), "sha256": None}
+                for path in paths
+            }
+
+        def download_file(self, repo_id, repo_type, path, revision, destination):
+            payload = self.snapshots[revision][path]
+            destination.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+
+    checkpoint = tmp_path / "job_000000001.safetensors"
+    checkpoint.write_bytes(b"checkpoint")
+    backup = make_backup(tmp_path, MissingHashClient(), max_attempts=1)
+    with pytest.raises(BackupError, match="downloaded-byte hash verification"):
+        backup.protect(
+            job_id="job", checkpoint_id="step-000000001", step=1,
+            paths=[checkpoint], final=False,
+        )
+    entry = next(iter(json.loads((tmp_path / "backup.json").read_text())["checkpoints"].values()))
+    assert entry["status"] == "pending"
+    assert not entry.get("verified", False)
+
+
 def test_public_destination_fails_closed(tmp_path):
     backup = make_backup(tmp_path, FakeHubClient(private=False))
     with pytest.raises(BackupConfigurationError, match="non-private"):

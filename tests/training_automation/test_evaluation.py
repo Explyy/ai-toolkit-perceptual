@@ -191,20 +191,88 @@ def test_latest_complete_duplicate_sample_run_is_used_once(tmp_path):
     assert checkpoint["discarded_duplicate_or_partial_samples"] == 2
 
 
-def test_identity_ranking_requires_same_valid_prompt_subset():
+def test_identity_ranking_uses_common_valid_prompt_subset():
     checkpoints = [
         {"step": 1, "samples": [
             {"prompt_index": 0, "identity": {"status": "available", "cosine_similarity": 0.8}},
-            {"prompt_index": 1, "identity": {"status": "missing", "cosine_similarity": None}},
+            {"prompt_index": 1, "identity": {"status": "available", "cosine_similarity": 0.7}},
+            {"prompt_index": 2, "identity": {"status": "available", "cosine_similarity": 0.6}},
+            {"prompt_index": 3, "identity": {"status": "missing", "cosine_similarity": None}},
         ]},
         {"step": 2, "samples": [
             {"prompt_index": 0, "identity": {"status": "available", "cosine_similarity": 0.7}},
             {"prompt_index": 1, "identity": {"status": "available", "cosine_similarity": 0.9}},
+            {"prompt_index": 2, "identity": {"status": "available", "cosine_similarity": 0.8}},
+            {"prompt_index": 3, "identity": {"status": "available", "cosine_similarity": 0.9}},
         ]},
     ]
     ranked, reason = evaluation.rank_identity(checkpoints)
-    assert ranked == []
-    assert reason == "valid identity subsets are not comparable across checkpoints"
+    assert reason is None
+    assert [item["step"] for item in ranked] == [2, 1]
+    assert {tuple(item["prompt_indices"]) for item in ranked} == {(0, 1, 2)}
+
+
+class ReferenceFaces:
+    def embeddings(self, image):
+        marker = int(image[0, 0, 0])
+        if marker == 0:
+            return []
+        if marker == 2:
+            return [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+        if marker == 3:
+            return [np.array([0.0, 0.0])]
+        return [np.array([1.0, 0.0])]
+
+
+def test_reference_filter_averages_only_single_valid_faces_and_records_rejections(tmp_path):
+    paths = []
+    for index, marker in enumerate((1, 1, 1, 0, 2, 3)):
+        path = tmp_path / f"reference-{index}.png"
+        Image.fromarray(np.full((2, 2, 3), marker, dtype=np.uint8)).save(path)
+        paths.append(path)
+    result = evaluation._reference_identity(paths, ReferenceFaces(), {
+        "single_face_only": True, "minimum_valid_count": 3,
+        "minimum_valid_fraction": 0.5,
+    })
+    assert result["status"] == "available"
+    assert result["filter"]["valid"] == 3
+    assert result["filter"]["coverage_fraction"] == 0.5
+    assert result["filter"]["excluded_counts"] == {"missing": 1, "multiple": 1, "invalid": 1}
+
+
+def test_reference_filter_rejects_insufficient_coverage(tmp_path):
+    paths = []
+    for index, marker in enumerate((1, 1, 0, 0, 2)):
+        path = tmp_path / f"reference-{index}.png"
+        Image.fromarray(np.full((2, 2, 3), marker, dtype=np.uint8)).save(path)
+        paths.append(path)
+    result = evaluation._reference_identity(paths, ReferenceFaces(), {
+        "single_face_only": True, "minimum_valid_count": 3,
+        "minimum_valid_fraction": 0.5,
+    })
+    assert result["status"] == "unavailable"
+    assert result["filter"]["valid"] == 2
+
+
+def test_reference_filter_empty_set_reports_evidence():
+    result = evaluation._reference_identity([], ReferenceFaces(), {
+        "single_face_only": True, "minimum_valid_count": 3,
+        "minimum_valid_fraction": 0.5,
+    })
+    assert result["status"] == "unavailable"
+    assert result["filter"]["total"] == result["filter"]["valid"] == 0
+
+
+def test_shortlist_ties_use_clipping_then_step():
+    checkpoints = [
+        {"step": step, "samples": [{"metrics": {"clipping_fraction_proxy": clipping}}]}
+        for step, clipping in ((300, 0.2), (100, 0.1), (200, 0.1), (400, 0.0))
+    ]
+    identity = [
+        {"step": step, "mean_face_cosine_similarity": 0.8, "prompt_indices": [0, 1, 2]}
+        for step in (100, 200, 300, 400)
+    ]
+    assert [item["step"] for item in evaluation.shortlist_checkpoints(checkpoints, identity)] == [400, 100, 200]
 
 
 def test_evaluate_cli_processes_existing_samples_without_training(tmp_path):

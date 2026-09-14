@@ -21,7 +21,8 @@ def write_configs(tmp_path: Path) -> Path:
                 "datasets": [{"caption_ext": "txt", "resolution": [512]}],
                 "model": {"arch": "flux2_klein_9b"},
                 "train": {"steps": 10},
-                "sample": {"seed": 5, "walk_seed": True, "samples": [{"prompt": "one"}]},
+                "save": {"save_every": 5, "max_step_saves_to_keep": 2},
+                "sample": {"sample_every": 5, "seed": 5, "walk_seed": True, "samples": [{"prompt": "one"}]},
             }],
         },
     }
@@ -69,6 +70,43 @@ def test_job_identity_includes_effective_dataset_settings_and_revision(tmp_path)
     config.write_text(yaml.safe_dump(document), encoding="utf-8")
     third = TrainingQueue(config).materialize()[0].job_id
     assert len({first, second, third}) == 3
+
+
+def test_duration_and_checkpoint_policy_preserve_identity_and_apply_after_digest(tmp_path):
+    config = write_configs(tmp_path)
+    first = TrainingQueue(config).materialize()[0]
+    document = yaml.safe_load(config.read_text())
+    document["checkpoint_policy"] = {"save_every": 5, "max_local_step_saves": 5}
+    document["datasets"][0].update({
+        "training_steps": 12,
+        "training_accounting": {"loader_epochs": 6, "source_image_count": 2},
+    })
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    second = TrainingQueue(config).materialize()[0]
+    generated = yaml.safe_load(second.config_path.read_text())
+    process = generated["config"]["process"][0]
+    assert second.job_id == first.job_id
+    assert process["train"]["steps"] == 12
+    assert process["save"] == {"save_every": 5, "max_step_saves_to_keep": 5}
+    assert generated["meta"]["training_automation_schedule"]["base_training_steps"] == 10
+
+
+def test_duration_change_rejects_non_pending_existing_job(tmp_path):
+    config = write_configs(tmp_path)
+    queue = TrainingQueue(config)
+    job = queue.materialize()[0]
+    (tmp_path / "queue.json").write_text(json.dumps({
+        "schema_version": 2,
+        "jobs": {job.job_id: {
+            "status": "completed", "training_status": "completed",
+            "evaluation_status": "completed", "attempts": 1,
+        }},
+    }), encoding="utf-8")
+    document = yaml.safe_load(config.read_text())
+    document["datasets"][0]["training_steps"] = 12
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(Exception, match="only while training is pending"):
+        TrainingQueue(config).materialize()
 
 
 def test_unsharded_job_keeps_legacy_digest_and_completed_state_skip(tmp_path):

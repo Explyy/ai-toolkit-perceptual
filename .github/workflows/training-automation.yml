@@ -9,6 +9,8 @@ on:
       - "training_automation/**"
       - "tests/training_automation/**"
       - "docker/automation/**"
+      - "config/examples/klein_automation/**"
+      - "docs/training-automation.md"
       - "jobs/process/BaseSDTrainProcess.py"
       - ".github/workflows/training-automation.yml"
   pull_request:
@@ -16,6 +18,8 @@ on:
       - "training_automation/**"
       - "tests/training_automation/**"
       - "docker/automation/**"
+      - "config/examples/klein_automation/**"
+      - "docs/training-automation.md"
       - "jobs/process/BaseSDTrainProcess.py"
       - ".github/workflows/training-automation.yml"
   workflow_dispatch:

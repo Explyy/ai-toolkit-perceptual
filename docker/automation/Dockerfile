@@ -20,7 +20,7 @@ RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/outp
     && python -m training_automation --help >/dev/null \
     && python -c "from training_automation.worker import worker_log_path; assert worker_log_path({'TRAINING_RUN_ID':'smoke','TRAINING_SHARD_ID':'a'}) == __import__('pathlib').Path('/storage/automation/smoke/a/worker.log')" \
     && python -m training_automation run /app/ai-toolkit/config/examples/klein_automation/automation.yaml --dry-run >/tmp/training-automation-dry-run.json \
-    && python -c "import json; from training_automation.backends import InsightFaceCPUBackend; p='/opt/training-automation-models'; assert len(json.load(open(p + '/SOURCES.json'))['archive_sha256']) == 64; InsightFaceCPUBackend(model_dir=p + '/insightface/models/buffalo_l')" \
+    && python -c "import json, numpy as np; from training_automation.backends import InsightFaceCPUBackend, UltralyticsPoseCPUBackend; p='/opt/training-automation-models'; s=json.load(open(p + '/SOURCES.json')); assert len(s['archive_sha256']) == 64; InsightFaceCPUBackend(model_dir=p + '/insightface/models/buffalo_l'); pose=UltralyticsPoseCPUBackend(model_path=s['pose']['path'], expected_sha256=s['pose']['sha256']); assert pose.metrics(np.zeros((64,64,3),dtype=np.uint8))['status'] in {'missing','available','ambiguous','occluded','degenerate'}" \
     && rm /tmp/install_training_automation_overlay.py /tmp/install_evaluation_models.py
 
 ENV TRAINING_AUTOMATION_ROOT=/storage/automation

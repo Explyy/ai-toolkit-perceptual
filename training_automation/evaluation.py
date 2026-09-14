@@ -22,6 +22,23 @@ class FaceBackend(Protocol):
     def embeddings(self, image: np.ndarray) -> list[np.ndarray]: ...
 
 
+def _backend_provenance(backend: Any | None, spec: str | None) -> dict[str, Any]:
+    if backend is None:
+        return {"status": "unavailable", "backend": spec, "reason": "backend not configured"}
+    details = backend.provenance() if hasattr(backend, "provenance") else {}
+    return {"status": "available", "backend": spec, **details}
+
+
+def preflight_evaluation_backends(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Load configured backends before a paid training process starts."""
+    face = _load_backend(config.get("face_backend"), config.get("face_backend_options", {}))
+    landmark = _load_backend(config.get("landmark_backend"), config.get("landmark_backend_options", {}))
+    return {
+        "face_backend": _backend_provenance(face, config.get("face_backend")),
+        "pose_backend": _backend_provenance(landmark, config.get("landmark_backend")),
+    }
+
+
 def _load_backend(spec: str | None, options: Mapping[str, Any]) -> Any | None:
     if not spec:
         return None
@@ -54,26 +71,72 @@ def _unit(vector: np.ndarray) -> np.ndarray | None:
     return None if not math.isfinite(norm) or norm <= 0 else vector / norm
 
 
-def _reference_identity(reference_images: list[Path], backend: FaceBackend | None) -> dict[str, Any]:
+def _reference_identity(
+    reference_images: list[Path], backend: FaceBackend | None,
+    filter_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     if backend is None:
         return {"status": "unavailable", "embedding": None, "reason": "face backend not configured"}
     embeddings = []
+    excluded: list[dict[str, str]] = []
     for path in reference_images:
-        faces = backend.embeddings(np.asarray(Image.open(path).convert("RGB")))
+        try:
+            faces = backend.embeddings(np.asarray(Image.open(path).convert("RGB")))
+        except Exception as exc:
+            if filter_config is None:
+                return {"status": "unavailable", "embedding": None, "reason": f"invalid reference {path.name}: {type(exc).__name__}"}
+            excluded.append({"file": path.name, "reason": "invalid"})
+            continue
         if len(faces) == 0:
+            if filter_config is not None:
+                excluded.append({"file": path.name, "reason": "missing"})
+                continue
             return {"status": "missing", "embedding": None, "reason": f"no face in reference {path.name}"}
         if len(faces) != 1:
+            if filter_config is not None:
+                excluded.append({"file": path.name, "reason": "multiple"})
+                continue
             return {"status": "ambiguous", "embedding": None, "reason": f"multiple faces in reference {path.name}"}
         vector = _unit(faces[0])
         if vector is None:
+            if filter_config is not None:
+                excluded.append({"file": path.name, "reason": "invalid"})
+                continue
             return {"status": "unavailable", "embedding": None, "reason": "invalid reference embedding"}
         embeddings.append(vector)
-    if not embeddings:
+    if not embeddings and filter_config is None:
         return {"status": "missing", "embedding": None, "reason": "no reference images supplied"}
+    counts = {
+        reason: sum(item["reason"] == reason for item in excluded)
+        for reason in ("missing", "multiple", "invalid")
+    }
+    coverage = len(embeddings) / len(reference_images) if reference_images else 0.0
+    filter_evidence = None
+    if filter_config is not None:
+        filter_evidence = {
+            "mode": "exactly-one-valid-face",
+            "total": len(reference_images), "valid": len(embeddings),
+            "coverage_fraction": coverage, "excluded_counts": counts,
+            "excluded": excluded,
+            "minimum_valid_count": int(filter_config["minimum_valid_count"]),
+            "minimum_valid_fraction": float(filter_config["minimum_valid_fraction"]),
+        }
+        if (
+            len(embeddings) < int(filter_config["minimum_valid_count"])
+            or coverage < float(filter_config["minimum_valid_fraction"])
+        ):
+            return {
+                "status": "unavailable", "embedding": None,
+                "reason": "single-face reference coverage is below the configured minimum",
+                "filter": filter_evidence,
+            }
     average = _unit(np.mean(embeddings, axis=0))
     if average is None:
         return {"status": "unavailable", "embedding": None, "reason": "invalid averaged reference embedding"}
-    return {"status": "available", "embedding": average, "reason": None}
+    return {
+        "status": "available", "embedding": average, "reason": None,
+        **({"filter": filter_evidence} if filter_evidence is not None else {}),
+    }
 
 
 def _identity_metric(image: np.ndarray, backend: FaceBackend | None, reference: Mapping[str, Any]) -> dict[str, Any]:
@@ -138,26 +201,46 @@ def rank_identity(checkpoints: list[dict[str, Any]]) -> tuple[list[dict[str, Any
         }
         for checkpoint in checkpoints
     ]
-    if not available_sets or not available_sets[0]:
-        return [], "no checkpoint has a valid identity subset"
-    if any(indices != available_sets[0] for indices in available_sets[1:]):
-        return [], "valid identity subsets are not comparable across checkpoints"
+    common = set.intersection(*available_sets) if available_sets else set()
+    if len(common) < 3:
+        return [], "fewer than three prompt indices have valid faces at every checkpoint"
     ranked = []
     for checkpoint in checkpoints:
         values = [
             sample["identity"]["cosine_similarity"]
             for sample in checkpoint["samples"]
-            if sample["prompt_index"] in available_sets[0]
+            if sample["prompt_index"] in common and sample["identity"]["status"] == "available"
         ]
         ranked.append(
             {
                 "step": checkpoint["step"],
                 "mean_face_cosine_similarity": sum(values) / len(values),
-                "prompt_indices": sorted(available_sets[0]),
+                "prompt_indices": sorted(common),
             }
         )
     ranked.sort(key=lambda item: (-item["mean_face_cosine_similarity"], item["step"]))
     return ranked, None
+
+
+def shortlist_checkpoints(
+    checkpoints: list[dict[str, Any]], identity_ranked: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    by_step = {item["step"]: item for item in identity_ranked}
+    items = []
+    for checkpoint in checkpoints:
+        identity = by_step.get(checkpoint["step"])
+        if identity is None:
+            continue
+        clipping = [sample["metrics"]["clipping_fraction_proxy"] for sample in checkpoint["samples"]]
+        items.append({
+            **identity,
+            "mean_clipping_fraction_proxy": sum(clipping) / len(clipping),
+        })
+    items.sort(key=lambda item: (
+        -item["mean_face_cosine_similarity"],
+        item["mean_clipping_fraction_proxy"], item["step"],
+    ))
+    return items[:3]
 
 
 def _choose_latest_complete_run(
@@ -192,7 +275,9 @@ def evaluate_job(
         job_name = yaml.safe_load(handle)["config"]["name"]
     face = _load_backend(config.get("face_backend"), config.get("face_backend_options", {}))
     landmark = _load_backend(config.get("landmark_backend"), config.get("landmark_backend_options", {}))
-    reference = _reference_identity(reference_images, face)
+    reference = _reference_identity(
+        reference_images, face, config.get("reference_identity_filter")
+    )
     grouped: dict[int, list[dict[str, Any]]] = {}
     for path in sorted((output_dir / "samples").glob("*")):
         match = SAMPLE_RE.match(path.name)
@@ -297,12 +382,15 @@ def evaluate_job(
     expected_signature = {(index, item["seed"]) for index, item in expected.items()}
     ranked, ranking_error = rank_checkpoints(checkpoints, expected_signature)
     identity_ranked, identity_ranking_error = rank_identity(checkpoints)
+    shortlist = shortlist_checkpoints(checkpoints, identity_ranked) if not identity_ranking_error else []
     report = {
         "schema_version": REPORT_SCHEMA,
         "job_config": str(job_config_path),
         "final_step": final_step,
         "reference_identity_status": {key: value for key, value in reference.items() if key != "embedding"},
         "reference_provenance": str(config.get("reference_provenance", "unspecified")),
+        "face_backend": _backend_provenance(face, config.get("face_backend")),
+        "pose_backend": _backend_provenance(landmark, config.get("landmark_backend")),
         "checkpoints": checkpoints,
         "ranking": {
             "status": "available" if not ranking_error else "unavailable",
@@ -313,8 +401,14 @@ def evaluate_job(
         "identity_ranking": {
             "status": "available" if not identity_ranking_error else "unavailable",
             "reason": identity_ranking_error,
-            "method": "mean face cosine similarity on the same valid prompt-index subset for every checkpoint; heuristic only",
+            "method": "mean face cosine similarity on the intersection of prompt indices valid at every checkpoint; heuristic only",
             "items": identity_ranked,
+        },
+        "automatic_shortlist": {
+            "status": "available" if shortlist else "unavailable",
+            "reason": identity_ranking_error,
+            "method": "top three by mean face cosine descending on the common valid-face prompt subset, then mean clipping ascending, then step ascending; evidence shortlist only",
+            "items": shortlist,
         },
         "pose_body_limit": "optional backend output is viewpoint- and visibility-dependent and is not a 3D body measurement",
     }

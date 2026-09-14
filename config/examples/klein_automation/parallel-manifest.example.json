@@ -7,6 +7,10 @@
   "storage": {
     "minimum_free_bytes": 60000000000
   },
+  "checkpoint_policy": {
+    "save_every": 100,
+    "max_local_step_saves": 5
+  },
   "catalog": {
     "remote_prefix": "training-backups"
   },
@@ -61,6 +65,19 @@
     "face_backend": "training_automation.backends:InsightFaceCPUBackend",
     "face_backend_options": {
       "model_dir": "/opt/training-automation-models/insightface/models/buffalo_l"
+    },
+    "reference_identity_filter": {
+      "single_face_only": true,
+      "minimum_valid_count": 3,
+      "minimum_valid_fraction": 0.5
+    },
+    "landmark_backend": "training_automation.backends:UltralyticsPoseCPUBackend",
+    "landmark_backend_options": {
+      "model_path": "/opt/training-automation-models/ultralytics/yolo11n-pose.pt",
+      "expected_sha256": "869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0",
+      "min_detection_confidence": 0.25,
+      "min_keypoint_confidence": 0.5,
+      "image_size": 640
     }
   },
   "archive": {

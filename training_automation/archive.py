@@ -6,7 +6,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from .backup import BackupError, LocalArtifact, sha256_file
+from .backup import BackupError, LocalArtifact, sha256_file, verify_remote_artifacts
 from .catalog import safe_relative_path
 from .state import atomic_write_json, read_json
 
@@ -27,6 +27,10 @@ class ArchiveClient(Protocol):
     def path_metadata(
         self, repo_id: str, repo_type: str, paths: list[str], revision: str
     ) -> Mapping[str, Mapping[str, Any]]: ...
+
+    def download_file(
+        self, repo_id: str, repo_type: str, path: str, revision: str, destination: Path
+    ) -> None: ...
 
 
 class EvidenceArchive:
@@ -81,19 +85,14 @@ class EvidenceArchive:
         return state
 
     def _verify(self, artifacts: Sequence[LocalArtifact], revision: str) -> None:
-        metadata = self.client.path_metadata(
-            self.repo_id,
-            self.repo_type,
-            [item.remote_path for item in artifacts],
-            revision,
+        verify_remote_artifacts(
+            self.client,
+            repo_id=self.repo_id,
+            repo_type=self.repo_type,
+            artifacts=artifacts,
+            revision=revision,
+            context="archive",
         )
-        for artifact in artifacts:
-            remote = metadata.get(artifact.remote_path)
-            if remote is None or int(remote.get("size", -1)) != artifact.size:
-                raise BackupError(f"archive size verification failed for {artifact.remote_path}")
-            remote_sha = remote.get("sha256")
-            if remote_sha and str(remote_sha).removeprefix("sha256:") != artifact.sha256:
-                raise BackupError(f"archive hash verification failed for {artifact.remote_path}")
 
     def publish(
         self,
