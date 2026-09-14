@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pytest pyyaml pillow numpy
-      - run: pytest -q tests/training_automation
+      - run: python -m pytest -q tests/training_automation
 
   docker:
     if: github.event_name == 'workflow_dispatch'
