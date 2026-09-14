@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "run_id": "replace-with-run-id",
+  "recipe_id": "subject_likeness_masked_flux2_klein9b",
+  "expected_jobs_per_shard": 3,
+  "dataset_revision": "0000000000000000000000000000000000000000",
+  "storage": {
+    "minimum_free_bytes": 60000000000
+  },
+  "catalog": {
+    "remote_prefix": "training-backups"
+  },
+  "model_sources": [
+    {
+      "kind": "base_model",
+      "repo_id": "black-forest-labs/FLUX.2-klein-base-9B",
+      "revision": "32773329fbe7e81a90ef971740e8ba4b0364ecf3",
+      "local_path": "pinned/flux2-klein-base-9b-32773329",
+      "allow_patterns": [
+        "model_index.json",
+        "scheduler/*",
+        "text_encoder/*",
+        "tokenizer/*",
+        "transformer/*",
+        "vae/*"
+      ]
+    },
+    {
+      "kind": "depth_model",
+      "repo_id": "depth-anything/Depth-Anything-V2-Large-hf",
+      "revision": "7581137eff8d4e94f6e796d3baea0e9fa79b22d2",
+      "local_path": "pinned/depth-anything-v2-large-7581137e",
+      "allow_patterns": [
+        "config.json",
+        "preprocessor_config.json",
+        "model.safetensors"
+      ]
+    }
+  ],
+  "evaluation": {
+    "enabled": true,
+    "require_identity_available": true,
+    "reference_provenance": "training-set",
+    "face_backend": "training_automation.backends:InsightFaceCPUBackend",
+    "face_backend_options": {
+      "model_dir": "/opt/training-automation-models/insightface/models/buffalo_l"
+    }
+  },
+  "archive": {
+    "remote_prefix": "training-runs"
+  },
+  "binding": {
+    "remote_path": "bindings/replace-with-run-id/{shard_id}.json",
+    "wait_seconds": 900,
+    "poll_seconds": 5
+  },
+  "datasets": [
+    {
+      "id": "subject-01",
+      "shard_id": "a",
+      "catalog_name": "replace-private-catalog-name-01",
+      "expected_catalog_id": 1,
+      "trigger_word": "REPLACE_TOKEN",
+      "destination_kind": "loras",
+      "reference_paths": ["reference.jpg"],
+      "files": [{"remote_path": "datasets/subject-01/reference.jpg", "relative_path": "reference.jpg", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]
+    },
+    {
+      "id": "subject-02",
+      "shard_id": "a",
+      "catalog_name": "replace-private-catalog-name-02",
+      "expected_catalog_id": 2,
+      "trigger_word": "REPLACE_TOKEN",
+      "destination_kind": "loras",
+      "reference_paths": ["reference.jpg"],
+      "files": [{"remote_path": "datasets/subject-02/reference.jpg", "relative_path": "reference.jpg", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]
+    },
+    {
+      "id": "subject-03",
+      "shard_id": "a",
+      "catalog_name": "replace-private-catalog-name-03",
+      "expected_catalog_id": 3,
+      "trigger_word": "REPLACE_TOKEN",
+      "destination_kind": "loras",
+      "reference_paths": ["reference.jpg"],
+      "files": [{"remote_path": "datasets/subject-03/reference.jpg", "relative_path": "reference.jpg", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]
+    },
+    {
+      "id": "subject-04",
+      "shard_id": "b",
+      "catalog_name": "replace-private-catalog-name-04",
+      "expected_catalog_id": 4,
+      "trigger_word": "REPLACE_TOKEN",
+      "destination_kind": "loras",
+      "reference_paths": ["reference.jpg"],
+      "files": [{"remote_path": "datasets/subject-04/reference.jpg", "relative_path": "reference.jpg", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]
+    },
+    {
+      "id": "subject-05",
+      "shard_id": "b",
+      "catalog_name": "replace-private-catalog-name-05",
+      "expected_catalog_id": 5,
+      "trigger_word": "REPLACE_TOKEN",
+      "destination_kind": "loras",
+      "reference_paths": ["reference.jpg"],
+      "files": [{"remote_path": "datasets/subject-05/reference.jpg", "relative_path": "reference.jpg", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]
+    },
+    {
+      "id": "subject-06",
+      "shard_id": "b",
+      "catalog_name": "replace-private-catalog-name-06",
+      "expected_catalog_id": 6,
+      "trigger_word": "REPLACE_TOKEN",
+      "destination_kind": "loras",
+      "reference_paths": ["reference.jpg"],
+      "files": [{"remote_path": "datasets/subject-06/reference.jpg", "relative_path": "reference.jpg", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]
+    }
+  ]
+}

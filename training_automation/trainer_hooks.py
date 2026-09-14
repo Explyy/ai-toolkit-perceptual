@@ -34,6 +34,7 @@ def initialize_checkpoint_backup(process: Any) -> CheckpointBackup | None:
             "base_model": (config.get("catalog") or {}).get("base_model") or getattr(process.model_config, "name_or_path", None),
             "trigger_word": (config.get("catalog") or {}).get("trigger_word", process.get_conf("trigger_word", None)),
             "destination_kind": (config.get("catalog") or {}).get("destination_kind", "loras"),
+            "expected_id": (config.get("catalog") or {}).get("expected_id"),
         },
     )
     backup.validate_destination()

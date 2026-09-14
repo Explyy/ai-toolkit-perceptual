@@ -286,6 +286,11 @@ class CheckpointBackup:
                 "destination_kind": self.catalog_metadata.get("destination_kind", "loras"),
             }
         )
+        expected_id = self.catalog_metadata.get("expected_id")
+        if expected_id is not None and int(model["id"]) != int(expected_id):
+            raise BackupConfigurationError(
+                f"catalog model {model_name!r} has id {model['id']}, expected pre-reserved id {expected_id}"
+            )
         remote_root = PurePosixPath(self.remote_prefix) / "models" / model["folder"] / "checkpoints" / qualified_checkpoint_id
         artifacts: list[LocalArtifact] = []
         used: set[str] = set()

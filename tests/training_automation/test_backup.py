@@ -197,3 +197,25 @@ def test_different_jobs_at_same_step_keep_distinct_catalog_checkpoints(tmp_path)
     assert len(checkpoint_ids) == 2
     assert checkpoint_ids[0].startswith("first-job--")
     assert checkpoint_ids[1].startswith("second-job--")
+
+
+def test_pre_reserved_catalog_id_mismatch_fails_before_checkpoint_upload(tmp_path):
+    client = FakeHubClient()
+    checkpoint = tmp_path / "job_000000010.safetensors"
+    checkpoint.write_bytes(b"weights")
+    backup = CheckpointBackup(
+        repo_id="owner/private", repo_type="dataset",
+        state_path=tmp_path / "backup.json", client=client,
+        catalog_metadata={
+            "name": "character", "base_arch": "flux2_klein_9b",
+            "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+            "trigger_word": "TOK", "destination_kind": "loras",
+            "expected_id": 2,
+        },
+    )
+    with pytest.raises(BackupConfigurationError, match="expected pre-reserved id 2"):
+        backup.protect(
+            job_id="job", checkpoint_id="step-000000010", step=10,
+            paths=[checkpoint], final=False,
+        )
+    assert not any(message.startswith("Backup") for message in client.messages)

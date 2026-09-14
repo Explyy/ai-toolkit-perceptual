@@ -68,6 +68,7 @@ class TrainingQueue:
         self.state_path = (base / self.config.get("state_path", "queue-state.json")).resolve()
         self.repo_root = Path(self.config.get("repo_root", Path(__file__).resolve().parents[1])).resolve()
         self.python = str(self.config.get("python", sys.executable))
+        self.shard_id = self.config.get("shard_id")
         self._run_command = run_command or self._subprocess
 
     @staticmethod
@@ -78,6 +79,14 @@ class TrainingQueue:
         datasets = self.config.get("datasets")
         if not isinstance(datasets, list) or not datasets:
             raise QueueConfigurationError("datasets must be a non-empty list")
+        if any(not isinstance(item, dict) for item in datasets):
+            raise QueueConfigurationError("each dataset must be a mapping")
+        if self.shard_id is not None:
+            if any("shard_id" not in item for item in datasets):
+                raise QueueConfigurationError("every dataset requires shard_id in a sharded queue")
+            datasets = [item for item in datasets if item.get("shard_id") == self.shard_id]
+            if not datasets:
+                raise QueueConfigurationError(f"no datasets assigned to shard {self.shard_id!r}")
         return datasets
 
     def materialize(self) -> list[QueueJob]:
@@ -104,6 +113,7 @@ class TrainingQueue:
                 "name": raw.get("name"),
                 "trainer_dataset": raw.get("trainer_dataset", {}),
                 "dataset_revision": raw.get("dataset_revision"),
+                "shard_id": self.shard_id,
             }
             digest = hashlib.sha256(_canonical(identity).encode()).hexdigest()[:12]
             job_id = f"{_slug(str(raw.get('name') or Path(raw['folder']).name))}-{digest}"
@@ -114,6 +124,8 @@ class TrainingQueue:
             document["config"]["name"] = job_id
             process = document["config"]["process"][0]
             process["trigger_word"] = raw.get("trigger_word")
+            if self.config.get("training_folder"):
+                process["training_folder"] = str(self.config["training_folder"])
             dataset = copy.deepcopy(raw.get("trainer_dataset", {}))
             if base_process.get("datasets"):
                 defaults = copy.deepcopy(base_process["datasets"][0])
@@ -132,6 +144,8 @@ class TrainingQueue:
                 catalog.setdefault("base_model", process.get("model", {}).get("name_or_path"))
                 catalog["trigger_word"] = raw.get("trigger_word")
                 catalog["destination_kind"] = str(raw.get("destination_kind", catalog.get("destination_kind", "loras")))
+                if raw.get("expected_catalog_id") is not None:
+                    catalog["expected_id"] = int(raw["expected_catalog_id"])
                 backup.setdefault(
                     "state_path", str(output_root / job_id / ".automation" / "backup-state.json")
                 )

@@ -17,6 +17,10 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="materialize and run the sequential training queue")
     run.add_argument("config", type=Path)
     run.add_argument("--dry-run", action="store_true")
+    commands.add_parser(
+        "parallel-run",
+        help="run the private pinned parallel shard bootstrap and success-only self-delete",
+    )
     evaluate = commands.add_parser("evaluate", help="evaluate existing checkpoint samples without training")
     evaluate.add_argument("job_config", type=Path)
     evaluate.add_argument("output_dir", type=Path)
@@ -59,6 +63,10 @@ def main(argv: list[str] | None = None) -> int:
             for item in result.get("jobs", {}).values()
         ):
             return 1
+    elif args.command == "parallel-run":
+        from .bootstrap import run_parallel_bootstrap
+
+        print(json.dumps(run_parallel_bootstrap(), indent=2))
     elif args.command == "evaluate":
         import yaml
 

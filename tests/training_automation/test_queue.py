@@ -70,6 +70,31 @@ def test_job_identity_includes_effective_dataset_settings_and_revision(tmp_path)
     assert len({first, second, third}) == 3
 
 
+def test_sharded_queue_materializes_only_assignment_with_isolated_output(tmp_path):
+    config = write_configs(tmp_path)
+    document = yaml.safe_load(config.read_text())
+    document.update({
+        "shard_id": "a",
+        "training_folder": str(tmp_path / "output" / "run-1" / "a"),
+    })
+    first = document["datasets"][0]
+    first.update({"shard_id": "a", "expected_catalog_id": 1})
+    document["datasets"].append({
+        **first, "name": "Person Two", "shard_id": "b",
+        "expected_catalog_id": 2,
+    })
+    document["checkpoint_backup"] = {
+        "enabled": True, "repo_id": "owner/private", "repo_type": "dataset",
+    }
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    jobs = TrainingQueue(config).materialize()
+    assert len(jobs) == 1
+    generated = yaml.safe_load(jobs[0].config_path.read_text())
+    process = generated["config"]["process"][0]
+    assert process["training_folder"] == str(tmp_path / "output" / "run-1" / "a")
+    assert process["checkpoint_backup"]["catalog"]["expected_id"] == 1
+
+
 def test_dry_run_does_not_launch_and_resume_skips_completed(tmp_path):
     config = write_configs(tmp_path)
     calls = []

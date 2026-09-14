@@ -1,0 +1,182 @@
+---
+# Provenance: origin/perceptual-port@ab5f146e9a30764a40bf29b0881d3a6dd7186c6f
+# ui/src/app/jobs/new/quickstarts.ts, subject_likeness_masked_flux2_klein9b.
+# Only paths, trigger, backup integration, and evaluation prompts are injected.
+job: extension
+config:
+  name: generated-by-parallel-queue
+  process:
+    - type: diffusion_trainer
+      training_folder: /storage/output
+      sqlite_db_path: ./aitk_db.db
+      device: cuda
+      trigger_word: null
+      performance_log_every: 10
+      network:
+        type: lokr
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+        network_kwargs:
+          ignore_if_contains: []
+      save:
+        dtype: bf16
+        save_every: 25
+        max_step_saves_to_keep: 120
+        save_format: diffusers
+        push_to_hub: false
+      datasets:
+        - folder_path: replaced-by-bootstrap
+          mask_path: null
+          mask_min_value: 0.1
+          default_caption: ''
+          caption_ext: txt
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          network_weight: 1
+          resolution: [512, 768, 1024]
+          controls: []
+          shrink_video_to_frames: true
+          num_frames: 1
+          flip_x: false
+          flip_y: false
+          num_repeats: [16, 4, 1]
+          loss_split: sum
+      train:
+        weight_noise:
+          enabled: true
+          mode: relative
+          sigma: 0.0125
+          log_every: 1
+        max_grad_norm: 1
+        batch_size: 4
+        bypass_guidance_embedding: false
+        steps: 1200
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        timestep_type: linear
+        content_or_style: balanced
+        optimizer_params:
+          weight_decay: 0.0001
+        unload_text_encoder: false
+        cache_text_embeddings: true
+        lr: 0.00005
+        ema_config:
+          use_ema: false
+          ema_decay: 0.99
+        skip_first_sample: false
+        force_first_sample: true
+        disable_sampling: false
+        dtype: bf16
+        diff_output_preservation: false
+        diff_output_preservation_multiplier: 1
+        diff_output_preservation_class: person
+        switch_boundary_every: 1
+        loss_type: mse
+        diffusion_loss_weight: 1
+        diffusion_loss_max_t: 1
+        diffusion_loss_min_t: 0
+        custom_timestep_distribution: null
+        custom_timestep_curve: null
+        max_denoising_steps: 999
+        min_denoising_steps: 0
+        loss_split: null
+      logging:
+        log_every: 1
+        use_ui_logger: true
+      model:
+        name_or_path: black-forest-labs/FLUX.2-klein-base-9B
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        arch: flux2_klein_9b
+        low_vram: false
+        model_kwargs:
+          match_target_res: false
+        layer_offloading: false
+        layer_offloading_text_encoder_percent: 1
+        layer_offloading_transformer_percent: 1
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 640
+        height: 960
+        samples:
+          - {prompt: "neutral clothed portrait photo of [trigger], soft daylight"}
+          - {prompt: "close clothed portrait of [trigger], neutral background"}
+          - {prompt: "three-quarter clothed portrait of [trigger], overcast light"}
+          - {prompt: "full body photo of [trigger] in a plain dark outfit, studio"}
+          - {prompt: "full body photo of [trigger] in a plain light outfit, studio"}
+          - {prompt: "clothed photo of [trigger] standing beside a plain wall"}
+          - {prompt: "clothed photo of [trigger] seated on a simple chair"}
+          - {prompt: "clothed photo of [trigger] walking in soft daylight"}
+          - {prompt: "clothed photo of [trigger] facing camera, hands visible"}
+          - {prompt: "clothed profile photo of [trigger], plain background"}
+          - {prompt: "clothed waist-up photo of [trigger], window light"}
+          - {prompt: "clothed full-length photo of [trigger], even lighting"}
+          - {prompt: "clothed portrait of [trigger] looking slightly left"}
+          - {prompt: "clothed portrait of [trigger] looking slightly right"}
+          - {prompt: "clothed portrait of [trigger], neutral expression"}
+          - {prompt: "clothed portrait of [trigger], gentle smile"}
+          - {prompt: "clothed photo of [trigger] with arms relaxed"}
+          - {prompt: "clothed photo of [trigger] seated at a plain table"}
+          - {prompt: "clothed photo of [trigger] indoors in diffuse light"}
+          - {prompt: "clothed photo of [trigger] outdoors in diffuse light"}
+          - {prompt: "clothed medium shot of [trigger], simple backdrop"}
+          - {prompt: "clothed documentary photo of [trigger], natural light"}
+          - {prompt: "clothed identity reference portrait of [trigger], front view"}
+        neg: ''
+        seed: 42
+        walk_seed: false
+        guidance_scale: 4
+        sample_steps: 25
+        num_frames: 1
+        fps: 1
+      face_id:
+        enabled: false
+        init_scale: 0.3
+        identity_loss_weight: 0
+        landmark_loss_weight: 0
+        body_proportion_loss_weight: 0
+        body_proportion_loss_min_t: 0.8
+        body_proportion_loss_max_t: 1
+        body_shape_loss_weight: 0
+        body_shape_loss_max_t: 1
+        body_shape_loss_min_t: 0.8
+        identity_loss_min_t: 0
+        identity_loss_max_t: 0.9
+        identity_metrics: false
+        identity_loss_use_average: true
+        identity_loss_min_cos: 0.4
+      depth_consistency:
+        loss_weight: 0.005
+        input_size: 518
+        preview_every: 1
+        mask_source: subject
+        loss_max_t: 1
+        model_id: depth-anything/Depth-Anything-V2-Large-hf
+        loss_min_t: 0
+        grad_checkpoint: true
+        ssi_weight: 0
+        grad_weight: 1
+        grad_scales: 6
+      subject_mask:
+        enabled: true
+        background_loss_weight: 0
+        clothing_loss_weight: 1
+        body_loss_weight: 1
+        save_debug_previews: true
+        cache_resolution: 768
+        segformer_res: 768
+meta:
+  name: "[name]"
+  version: "1.0"

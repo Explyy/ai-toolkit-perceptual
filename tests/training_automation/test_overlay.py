@@ -48,3 +48,15 @@ def test_rejects_unknown_or_partial_trainer():
 def test_current_checkout_is_already_a_complete_overlay():
     source = (Path(__file__).parents[2] / "jobs/process/BaseSDTrainProcess.py").read_text()
     assert patch_trainer(source) == source
+
+
+def test_docker_overlay_keeps_gui_default_and_adds_opt_in_parallel_command():
+    root = Path(__file__).parents[2]
+    dockerfile = (root / "docker/automation/Dockerfile").read_text()
+    command = (root / "docker/automation/run_parallel_training.sh").read_text()
+    instructions = [line.strip() for line in dockerfile.splitlines() if not line.lstrip().startswith("#")]
+    assert "COPY docker/automation/run_parallel_training.sh /run-parallel-training" in dockerfile
+    assert not any(line.startswith("CMD ") for line in instructions)
+    assert not any(line.startswith("ENTRYPOINT ") for line in instructions)
+    assert "python -m training_automation parallel-run" in command
+    assert "InsightFaceCPUBackend" in dockerfile

@@ -302,6 +302,7 @@ def evaluate_job(
         "job_config": str(job_config_path),
         "final_step": final_step,
         "reference_identity_status": {key: value for key, value in reference.items() if key != "embedding"},
+        "reference_provenance": str(config.get("reference_provenance", "unspecified")),
         "checkpoints": checkpoints,
         "ranking": {
             "status": "available" if not ranking_error else "unavailable",

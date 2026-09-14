@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - codex/klein-training-backup-evaluation
+      - codex/parallel-klein-training
     paths:
       - "training_automation/**"
       - "tests/training_automation/**"
