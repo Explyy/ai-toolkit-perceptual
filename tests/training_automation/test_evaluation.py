@@ -2,10 +2,12 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import yaml
 from PIL import Image
 
 from training_automation import cli, evaluation
+from training_automation.backup import BackupError
 
 
 def setup_job(tmp_path: Path):
@@ -121,6 +123,54 @@ def test_archived_verified_checkpoint_is_evaluated_without_local_weight(tmp_path
     assert archived["checkpoint_paths"] == []
     assert archived["catalog_checkpoint_id"] == "job--step-000000100--abc123"
     assert archived["remote_checkpoint"]["commit_id"] == "immutable-revision"
+    assert archived["remote_association"]["status"] == "unique"
+
+
+def test_differing_remote_variants_at_same_step_are_explicitly_ambiguous(tmp_path):
+    config_path, output = setup_job(tmp_path)
+    state = output / ".automation" / "backup-state.json"
+    state.parent.mkdir()
+    receipt = {
+        "status": "backed_up", "verified": True, "cataloged": True,
+        "step": 100, "job_id": "person-deadbeef0000",
+    }
+    state.write_text(json.dumps({
+        "schema_version": 2,
+        "destination": {
+            "repo_id": "owner/private", "repo_type": "dataset",
+            "remote_prefix": "training-backups",
+        },
+        "checkpoints": {
+            "zzz-sorted-last": {
+                **receipt, "catalog_checkpoint_id": "checkpoint-first",
+                "commit_id": "revision-first",
+                "artifacts": [{"role": "weights", "sha256": "aaa"}],
+            },
+            "aaa-sorted-first": {
+                **receipt, "catalog_checkpoint_id": "checkpoint-second",
+                "commit_id": "revision-second",
+                "artifacts": [{"role": "weights", "sha256": "bbb"}],
+            },
+        },
+    }), encoding="utf-8")
+    report_path = evaluation.evaluate_job(
+        job_config_path=config_path, output_dir=output,
+        reference_images=[], config={},
+    )
+    report = json.loads(report_path.read_text())
+    checkpoint = report["checkpoints"][0]
+    assert checkpoint["remote_association"]["status"] == "ambiguous"
+    assert checkpoint["catalog_checkpoint_id"] is None
+    assert checkpoint["remote_checkpoint"] is None
+    assert {item["catalog_checkpoint_id"] for item in checkpoint["remote_checkpoint_candidates"]} == {
+        "checkpoint-first", "checkpoint-second",
+    }
+    with pytest.raises(BackupError, match="multiple remote checkpoint variants"):
+        cli.main([
+            "select", str(report_path), "100", "--note", "manual",
+            "--repo-id", "owner/private", "--repo-type", "dataset",
+            "--model", "person",
+        ])
 
 
 def test_latest_complete_duplicate_sample_run_is_used_once(tmp_path):

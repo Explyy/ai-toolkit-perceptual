@@ -220,7 +220,7 @@ def evaluate_job(
         )
     checkpoint_steps: set[int] = set()
     checkpoint_paths: dict[int, list[str]] = {}
-    checkpoint_remote: dict[int, dict[str, Any]] = {}
+    checkpoint_remote: dict[int, list[dict[str, Any]]] = {}
     step_pattern = re.compile(r"_(\d{9})(?:_|\.|$)")
     for path in output_dir.iterdir() if output_dir.is_dir() else []:
         if path.name.startswith(".") or path.name in {"samples", "optimizer.pt", "config.yaml"}:
@@ -249,24 +249,47 @@ def evaluate_job(
                 continue
             step = int(entry["step"])
             checkpoint_steps.add(step)
-            checkpoint_remote[step] = {
+            checkpoint_remote.setdefault(step, []).append({
                 "catalog_checkpoint_id": entry.get("catalog_checkpoint_id"),
                 "commit_id": entry.get("commit_id"),
                 "cataloged": True,
                 "destination": backup_state.get("destination"),
-            }
+                "weight_sha256": sorted(
+                    item["sha256"]
+                    for item in entry.get("artifacts", [])
+                    if item.get("role") == "weights" and item.get("sha256")
+                ),
+            })
     expected_indices = set(expected)
     checkpoints = []
     for step in sorted(checkpoint_steps & grouped.keys()):
         selected_samples, sample_run_status, discarded_samples = _choose_latest_complete_run(
             grouped[step], expected_indices
         )
+        remote_candidates = sorted(
+            checkpoint_remote.get(step, []),
+            key=lambda item: (str(item.get("catalog_checkpoint_id")), str(item.get("commit_id"))),
+        )
+        if len(remote_candidates) == 1:
+            remote_association = {"status": "unique", "reason": None}
+            remote_checkpoint = remote_candidates[0]
+        elif len(remote_candidates) > 1:
+            remote_association = {
+                "status": "ambiguous",
+                "reason": "multiple verified catalog checkpoints exist for this job and step; sample filenames do not identify checkpoint bytes",
+            }
+            remote_checkpoint = None
+        else:
+            remote_association = {"status": "unavailable", "reason": "no verified catalog checkpoint receipt for this job and step"}
+            remote_checkpoint = None
         checkpoints.append({
             "step": step,
             "final": step == final_step,
             "checkpoint_paths": sorted(checkpoint_paths.get(step, [])),
-            "catalog_checkpoint_id": checkpoint_remote.get(step, {}).get("catalog_checkpoint_id"),
-            "remote_checkpoint": checkpoint_remote.get(step),
+            "catalog_checkpoint_id": remote_checkpoint.get("catalog_checkpoint_id") if remote_checkpoint else None,
+            "remote_checkpoint": remote_checkpoint,
+            "remote_checkpoint_candidates": remote_candidates,
+            "remote_association": remote_association,
             "samples": selected_samples,
             "sample_run_status": sample_run_status,
             "discarded_duplicate_or_partial_samples": discarded_samples,

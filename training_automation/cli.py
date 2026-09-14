@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from .backup import BackupConfigurationError, HuggingFaceBackupClient, sha256_file
+from .backup import BackupConfigurationError, BackupError, HuggingFaceBackupClient, sha256_file
 from .catalog import CatalogStore, restore_generation, restore_training
 from .evaluation import evaluate_job, persist_selection
 from .queue import TrainingQueue
@@ -75,9 +75,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.repo_id or os.environ.get(args.repo_id_env):
             if not args.model:
                 raise BackupConfigurationError("--model is required when publishing selection")
-            store = _store(args)
             report = json.loads(args.report.read_text(encoding="utf-8"))
             checkpoint = next(item for item in report["checkpoints"] if int(item["step"]) == args.step)
+            if checkpoint.get("remote_association", {}).get("status") == "ambiguous":
+                raise BackupError(
+                    "cannot publish selection: multiple remote checkpoint variants share this sample step"
+                )
+            store = _store(args)
             checkpoint_id = checkpoint.get("catalog_checkpoint_id")
             if not checkpoint_id:
                 checkpoint_id = f"step-{args.step:09d}" + ("-final" if checkpoint.get("final") else "")
