@@ -101,6 +101,7 @@ def test_ultralytics_backend_does_not_choose_from_missing_or_multiple_people(cou
     backend._image_size = 640
     backend._min_detection_confidence = 0.25
     backend._min_keypoint_confidence = 0.5
+    backend._iou_threshold = 0.7
     result = backend.metrics(np.zeros((100, 200, 3), dtype=np.uint8))
     assert result["status"] == status
     assert result["values"] is None

@@ -182,7 +182,7 @@ class UltralyticsPoseCPUBackend:
     def __init__(
         self, *, model_path: str, expected_sha256: str,
         min_detection_confidence: float = 0.25, min_keypoint_confidence: float = 0.5,
-        image_size: int = 640,
+        iou_threshold: float = 0.7, image_size: int = 640,
     ):
         path = Path(model_path).resolve()
         if not path.is_file():
@@ -197,12 +197,14 @@ class UltralyticsPoseCPUBackend:
         self._sha256 = actual
         self._min_detection_confidence = float(min_detection_confidence)
         self._min_keypoint_confidence = float(min_keypoint_confidence)
+        self._iou_threshold = float(iou_threshold)
         self._image_size = int(image_size)
 
     def metrics(self, image: np.ndarray) -> dict[str, Any]:
         results = self._model.predict(
             source=image, device="cpu", verbose=False, imgsz=self._image_size,
-            conf=self._min_detection_confidence, max_det=2,
+            conf=self._min_detection_confidence, iou=self._iou_threshold,
+            max_det=2, augment=False, deterministic=True, save=False,
         )
         if not results:
             return {"status": "missing", "values": None, "reason": "no pose detected"}
@@ -227,4 +229,5 @@ class UltralyticsPoseCPUBackend:
             "device": "cpu", "image_size": self._image_size,
             "min_detection_confidence": self._min_detection_confidence,
             "min_keypoint_confidence": self._min_keypoint_confidence,
+            "iou_threshold": self._iou_threshold,
         }
