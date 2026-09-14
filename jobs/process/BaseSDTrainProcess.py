@@ -76,6 +76,11 @@ import hashlib
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
+from training_automation.trainer_hooks import (
+    checkpoint_may_be_removed,
+    initialize_checkpoint_backup,
+    protect_training_checkpoint,
+)
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
@@ -128,6 +133,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.first_sample_config = self.sample_config
         self.logging_config = LoggingConfig(**self.get_conf('logging', {}))
         self.logger = create_logger(self.logging_config, config, self.save_root)
+        self._training_checkpoint_backup = initialize_checkpoint_backup(self)
         self.optimizer: torch.optim.Optimizer = None
         self.lr_scheduler = None
         self.data_loader: Union[DataLoader, None] = None
@@ -479,6 +485,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             items_to_remove = list(dict.fromkeys(items_to_remove))
 
             for item in items_to_remove:
+                if not checkpoint_may_be_removed(self, item):
+                    print_acc(f"Retaining unbacked save: {item}")
+                    continue
                 print_acc(f"Removing old save: {item}")
                 if os.path.isdir(item):
                     shutil.rmtree(item)
@@ -684,6 +693,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     get_torch_dtype(self.save_config.dtype)
                 )
 
+        checkpoint_path = file_path
+
         # save learnable params as json if we have thim
         if self.snr_gos:
             json_data = {
@@ -696,7 +707,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with open(path_to_save, 'w') as f:
                 json.dump(json_data, f, indent=4)
         
-        print_acc(f"Saved checkpoint to {file_path}")
+        print_acc(f"Saved checkpoint to {checkpoint_path}")
 
         # save optimizer
         if self.optimizer is not None:
@@ -713,6 +724,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(e)
                 print_acc("Could not save optimizer")
 
+        # A configured backup is synchronous and commit-verified. Retention is
+        # reached only after the checkpoint and available optimizer/config
+        # state are protected; failure stops training and leaves local data.
+        protect_training_checkpoint(self, checkpoint_path, step)
         self.clean_up_saves()
         self.post_save_hook(file_path)
 

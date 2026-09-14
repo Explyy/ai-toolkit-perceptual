@@ -1,0 +1,86 @@
+---
+job: extension
+config:
+  name: generated-by-queue
+  process:
+    - type: diffusion_trainer
+      training_folder: /storage/output
+      device: cuda
+      trigger_word: null
+      network:
+        type: lokr
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+      save:
+        dtype: bf16
+        save_every: 100
+        max_step_saves_to_keep: 5
+        save_format: safetensors
+        push_to_hub: false
+      datasets:
+        - folder_path: replaced-by-queue
+          caption_ext: txt
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          resolution: [512, 768, 1024]
+          num_repeats: [16, 4, 1]
+      train:
+        batch_size: 1
+        steps: 1200
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        lr: 0.00005
+        dtype: bf16
+        cache_text_embeddings: true
+      model:
+        name_or_path: black-forest-labs/FLUX.2-klein-base-9B
+        arch: flux2_klein_9b
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 640
+        height: 960
+        seed: 42000
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 25
+        samples:
+          - prompt: "portrait photo of [trigger], neutral expression, soft daylight"
+          - prompt: "close portrait of [trigger], smiling, window light"
+          - prompt: "three-quarter portrait of [trigger], overcast outdoor light"
+          - prompt: "full body photo of [trigger], standing in a simple studio"
+          - prompt: "full body photo of [trigger], walking on a city street"
+          - prompt: "photo of [trigger] seated at a cafe table"
+          - prompt: "photo of [trigger] reading a book indoors"
+          - prompt: "photo of [trigger] cooking in a bright kitchen"
+          - prompt: "photo of [trigger] wearing a dark jacket"
+          - prompt: "photo of [trigger] wearing a light sweater"
+          - prompt: "photo of [trigger] in warm sunset light"
+          - prompt: "photo of [trigger] in cool morning light"
+          - prompt: "candid photo of [trigger] laughing outdoors"
+          - prompt: "profile photo of [trigger] against a plain wall"
+          - prompt: "photo of [trigger] looking toward the camera in a park"
+          - prompt: "photo of [trigger] at a train station"
+          - prompt: "photo of [trigger] in a library aisle"
+          - prompt: "photo of [trigger] beside a large window"
+          - prompt: "photo of [trigger] under soft studio lighting"
+          - prompt: "photo of [trigger] in a rainy street scene"
+          - prompt: "photo of [trigger] in a sunlit room"
+          - prompt: "medium shot of [trigger], hands visible, neutral background"
+          - prompt: "documentary-style photo of [trigger], natural light"
+meta:
+  name: "[name]"
+  version: "1.0"
+

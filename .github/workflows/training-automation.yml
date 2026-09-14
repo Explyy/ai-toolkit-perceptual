@@ -1,0 +1,71 @@
+name: Training automation
+
+on:
+  push:
+    branches:
+      - codex/klein-training-backup-evaluation
+    paths:
+      - "training_automation/**"
+      - "tests/training_automation/**"
+      - "docker/automation/**"
+      - "jobs/process/BaseSDTrainProcess.py"
+      - ".github/workflows/training-automation.yml"
+  pull_request:
+    paths:
+      - "training_automation/**"
+      - "tests/training_automation/**"
+      - "docker/automation/**"
+      - "jobs/process/BaseSDTrainProcess.py"
+      - ".github/workflows/training-automation.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a unique GHCR image tag after tests"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pyyaml pillow numpy
+      - run: pytest -q tests/training_automation
+
+  docker:
+    if: github.event_name == 'workflow_dispatch'
+    needs: cpu-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free hosted-runner space for the pinned base image
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet
+          docker system prune --all --force
+      - id: image
+        name: Compute lowercase image tag
+        env:
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+        run: echo "tag=ghcr.io/${OWNER,,}/ai-toolkit-perceptual:training-automation-${SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - if: github.event_name == 'workflow_dispatch' && inputs.publish
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/automation/Dockerfile
+          push: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+          tags: ${{ steps.image.outputs.tag }}
