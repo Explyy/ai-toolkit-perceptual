@@ -49,9 +49,17 @@ def validate_parallel_recipe(recipe_path: Path, repo_root: Path) -> None:
     if len(process["sample"]["samples"]) != 23:
         raise BackupError("parallel recipe requires exactly 23 evaluation prompts")
     config_source = (repo_root / "toolkit" / "config_modules.py").read_text(encoding="utf-8")
-    trainer_source = (repo_root / "jobs" / "process" / "BaseSDTrainProcess.py").read_text(encoding="utf-8")
+    trainer_source = (
+        repo_root / "extensions_built_in" / "sd_trainer" / "SDTrainer.py"
+    ).read_text(encoding="utf-8")
     required_config = ["preprocess_dataset_raw_config", "isinstance(num_repeats, list)", "self.weight_noise"]
-    required_trainer = ["weight_noise", "depth_consistency", "subject_mask"]
+    required_trainer = [
+        "from toolkit.subject_mask import cache_subject_masks",
+        "from toolkit.depth_consistency import",
+        "def _inject_weight_noise",
+        "self.subject_mask_config",
+        "self.depth_consistency_config",
+    ]
     missing = [token for token in required_config if token not in config_source]
     missing += [token for token in required_trainer if token not in trainer_source]
     if missing:

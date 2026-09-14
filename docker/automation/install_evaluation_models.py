@@ -10,6 +10,7 @@ from pathlib import Path
 
 SOURCE_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
 EXPECTED_ARCHIVE_SIZE = 288_621_354
+EXPECTED_ARCHIVE_SHA256 = "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f"
 REQUIRED = {
     "1k3d68.onnx",
     "2d106det.onnx",
@@ -38,6 +39,11 @@ def main() -> None:
             raise RuntimeError(
                 f"Buffalo L archive size changed: {archive.stat().st_size} != {EXPECTED_ARCHIVE_SIZE}"
             )
+        archive_sha256 = sha256(archive)
+        if archive_sha256 != EXPECTED_ARCHIVE_SHA256:
+            raise RuntimeError(
+                f"Buffalo L archive SHA-256 changed: {archive_sha256} != {EXPECTED_ARCHIVE_SHA256}"
+            )
         with zipfile.ZipFile(archive) as bundle:
             members = {Path(info.filename).name: info for info in bundle.infolist() if not info.is_dir()}
             missing = REQUIRED - set(members)
@@ -51,7 +57,7 @@ def main() -> None:
             "source_url": SOURCE_URL,
             "release": "deepinsight/insightface v0.7 buffalo_l",
             "archive_size": archive.stat().st_size,
-            "archive_sha256": sha256(archive),
+            "archive_sha256": archive_sha256,
             "files": {
                 name: {"size": (TARGET / name).stat().st_size, "sha256": sha256(TARGET / name)}
                 for name in sorted(REQUIRED)
