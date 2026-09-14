@@ -1,5 +1,6 @@
 import json
 import fcntl
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,41 @@ def test_job_identity_includes_effective_dataset_settings_and_revision(tmp_path)
     config.write_text(yaml.safe_dump(document), encoding="utf-8")
     third = TrainingQueue(config).materialize()[0].job_id
     assert len({first, second, third}) == 3
+
+
+def test_unsharded_job_keeps_legacy_digest_and_completed_state_skip(tmp_path):
+    config = write_configs(tmp_path)
+    document = yaml.safe_load(config.read_text())
+    raw = document["datasets"][0]
+    trainer_bytes = (tmp_path / "trainer.yaml").read_bytes()
+    legacy_identity = {
+        "template_sha256": hashlib.sha256(trainer_bytes).hexdigest(),
+        "folder": str((tmp_path / raw["folder"]).resolve()),
+        "trigger_word": raw.get("trigger_word"),
+        "reference_images": [],
+        "name": raw.get("name"),
+        "trainer_dataset": {},
+        "dataset_revision": None,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            legacy_identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()[:12]
+    expected_job_id = f"person-one-{digest}"
+    calls = []
+    queue = TrainingQueue(config, run_command=lambda command, env: calls.append(command) or 0)
+    assert queue.materialize()[0].job_id == expected_job_id
+    (tmp_path / "queue.json").write_text(json.dumps({
+        "schema_version": 2,
+        "jobs": {expected_job_id: {
+            "status": "completed", "training_status": "completed",
+            "evaluation_status": "completed", "attempts": 1,
+        }},
+    }), encoding="utf-8")
+    state = queue.run()
+    assert state["jobs"][expected_job_id]["status"] == "completed"
+    assert calls == []
 
 
 def test_sharded_queue_materializes_only_assignment_with_isolated_output(tmp_path):

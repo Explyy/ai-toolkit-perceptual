@@ -39,17 +39,38 @@ class Pod:
 
 
 class CompletedQueue:
-    def __init__(self, path, *, identity_available=True, write_sample=True):
+    def __init__(
+        self, path, *, reference_available=True,
+        identity_ranking_status="available", write_sample=True,
+    ):
         config = yaml.safe_load(Path(path).read_text())
         self.state_path = Path(config["state_path"])
-        self.identity_available = identity_available
+        self.reference_available = reference_available
+        self.identity_ranking_status = identity_ranking_status
         self.write_sample = write_sample
         self.jobs = []
         for index, dataset in enumerate(config["datasets"]):
             job_id = f"{dataset['name']}-job"
             config_path = Path(config["generated_dir"]) / f"{job_id}.yaml"
             config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.write_text("job: extension\n", encoding="utf-8")
+            config_path.write_text(yaml.safe_dump({
+                "job": "extension",
+                "config": {
+                    "name": job_id,
+                    "process": [{
+                        "train": {"steps": 1200},
+                        "sample": {
+                            "sample_every": 100,
+                            "seed": 42,
+                            "walk_seed": False,
+                            "samples": [
+                                {"prompt": f"clothed reference prompt {prompt_index}"}
+                                for prompt_index in range(23)
+                            ],
+                        },
+                    }],
+                },
+            }, sort_keys=False), encoding="utf-8")
             self.jobs.append(QueueJob(
                 job_id=job_id, config_path=config_path,
                 output_root=Path(config["training_folder"]), reference_images=(),
@@ -66,10 +87,34 @@ class CompletedQueue:
             samples = output / "samples"
             automation.mkdir(parents=True, exist_ok=True)
             samples.mkdir(parents=True, exist_ok=True)
-            if self.write_sample:
-                (samples / "1__000001200_0.png").write_bytes(b"sample")
-            else:
+            report_checkpoints = []
+            if not self.write_sample:
                 (samples / "not-a-sample-file").mkdir()
+            for step in range(100, 1201, 100):
+                checkpoint_samples = []
+                for prompt_index in range(23):
+                    sample_path = samples / f"1__{step:09d}_{prompt_index}.png"
+                    if self.write_sample:
+                        sample_path.write_bytes(b"sample")
+                    checkpoint_samples.append({
+                        "path": str(sample_path),
+                        "prompt_index": prompt_index,
+                        "seed": 42,
+                        "identity": {
+                            "status": (
+                                "missing"
+                                if self.identity_ranking_status == "unavailable"
+                                and step == 100 and prompt_index == 0
+                                else "available"
+                            )
+                        },
+                    })
+                report_checkpoints.append({
+                    "step": step,
+                    "final": step == 1200,
+                    "sample_run_status": "complete",
+                    "samples": checkpoint_samples,
+                })
             (automation / "backup-state.json").write_text(json.dumps({
                 "schema_version": 2,
                 "checkpoints": {"final": {
@@ -77,11 +122,18 @@ class CompletedQueue:
                     "cataloged": True, "final": True,
                 }},
             }), encoding="utf-8")
-            identity = "available" if self.identity_available else "unavailable"
+            reference = "available" if self.reference_available else "unavailable"
             (automation / "evaluation.json").write_text(json.dumps({
-                "reference_identity_status": {"status": identity},
-                "identity_ranking": {"status": identity},
-                "checkpoints": [{"step": 1200}],
+                "reference_identity_status": {"status": reference},
+                "identity_ranking": {
+                    "status": self.identity_ranking_status,
+                    "reason": (
+                        "valid identity subsets are not comparable across checkpoints"
+                        if self.identity_ranking_status == "unavailable" else None
+                    ),
+                },
+                "ranking": {"status": "available"},
+                "checkpoints": report_checkpoints,
                 "reference_provenance": "training-set",
             }), encoding="utf-8")
             state["jobs"][job.job_id] = {
@@ -96,12 +148,12 @@ class CompletedQueue:
 def private_manifest():
     datasets = []
     files = {}
-    for index in range(3):
+    for index in range(6):
         payload = f"image-{index}".encode()
         remote = f"datasets/subject-{index}/image.jpg"
         files[remote] = payload
         datasets.append({
-            "id": f"subject-{index}", "shard_id": "a",
+            "id": f"subject-{index}", "shard_id": "a" if index < 3 else "b",
             "catalog_name": f"Private {index}", "expected_catalog_id": index + 1,
             "trigger_word": "TOKEN", "reference_paths": ["image.jpg"],
             "files": [{
@@ -164,7 +216,7 @@ def setup_client():
             "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
             "trigger_word": "TOKEN", "destination_kind": "loras",
             "checkpoints": [], "selected_checkpoint_id": None, "selection": None,
-        } for index in range(3)],
+        } for index in range(6)],
     }).encode()
     return client
 
@@ -215,12 +267,12 @@ def test_parallel_bootstrap_archives_then_deletes_only_bound_instance(tmp_path):
     assert "sqlite_db_path" not in process
 
 
-def test_identity_failure_is_durable_and_never_deletes(tmp_path):
+def test_reference_identity_failure_is_durable_and_never_deletes(tmp_path):
     pod = Pod()
-    with pytest.raises(BackupError, match="no successful comparable identity"):
+    with pytest.raises(BackupError, match="no successful reference identity"):
         run_parallel_bootstrap(
             env=env(tmp_path), hub_client=setup_client(), pod_client=pod,
-            queue_factory=lambda path: CompletedQueue(path, identity_available=False),
+            queue_factory=lambda path: CompletedQueue(path, reference_available=False),
             snapshot_fetch=snapshot_fetch,
             recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
         )
@@ -228,6 +280,32 @@ def test_identity_failure_is_durable_and_never_deletes(tmp_path):
     assert state["status"] == "failed"
     assert state["delete_requested"] is False
     assert pod.deleted == []
+
+
+def test_unavailable_generated_face_ranking_is_archived_without_fake_score(tmp_path):
+    pod = Pod()
+    client = setup_client()
+    result = run_parallel_bootstrap(
+        env=env(tmp_path), hub_client=client, pod_client=pod,
+        queue_factory=lambda path: CompletedQueue(
+            path, reference_available=True, identity_ranking_status="unavailable"
+        ),
+        snapshot_fetch=snapshot_fetch,
+        recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+    )
+    assert result["status"] == "delete-accepted"
+    assert pod.deleted == [42]
+    completion = json.loads(client.remote["training-runs/run-1/a/completion.json"])
+    assert {
+        item["identity_ranking_status"] for item in completion["completion"]["jobs"]
+    } == {"unavailable"}
+    report_paths = [
+        path for path in client.remote
+        if path.endswith("/evaluation.json") and "/evidence/jobs/" in path
+    ]
+    report = json.loads(client.remote[report_paths[0]])
+    assert report["identity_ranking"]["status"] == "unavailable"
+    assert report["checkpoints"][0]["samples"][0]["identity"]["status"] == "missing"
 
 
 def test_directory_only_sample_output_never_passes_completion_gate(tmp_path):
@@ -261,7 +339,22 @@ def test_manifest_requires_exact_three_job_assignment_and_pinned_models():
     manifest, _ = private_manifest()
     assert len(validate_manifest(manifest, run_id="run-1", shard_id="a")) == 3
     manifest["datasets"][0]["shard_id"] = "b"
-    with pytest.raises(BackupError, match="expected 3"):
+    with pytest.raises(BackupError, match="two disjoint three-job shards"):
+        validate_manifest(manifest, run_id="run-1", shard_id="a")
+
+
+@pytest.mark.parametrize("field", ["id", "catalog_name", "expected_catalog_id"])
+def test_manifest_rejects_global_identity_duplicates_across_shards(field):
+    manifest, _ = private_manifest()
+    manifest["datasets"][3][field] = manifest["datasets"][0][field]
+    with pytest.raises(BackupError, match="globally unique"):
+        validate_manifest(manifest, run_id="run-1", shard_id="a")
+
+
+def test_manifest_rejects_unlaunched_third_shard():
+    manifest, _ = private_manifest()
+    manifest["datasets"][5]["shard_id"] = "c"
+    with pytest.raises(BackupError, match="two disjoint three-job shards"):
         validate_manifest(manifest, run_id="run-1", shard_id="a")
 
 

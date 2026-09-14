@@ -113,8 +113,9 @@ class TrainingQueue:
                 "name": raw.get("name"),
                 "trainer_dataset": raw.get("trainer_dataset", {}),
                 "dataset_revision": raw.get("dataset_revision"),
-                "shard_id": self.shard_id,
             }
+            if self.shard_id is not None:
+                identity["shard_id"] = self.shard_id
             digest = hashlib.sha256(_canonical(identity).encode()).hexdigest()[:12]
             job_id = f"{_slug(str(raw.get('name') or Path(raw['folder']).name))}-{digest}"
             if job_id in seen:

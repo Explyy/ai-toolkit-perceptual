@@ -52,17 +52,31 @@ def validate_manifest(
     if expected_jobs != 3:
         raise BackupError("parallel deployment requires exactly three jobs per shard")
     datasets = manifest.get("datasets")
-    if not isinstance(datasets, list):
-        raise BackupError("deployment manifest datasets must be a list")
-    selected = [dict(item) for item in datasets if str(item.get("shard_id")) == shard_id]
-    if len(selected) != expected_jobs:
-        raise BackupError(
-            f"shard {shard_id!r} has {len(selected)} datasets; expected {expected_jobs}"
-        )
-    ids = [_component(item.get("id"), "dataset id") for item in selected]
+    if not isinstance(datasets, list) or any(not isinstance(item, Mapping) for item in datasets):
+        raise BackupError("deployment manifest datasets must be a list of mappings")
+    if len(datasets) != 2 * expected_jobs:
+        raise BackupError("parallel deployment requires exactly six datasets")
+    normalized = [dict(item) for item in datasets]
+    shard_ids = [_component(item.get("shard_id"), "dataset shard_id") for item in normalized]
+    groups = set(shard_ids)
+    if len(groups) != 2 or any(shard_ids.count(group) != expected_jobs for group in groups):
+        raise BackupError("parallel deployment requires exactly two disjoint three-job shards")
+    if shard_id not in groups:
+        raise BackupError(f"shard {shard_id!r} is absent from the deployment manifest")
+    ids = [_component(item.get("id"), "dataset id") for item in normalized]
+    catalog_names = [str(item.get("catalog_name") or "") for item in normalized]
+    try:
+        catalog_ids = [int(item.get("expected_catalog_id", 0)) for item in normalized]
+    except (TypeError, ValueError) as exc:
+        raise BackupError("expected catalog ids must be positive integers") from exc
     if len(ids) != len(set(ids)):
-        raise BackupError("assigned dataset ids must be unique")
-    for item in selected:
+        raise BackupError("dataset ids must be globally unique across shards")
+    normalized_names = [name.casefold() for name in catalog_names]
+    if any(not name for name in catalog_names) or len(normalized_names) != len(set(normalized_names)):
+        raise BackupError("catalog names must be nonempty and globally unique across shards")
+    if any(value <= 0 for value in catalog_ids) or len(catalog_ids) != len(set(catalog_ids)):
+        raise BackupError("expected catalog ids must be positive and globally unique across shards")
+    for item in normalized:
         if int(item.get("expected_catalog_id", 0)) <= 0:
             raise BackupError("each dataset requires its pre-reserved expected_catalog_id")
         if not item.get("catalog_name") or not item.get("trigger_word"):
@@ -79,6 +93,7 @@ def validate_manifest(
         for reference in references:
             if safe_relative_path(str(reference)).as_posix() not in file_paths:
                 raise BackupError("every reference_path must name a staged dataset file")
+    selected = [item for item in normalized if str(item["shard_id"]) == shard_id]
     sources = manifest.get("model_sources")
     if not isinstance(sources, list) or len(sources) != 2 or {item.get("kind") for item in sources} != {
         "base_model", "depth_model"
@@ -323,13 +338,39 @@ def _completion_evidence(
         ):
             raise BackupError(f"job {job.job_id} has incomplete checkpoint backup receipts")
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        if not report.get("checkpoints"):
+        report_checkpoints = report.get("checkpoints")
+        if not isinstance(report_checkpoints, list) or not report_checkpoints:
             raise BackupError(f"job {job.job_id} has no evaluated checkpoint samples")
-        if require_identity and (
-            report.get("reference_identity_status", {}).get("status") != "available"
-            or report.get("identity_ranking", {}).get("status") != "available"
-        ):
-            raise BackupError(f"job {job.job_id} has no successful comparable identity evaluation")
+        trainer = yaml.safe_load(job.config_path.read_text(encoding="utf-8"))
+        process = trainer["config"]["process"][0]
+        sample_config = process.get("sample") or {}
+        configured_samples = sample_config.get("samples")
+        expected_sample_count = len(configured_samples) if isinstance(configured_samples, list) else 0
+        final_step = int(process.get("train", {}).get("steps", 0))
+        sample_every = int(sample_config.get("sample_every", 0))
+        if expected_sample_count != 23 or final_step != 1200 or sample_every != 100:
+            raise BackupError(f"job {job.job_id} does not retain the required evaluation schedule")
+        checkpoints_by_step = {int(item.get("step", -1)): item for item in report_checkpoints}
+        expected_steps = set(range(sample_every, final_step + 1, sample_every))
+        if not expected_steps.issubset(checkpoints_by_step):
+            raise BackupError(f"job {job.job_id} is missing scheduled checkpoint evaluations")
+        for step in sorted(expected_steps):
+            checkpoint = checkpoints_by_step[step]
+            if (
+                checkpoint.get("sample_run_status") != "complete"
+                or len(checkpoint.get("samples") or []) != expected_sample_count
+            ):
+                raise BackupError(
+                    f"job {job.job_id} has incomplete configured sample evidence at step {step}"
+                )
+        if report.get("ranking", {}).get("status") != "available":
+            raise BackupError(f"job {job.job_id} has incomplete prompt/seed evaluation coverage")
+        if require_identity:
+            if report.get("reference_identity_status", {}).get("status") != "available":
+                raise BackupError(f"job {job.job_id} has no successful reference identity evaluation")
+            ranking_status = report.get("identity_ranking", {}).get("status")
+            if ranking_status not in {"available", "unavailable"}:
+                raise BackupError(f"job {job.job_id} has no completed identity ranking outcome")
         prefix = f"jobs/{job.job_id}"
         files.extend([
             (job.config_path, f"{prefix}/trainer.yaml"),
@@ -339,6 +380,14 @@ def _completion_evidence(
         samples = sorted(path for path in (output / "samples").glob("*") if path.is_file())
         if not samples:
             raise BackupError(f"job {job.job_id} has no sample files to archive")
+        archived_samples = {path.resolve() for path in samples}
+        selected_sample_paths = {
+            Path(sample["path"]).resolve()
+            for checkpoint in report_checkpoints
+            for sample in (checkpoint.get("samples") or [])
+        }
+        if not selected_sample_paths or not selected_sample_paths.issubset(archived_samples):
+            raise BackupError(f"job {job.job_id} evaluation report references missing sample evidence")
         files.extend((path, f"{prefix}/samples/{path.name}") for path in samples)
         completion_jobs.append({
             "job_id": job.job_id,
