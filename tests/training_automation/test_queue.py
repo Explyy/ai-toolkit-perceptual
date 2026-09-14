@@ -1,8 +1,11 @@
 import json
+import fcntl
 from pathlib import Path
 
+import pytest
 import yaml
 
+from training_automation import cli, queue as queue_module
 from training_automation.queue import TrainingQueue
 
 
@@ -54,6 +57,19 @@ def test_materialization_is_stable_and_injects_dataset(tmp_path):
     assert process["datasets"][0]["folder_path"] == str((tmp_path / "dataset").resolve())
 
 
+def test_job_identity_includes_effective_dataset_settings_and_revision(tmp_path):
+    config = write_configs(tmp_path)
+    first = TrainingQueue(config).materialize()[0].job_id
+    document = yaml.safe_load(config.read_text())
+    document["datasets"][0]["trainer_dataset"] = {"num_repeats": 7}
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    second = TrainingQueue(config).materialize()[0].job_id
+    document["datasets"][0]["dataset_revision"] = "captions-v2"
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    third = TrainingQueue(config).materialize()[0].job_id
+    assert len({first, second, third}) == 3
+
+
 def test_dry_run_does_not_launch_and_resume_skips_completed(tmp_path):
     config = write_configs(tmp_path)
     calls = []
@@ -81,3 +97,53 @@ def test_interrupted_running_job_returns_to_pending_and_runs(tmp_path):
     assert state["jobs"][job_id]["attempts"] == 2
     assert state["jobs"][job_id]["interrupted"] is True
 
+
+def test_evaluation_failure_retries_without_relaunching_training(tmp_path, monkeypatch):
+    config = write_configs(tmp_path)
+    document = yaml.safe_load(config.read_text())
+    document["evaluation"] = {"enabled": True}
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    launches = []
+    evaluations = []
+
+    def evaluate_once_then_succeed(**kwargs):
+        evaluations.append(kwargs["job_config_path"])
+        if len(evaluations) == 1:
+            raise RuntimeError("evaluation interrupted")
+        report = tmp_path / "evaluation.json"
+        report.write_text("{}", encoding="utf-8")
+        return report
+
+    monkeypatch.setattr(queue_module, "evaluate_job", evaluate_once_then_succeed)
+    queue = TrainingQueue(config, run_command=lambda command, env: launches.append(command) or 0)
+    failed = queue.run()
+    entry = next(iter(failed["jobs"].values()))
+    assert entry["training_status"] == "completed"
+    assert entry["evaluation_status"] == "failed"
+    completed = queue.run()
+    entry = next(iter(completed["jobs"].values()))
+    assert entry["status"] == "completed"
+    assert len(launches) == 1
+    assert len(evaluations) == 2
+
+
+def test_queue_lock_refuses_second_launcher(tmp_path):
+    config = write_configs(tmp_path)
+    queue = TrainingQueue(config, run_command=lambda command, env: 0)
+    lock_path = tmp_path / "queue.json.lock"
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="already running"):
+            queue.run()
+
+
+def test_cli_returns_nonzero_for_failed_job(tmp_path, monkeypatch):
+    class FailedQueue:
+        def __init__(self, config):
+            pass
+
+        def run(self, *, dry_run=False):
+            return {"jobs": {"job": {"status": "failed"}}}
+
+    monkeypatch.setattr(cli, "TrainingQueue", FailedQueue)
+    assert cli.main(["run", str(tmp_path / "automation.yaml")]) == 1

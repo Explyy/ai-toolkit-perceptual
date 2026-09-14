@@ -25,9 +25,14 @@ evaluation:
   #   model_dir: /storage/models/insightface/models/your-model
   # Optional real landmark backend:
   # landmark_backend: training_automation.backends:MediaPipePoseCPUBackend
+  # landmark_backend_options:
+  #   model_path: /storage/models/mediapipe/pose_landmarker.task
+  #   min_visibility: 0.5
 
 datasets:
   - name: character-name
+    # Increment when dataset content changes without changing folder path.
+    dataset_revision: images-and-captions-v1
     catalog_name: character-name
     folder: /storage/datasets/character-name
     trigger_word: CHARACTER_TOKEN
@@ -39,5 +44,4 @@ datasets:
       caption_dropout_rate: 0.05
       cache_latents_to_disk: true
       resolution: [512, 768, 1024]
-      num_repeats: [16, 4, 1]
-
+      num_repeats: 16

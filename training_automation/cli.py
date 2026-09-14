@@ -5,9 +5,9 @@ import json
 import os
 from pathlib import Path
 
-from .backup import BackupConfigurationError, HuggingFaceBackupClient
+from .backup import BackupConfigurationError, HuggingFaceBackupClient, sha256_file
 from .catalog import CatalogStore, restore_generation, restore_training
-from .evaluation import persist_selection
+from .evaluation import evaluate_job, persist_selection
 from .queue import TrainingQueue
 
 
@@ -17,6 +17,11 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="materialize and run the sequential training queue")
     run.add_argument("config", type=Path)
     run.add_argument("--dry-run", action="store_true")
+    evaluate = commands.add_parser("evaluate", help="evaluate existing checkpoint samples without training")
+    evaluate.add_argument("job_config", type=Path)
+    evaluate.add_argument("output_dir", type=Path)
+    evaluate.add_argument("--reference", action="append", type=Path, default=[])
+    evaluate.add_argument("--config", type=Path, help="optional YAML evaluation settings")
     select = commands.add_parser("select", help="persist a human checkpoint choice")
     select.add_argument("report", type=Path)
     select.add_argument("step", type=int)
@@ -39,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     index.add_argument("remote_path")
     index.add_argument("--name", required=True)
     index.add_argument("--base-arch", required=True)
+    index.add_argument("--base-model", required=True)
     index.add_argument("--trigger-word")
     index.add_argument("--destination-kind", choices=("loras", "diffusion_models", "vae", "text_encoders"), required=True)
     index.add_argument("--checkpoint-id", required=True)
@@ -46,7 +52,25 @@ def main(argv: list[str] | None = None) -> int:
     index.add_argument("--final", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "run":
-        print(json.dumps(TrainingQueue(args.config).run(dry_run=args.dry_run), indent=2))
+        result = TrainingQueue(args.config).run(dry_run=args.dry_run)
+        print(json.dumps(result, indent=2))
+        if not args.dry_run and any(
+            item.get("status") in {"failed", "evaluation_failed"}
+            for item in result.get("jobs", {}).values()
+        ):
+            return 1
+    elif args.command == "evaluate":
+        import yaml
+
+        config = {}
+        if args.config:
+            config = yaml.safe_load(args.config.read_text(encoding="utf-8")) or {}
+        print(evaluate_job(
+            job_config_path=args.job_config,
+            output_dir=args.output_dir,
+            reference_images=args.reference,
+            config=config,
+        ))
     elif args.command == "select":
         if args.repo_id or os.environ.get(args.repo_id_env):
             if not args.model:
@@ -54,8 +78,19 @@ def main(argv: list[str] | None = None) -> int:
             store = _store(args)
             report = json.loads(args.report.read_text(encoding="utf-8"))
             checkpoint = next(item for item in report["checkpoints"] if int(item["step"]) == args.step)
-            checkpoint_id = f"step-{args.step:09d}" + ("-final" if checkpoint.get("final") else "")
-            store.select(args.model, checkpoint_id)
+            checkpoint_id = checkpoint.get("catalog_checkpoint_id")
+            if not checkpoint_id:
+                checkpoint_id = f"step-{args.step:09d}" + ("-final" if checkpoint.get("final") else "")
+            store.select(
+                args.model,
+                checkpoint_id,
+                evidence={
+                    "report_sha256": sha256_file(args.report),
+                    "selected_step": args.step,
+                    "human_note": args.note,
+                    "checkpoint_evidence": checkpoint,
+                },
+            )
         selection_path = persist_selection(args.report, args.step, args.note)
         print(selection_path)
     elif args.command == "restore":
@@ -90,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         store = _store(args)
         print(store.import_existing(
             metadata={
-                "name": args.name, "base_arch": args.base_arch,
+                "name": args.name, "base_arch": args.base_arch, "base_model": args.base_model,
                 "trigger_word": args.trigger_word, "destination_kind": args.destination_kind,
             },
             remote_path=args.remote_path, checkpoint_id=args.checkpoint_id,

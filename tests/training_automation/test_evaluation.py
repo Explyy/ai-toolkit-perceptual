@@ -5,7 +5,7 @@ import numpy as np
 import yaml
 from PIL import Image
 
-from training_automation import evaluation
+from training_automation import cli, evaluation
 
 
 def setup_job(tmp_path: Path):
@@ -90,3 +90,74 @@ def test_human_selection_persists_checkpoint_evidence(tmp_path):
     content = json.loads(selection.read_text())
     assert content["selected_step"] == 200
     assert content["evidence"]["final"] is True
+
+
+def test_archived_verified_checkpoint_is_evaluated_without_local_weight(tmp_path):
+    config_path, output = setup_job(tmp_path)
+    (output / f"person-deadbeef0000_000000100.safetensors").unlink()
+    state = output / ".automation" / "backup-state.json"
+    state.parent.mkdir()
+    state.write_text(json.dumps({
+        "schema_version": 2,
+        "destination": {
+            "repo_id": "owner/private", "repo_type": "dataset",
+            "remote_prefix": "training-backups",
+        },
+        "checkpoints": {
+            "qualified": {
+                "status": "backed_up", "verified": True, "step": 100,
+                "job_id": "person-deadbeef0000",
+                "catalog_checkpoint_id": "job--step-000000100--abc123",
+                "commit_id": "immutable-revision", "cataloged": True,
+            }
+        },
+    }), encoding="utf-8")
+    report = json.loads(evaluation.evaluate_job(
+        job_config_path=config_path, output_dir=output,
+        reference_images=[], config={},
+    ).read_text())
+    archived = report["checkpoints"][0]
+    assert archived["step"] == 100
+    assert archived["checkpoint_paths"] == []
+    assert archived["catalog_checkpoint_id"] == "job--step-000000100--abc123"
+    assert archived["remote_checkpoint"]["commit_id"] == "immutable-revision"
+
+
+def test_latest_complete_duplicate_sample_run_is_used_once(tmp_path):
+    config_path, output = setup_job(tmp_path)
+    samples = output / "samples"
+    for index in (0, 1):
+        pixels = np.full((12, 12, 3), 180 + index, dtype=np.uint8)
+        Image.fromarray(pixels).save(samples / f"22345__{100:09d}_{index}.png")
+    report = json.loads(evaluation.evaluate_job(
+        job_config_path=config_path, output_dir=output,
+        reference_images=[], config={},
+    ).read_text())
+    checkpoint = report["checkpoints"][0]
+    assert [Path(item["path"]).name for item in checkpoint["samples"]] == [
+        "22345__000000100_0.png", "22345__000000100_1.png",
+    ]
+    assert checkpoint["sample_run_status"] == "complete"
+    assert checkpoint["discarded_duplicate_or_partial_samples"] == 2
+
+
+def test_identity_ranking_requires_same_valid_prompt_subset():
+    checkpoints = [
+        {"step": 1, "samples": [
+            {"prompt_index": 0, "identity": {"status": "available", "cosine_similarity": 0.8}},
+            {"prompt_index": 1, "identity": {"status": "missing", "cosine_similarity": None}},
+        ]},
+        {"step": 2, "samples": [
+            {"prompt_index": 0, "identity": {"status": "available", "cosine_similarity": 0.7}},
+            {"prompt_index": 1, "identity": {"status": "available", "cosine_similarity": 0.9}},
+        ]},
+    ]
+    ranked, reason = evaluation.rank_identity(checkpoints)
+    assert ranked == []
+    assert reason == "valid identity subsets are not comparable across checkpoints"
+
+
+def test_evaluate_cli_processes_existing_samples_without_training(tmp_path):
+    config_path, output = setup_job(tmp_path)
+    assert cli.main(["evaluate", str(config_path), str(output)]) == 0
+    assert (output / ".automation" / "evaluation.json").is_file()

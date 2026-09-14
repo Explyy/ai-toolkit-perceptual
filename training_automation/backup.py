@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 from .state import atomic_write_json, read_json
 
 
-STATE_SCHEMA = 1
+STATE_SCHEMA = 2
 
 
 class BackupError(RuntimeError):
@@ -180,6 +180,9 @@ class CheckpointBackup:
         self.repo_type = repo_type
         self.state_path = state_path
         self.remote_prefix = remote_prefix.strip("/")
+        prefix_path = PurePosixPath(self.remote_prefix)
+        if not self.remote_prefix or prefix_path.is_absolute() or ".." in prefix_path.parts:
+            raise BackupConfigurationError("remote_prefix must be a safe relative repository path")
         self.max_attempts = max(1, int(max_attempts))
         self.backoff_seconds = max(0.0, float(backoff_seconds))
         self.client = client or HuggingFaceBackupClient(token=token or "")
@@ -203,9 +206,27 @@ class CheckpointBackup:
         self._destination_checked = True
 
     def _state(self) -> dict[str, Any]:
-        state = read_json(self.state_path, {"schema_version": STATE_SCHEMA, "checkpoints": {}})
+        destination = {
+            "repo_id": self.repo_id,
+            "repo_type": self.repo_type,
+            "remote_prefix": self.remote_prefix,
+        }
+        state = read_json(
+            self.state_path,
+            {"schema_version": STATE_SCHEMA, "destination": destination, "checkpoints": {}},
+        )
+        if state.get("schema_version") == 1:
+            if state.get("checkpoints"):
+                raise BackupConfigurationError(
+                    "legacy backup state has unbound receipts; preserve it and configure a new state_path"
+                )
+            state = {"schema_version": STATE_SCHEMA, "destination": destination, "checkpoints": {}}
         if state.get("schema_version") != STATE_SCHEMA:
             raise BackupError(f"unsupported backup state schema in {self.state_path}")
+        if state.get("destination") != destination:
+            raise BackupConfigurationError(
+                "backup state belongs to a different repo_id, repo_type, or remote_prefix"
+            )
         state.setdefault("checkpoints", {})
         return state
 
@@ -222,15 +243,30 @@ class CheckpointBackup:
         final: bool,
     ) -> str:
         self.validate_destination()
-        key = f"{job_id}:{checkpoint_id}"
-        state = self._state()
-        existing = state["checkpoints"].get(key)
-        if existing and existing.get("status") == "backed_up":
-            return str(existing["commit_id"])
-
         path_list = list(paths)
         local_files = _files(path_list)
         primary = Path(path_list[0]).resolve()
+        fingerprint_source = "\n".join(
+            f"{path.resolve()}:{path.stat().st_size}:{sha256_file(path)}" for path in local_files
+        )
+        content_fingerprint = hashlib.sha256(fingerprint_source.encode()).hexdigest()
+        qualified_checkpoint_id = f"{job_id}--{checkpoint_id}--{content_fingerprint[:12]}"
+        key = qualified_checkpoint_id
+        state = self._state()
+        existing = state["checkpoints"].get(key)
+        if existing and existing.get("status") == "backed_up":
+            expected = {
+                str(path.resolve()): (path.stat().st_size, sha256_file(path)) for path in local_files
+            }
+            recorded = {
+                str(Path(item["local_path"]).resolve()): (int(item["size"]), item["sha256"])
+                for item in existing.get("artifacts", [])
+                if item.get("role") != "manifest"
+            }
+            if expected == recorded:
+                return str(existing["commit_id"])
+            raise BackupError("verified checkpoint receipt does not match current local artifacts")
+
         from .catalog import CatalogStore
 
         model_name = str(self.catalog_metadata.get("name") or job_id)
@@ -245,11 +281,12 @@ class CheckpointBackup:
             {
                 "name": model_name,
                 "base_arch": self.catalog_metadata.get("base_arch"),
+                "base_model": self.catalog_metadata.get("base_model"),
                 "trigger_word": self.catalog_metadata.get("trigger_word"),
                 "destination_kind": self.catalog_metadata.get("destination_kind", "loras"),
             }
         )
-        remote_root = PurePosixPath(self.remote_prefix) / "models" / model["folder"] / "checkpoints" / checkpoint_id
+        remote_root = PurePosixPath(self.remote_prefix) / "models" / model["folder"] / "checkpoints" / qualified_checkpoint_id
         artifacts: list[LocalArtifact] = []
         used: set[str] = set()
         for path in local_files:
@@ -282,6 +319,7 @@ class CheckpointBackup:
             "schema_version": 1,
             "job_id": job_id,
             "checkpoint_id": checkpoint_id,
+            "catalog_checkpoint_id": qualified_checkpoint_id,
             "step": int(step),
             "final": bool(final),
             "artifacts": [item.__dict__ for item in artifacts],
@@ -298,6 +336,8 @@ class CheckpointBackup:
             "status": "pending",
             "job_id": job_id,
             "checkpoint_id": checkpoint_id,
+            "catalog_checkpoint_id": qualified_checkpoint_id,
+            "content_fingerprint": content_fingerprint,
             "step": int(step),
             "final": bool(final),
             "artifacts": [item.__dict__ for item in artifacts],
@@ -378,20 +418,32 @@ class CheckpointBackup:
                 for artifact in artifacts:
                     if artifact.role == "manifest":
                         continue
-                    record = {
+                    common = {
                         "remote_path": artifact.remote_path,
-                        "relative_path": f"{entry['catalog_folder']}/{artifact.relative_path}" if artifact.role == "weights" else artifact.relative_path,
                         "size": artifact.size,
                         "sha256": artifact.sha256,
                     }
-                    resume_artifacts.append(record)
+                    resume_artifacts.append(
+                        {**common, "training_relative_path": artifact.relative_path}
+                    )
                     if artifact.role == "weights":
-                        weights.append(record)
+                        weights.append(
+                            {
+                                **common,
+                                "generation_relative_path": f"{entry['catalog_folder']}/{artifact.relative_path}",
+                            }
+                        )
                 checkpoint_record = {
-                    "checkpoint_id": entry["checkpoint_id"],
+                    "checkpoint_id": entry["catalog_checkpoint_id"],
+                    "source_checkpoint_id": entry["checkpoint_id"],
+                    "job_id": entry["job_id"],
                     "step": int(entry["step"]),
                     "final": bool(entry["final"]),
                     "revision": commit_id,
+                    "training_layout": {
+                        "root_kind": "ai_toolkit_job_save_root",
+                        "job_id": entry["job_id"],
+                    },
                     "weights": weights,
                     "resume_artifacts": resume_artifacts,
                 }

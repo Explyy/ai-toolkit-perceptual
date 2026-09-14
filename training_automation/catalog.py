@@ -11,7 +11,7 @@ from .backup import BackupConfigurationError, BackupError, LocalArtifact, sha256
 from .state import atomic_write_json
 
 
-CATALOG_SCHEMA = 1
+CATALOG_SCHEMA = 2
 ALLOWED_DESTINATIONS = {"loras", "diffusion_models", "vae", "text_encoders"}
 
 
@@ -49,6 +49,24 @@ class CatalogStore:
     def read(self) -> tuple[dict[str, Any], str]:
         payload, revision = self.client.read_remote_file(self.repo_id, self.repo_type, self.catalog_path)
         catalog = {"schema_version": CATALOG_SCHEMA, "models": []} if payload is None else json.loads(payload)
+        if catalog.get("schema_version") == 1 and isinstance(catalog.get("models"), list):
+            for model in catalog["models"]:
+                model.setdefault("base_model", None)
+                model.setdefault("selection", None)
+                for checkpoint in model.get("checkpoints", []):
+                    for artifact in checkpoint.get("weights", []):
+                        artifact.setdefault(
+                            "generation_relative_path", artifact.get("relative_path")
+                        )
+                    if checkpoint.get("imported_existing"):
+                        checkpoint["resume_artifacts"] = []
+                    else:
+                        for artifact in checkpoint.get("resume_artifacts", []):
+                            legacy = artifact.get("relative_path", "")
+                            artifact.setdefault(
+                                "training_relative_path", Path(legacy).name
+                            )
+            catalog["schema_version"] = CATALOG_SCHEMA
         if catalog.get("schema_version") != CATALOG_SCHEMA or not isinstance(catalog.get("models"), list):
             raise BackupError("unsupported or invalid remote model catalog")
         return catalog, revision
@@ -71,20 +89,34 @@ class CatalogStore:
             catalog, parent = self.read()
             existing = next((item for item in catalog["models"] if item["name"] == name), None)
             if existing:
-                for key in ("base_arch", "trigger_word", "destination_kind"):
+                changed = False
+                for key in ("base_arch", "base_model", "trigger_word", "destination_kind"):
+                    if key == "base_model" and existing.get(key) is None and metadata.get(key) is not None:
+                        existing[key] = metadata[key]
+                        changed = True
+                        continue
                     if existing.get(key) != metadata.get(key):
                         raise BackupConfigurationError(f"catalog model {name!r} has conflicting {key}")
-                return existing, parent
+                if not changed:
+                    return existing, parent
+                try:
+                    revision = self._write(catalog, parent, f"Record exact base model for {name}")
+                    return existing, revision
+                except Exception as exc:
+                    last_error = exc
+                    continue
             numeric_id = max([int(item["id"]) for item in catalog["models"]] or [0]) + 1
             model = {
                 "id": numeric_id,
                 "name": name,
                 "folder": f"{numeric_id:04d}-{safe_name(name)}",
                 "base_arch": metadata.get("base_arch"),
+                "base_model": metadata.get("base_model"),
                 "trigger_word": metadata.get("trigger_word"),
                 "destination_kind": destination_kind,
                 "checkpoints": [],
                 "selected_checkpoint_id": None,
+                "selection": None,
             }
             catalog["models"].append(model)
             catalog["models"].sort(key=lambda item: int(item["id"]))
@@ -115,7 +147,14 @@ class CatalogStore:
                 last_error = exc
         raise BackupError("catalog checkpoint update conflicted repeatedly") from last_error
 
-    def select(self, identifier: str | int, checkpoint_id: str, attempts: int = 5) -> str:
+    def select(
+        self,
+        identifier: str | int,
+        checkpoint_id: str,
+        *,
+        evidence: Mapping[str, Any] | None = None,
+        attempts: int = 5,
+    ) -> str:
         last_error: Exception | None = None
         for _ in range(attempts):
             catalog, parent = self.read()
@@ -124,6 +163,11 @@ class CatalogStore:
             if checkpoint is None:
                 raise BackupError(f"unknown checkpoint {checkpoint_id!r}")
             model["selected_checkpoint_id"] = checkpoint_id
+            model["selection"] = {
+                "checkpoint_id": checkpoint_id,
+                "checkpoint_revision": checkpoint["revision"],
+                "evidence": dict(evidence or {}),
+            }
             try:
                 return self._write(catalog, parent, f"Select {model['name']} {checkpoint_id}")
             except Exception as exc:
@@ -152,7 +196,7 @@ class CatalogStore:
             )
             record = {
                 "remote_path": remote_path,
-                "relative_path": f"{model['folder']}/{Path(remote_path).name}",
+                "generation_relative_path": f"{model['folder']}/{Path(remote_path).name}",
                 "size": temporary.stat().st_size,
                 "sha256": sha256_file(temporary),
             }
@@ -164,17 +208,20 @@ class CatalogStore:
             "final": bool(final),
             "revision": revision,
             "weights": [record],
-            "resume_artifacts": [record],
+            "resume_artifacts": [],
             "imported_existing": True,
+            "training_resume_available": False,
         }
         return self.add_checkpoint(str(metadata["name"]), checkpoint)
 
 
 def resolve_model(catalog: Mapping[str, Any], identifier: str | int) -> dict[str, Any]:
     text = str(identifier)
+    numeric = int(text) if text.isdigit() else None
     matches = [
         item for item in catalog["models"]
-        if str(item["id"]) == text or item["name"] == text or item["folder"] == text
+        if (numeric is not None and int(item["id"]) == numeric)
+        or item["name"] == text or item["folder"] == text
     ]
     if len(matches) != 1:
         raise BackupError(f"model identifier {identifier!r} did not resolve uniquely")
@@ -194,8 +241,17 @@ def _install(client: CatalogClient, repo_id: str, repo_type: str, artifact: Mapp
         client.download_file(repo_id, repo_type, artifact["remote_path"], revision, temporary)
         if temporary.stat().st_size != int(artifact["size"]) or sha256_file(temporary) != artifact["sha256"]:
             raise BackupError(f"download verification failed for {artifact['remote_path']}")
-        os.replace(temporary, target)
-        return "installed"
+        try:
+            os.link(temporary, target)
+            return "installed"
+        except FileExistsError:
+            if (
+                target.is_file()
+                and target.stat().st_size == int(artifact["size"])
+                and sha256_file(target) == artifact["sha256"]
+            ):
+                return "already-present"
+            raise BackupError(f"refusing to overwrite concurrently created file: {target}")
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -221,7 +277,8 @@ def restore_generation(*, client: CatalogClient, repo_id: str, repo_type: str, c
         raise BackupConfigurationError(f"no local root configured for destination kind {kind}")
     results = []
     for artifact in checkpoint["weights"]:
-        relative = safe_relative_path(artifact["relative_path"])
+        relative_value = artifact.get("generation_relative_path") or artifact.get("relative_path")
+        relative = safe_relative_path(relative_value)
         target = _target(Path(roots[kind]), relative)
         status = _install(client, repo_id, repo_type, artifact, checkpoint["revision"], target)
         results.append({"path": str(target), "status": status})
@@ -234,9 +291,14 @@ def restore_training(*, client: CatalogClient, repo_id: str, repo_type: str, cat
     checkpoint = next((item for item in model["checkpoints"] if item["checkpoint_id"] == selected), None)
     if checkpoint is None:
         raise BackupError("training checkpoint is absent or not selected")
+    if not checkpoint.get("resume_artifacts"):
+        raise BackupError("selected checkpoint is weights-only and has no trainer resume state")
     results = []
     for artifact in checkpoint["resume_artifacts"]:
-        target = _target(target_root, safe_relative_path(artifact["relative_path"]))
+        relative_value = artifact.get("training_relative_path")
+        if relative_value is None:
+            relative_value = Path(artifact.get("relative_path", "")).name
+        target = _target(target_root, safe_relative_path(relative_value))
         status = _install(client, repo_id, repo_type, artifact, checkpoint["revision"], target)
         results.append({"path": str(target), "status": status})
     return results

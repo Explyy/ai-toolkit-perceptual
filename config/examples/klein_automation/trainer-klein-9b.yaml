@@ -27,7 +27,7 @@ config:
           caption_dropout_rate: 0.05
           cache_latents_to_disk: true
           resolution: [512, 768, 1024]
-          num_repeats: [16, 4, 1]
+          num_repeats: 16
       train:
         batch_size: 1
         steps: 1200
@@ -83,4 +83,3 @@ config:
 meta:
   name: "[name]"
   version: "1.0"
-

@@ -31,6 +31,7 @@ def initialize_checkpoint_backup(process: Any) -> CheckpointBackup | None:
         catalog_metadata={
             "name": (config.get("catalog") or {}).get("name") or str(process.job.name),
             "base_arch": (config.get("catalog") or {}).get("base_arch") or getattr(process.model_config, "arch", None),
+            "base_model": (config.get("catalog") or {}).get("base_model") or getattr(process.model_config, "name_or_path", None),
             "trigger_word": (config.get("catalog") or {}).get("trigger_word", process.get_conf("trigger_word", None)),
             "destination_kind": (config.get("catalog") or {}).get("destination_kind", "loras"),
         },

@@ -6,13 +6,16 @@ WORKDIR /app/ai-toolkit
 # Install this checkout's additive package, then patch only four verified
 # trainer anchors. The base image's perceptual trainer and UI remain intact.
 COPY training_automation/ /app/ai-toolkit/training_automation/
+COPY config/examples/klein_automation/ /app/ai-toolkit/config/examples/klein_automation/
 COPY docker/automation/install_overlay.py /tmp/install_training_automation_overlay.py
-RUN python /tmp/install_training_automation_overlay.py --root /app/ai-toolkit \
+RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/output \
+    && python /tmp/install_training_automation_overlay.py --root /app/ai-toolkit \
     && python -m compileall -q /app/ai-toolkit/training_automation \
-    && mkdir -p /storage/automation /storage/config /storage/datasets /storage/output \
+    && python -m compileall -q /app/ai-toolkit/jobs/process/BaseSDTrainProcess.py \
+    && python -m training_automation --help >/dev/null \
+    && python -m training_automation run /app/ai-toolkit/config/examples/klein_automation/automation.yaml --dry-run >/tmp/training-automation-dry-run.json \
     && rm /tmp/install_training_automation_overlay.py
 
 ENV TRAINING_AUTOMATION_ROOT=/storage/automation
 
 # CMD and entrypoint are inherited to preserve the image's UI launch behavior.
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import re
 from pathlib import Path
@@ -121,16 +122,62 @@ def rank_checkpoints(checkpoints: list[dict[str, Any]], expected_signature: set[
         return [], "checkpoint samples do not contain the complete configured prompt/seed set"
     ranked = []
     for checkpoint in checkpoints:
-        identities = [
-            sample["identity"]["cosine_similarity"]
+        clipping = [sample["metrics"]["clipping_fraction_proxy"] for sample in checkpoint["samples"]]
+        score = -(sum(clipping) / len(clipping))
+        ranked.append({"step": checkpoint["step"], "clipping_proxy_score": score})
+    ranked.sort(key=lambda item: (-item["clipping_proxy_score"], item["step"]))
+    return ranked, None
+
+
+def rank_identity(checkpoints: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+    available_sets = [
+        {
+            sample["prompt_index"]
             for sample in checkpoint["samples"]
             if sample["identity"]["status"] == "available"
+        }
+        for checkpoint in checkpoints
+    ]
+    if not available_sets or not available_sets[0]:
+        return [], "no checkpoint has a valid identity subset"
+    if any(indices != available_sets[0] for indices in available_sets[1:]):
+        return [], "valid identity subsets are not comparable across checkpoints"
+    ranked = []
+    for checkpoint in checkpoints:
+        values = [
+            sample["identity"]["cosine_similarity"]
+            for sample in checkpoint["samples"]
+            if sample["prompt_index"] in available_sets[0]
         ]
-        clipping = [sample["metrics"]["clipping_fraction_proxy"] for sample in checkpoint["samples"]]
-        score = (sum(identities) / len(identities) if identities else 0.0) - sum(clipping) / len(clipping)
-        ranked.append({"step": checkpoint["step"], "heuristic_score": score, "identity_samples": len(identities)})
-    ranked.sort(key=lambda item: (-item["heuristic_score"], item["step"]))
+        ranked.append(
+            {
+                "step": checkpoint["step"],
+                "mean_face_cosine_similarity": sum(values) / len(values),
+                "prompt_indices": sorted(available_sets[0]),
+            }
+        )
+    ranked.sort(key=lambda item: (-item["mean_face_cosine_similarity"], item["step"]))
     return ranked, None
+
+
+def _choose_latest_complete_run(
+    samples: list[dict[str, Any]], expected_indices: set[int]
+) -> tuple[list[dict[str, Any]], str, int]:
+    """Partition chronological files when an index repeats and choose the latest complete run."""
+    runs: list[dict[int, dict[str, Any]]] = []
+    current: dict[int, dict[str, Any]] = {}
+    for sample in sorted(samples, key=lambda item: (item["timestamp_ms"], item["prompt_index"], item["path"])):
+        if sample["prompt_index"] in current:
+            runs.append(current)
+            current = {}
+        current[sample["prompt_index"]] = sample
+    if current:
+        runs.append(current)
+    complete = [run for run in runs if set(run) == expected_indices]
+    selected = complete[-1] if complete else (runs[-1] if runs else {})
+    discarded = len(samples) - len(selected)
+    status = "complete" if complete else "incomplete"
+    return [selected[index] for index in sorted(selected)], status, discarded
 
 
 def evaluate_job(
@@ -162,6 +209,7 @@ def evaluate_job(
         grouped.setdefault(step, []).append(
             {
                 "path": str(path),
+                "timestamp_ms": int(match.group("time")),
                 "prompt_index": index,
                 "prompt": expectation["prompt"],
                 "seed": expectation["seed"],
@@ -172,6 +220,7 @@ def evaluate_job(
         )
     checkpoint_steps: set[int] = set()
     checkpoint_paths: dict[int, list[str]] = {}
+    checkpoint_remote: dict[int, dict[str, Any]] = {}
     step_pattern = re.compile(r"_(\d{9})(?:_|\.|$)")
     for path in output_dir.iterdir() if output_dir.is_dir() else []:
         if path.name.startswith(".") or path.name in {"samples", "optimizer.pt", "config.yaml"}:
@@ -185,17 +234,46 @@ def evaluate_job(
             continue
         checkpoint_steps.add(step)
         checkpoint_paths.setdefault(step, []).append(str(path))
-    checkpoints = [
-        {
+    backup_state_path = Path(
+        config.get("backup_state_path") or output_dir / ".automation" / "backup-state.json"
+    )
+    if backup_state_path.is_file():
+        backup_state = json.loads(backup_state_path.read_text(encoding="utf-8"))
+        for entry in backup_state.get("checkpoints", {}).values():
+            if (
+                entry.get("status") != "backed_up"
+                or not entry.get("verified")
+                or not entry.get("cataloged")
+                or entry.get("job_id") != job_name
+            ):
+                continue
+            step = int(entry["step"])
+            checkpoint_steps.add(step)
+            checkpoint_remote[step] = {
+                "catalog_checkpoint_id": entry.get("catalog_checkpoint_id"),
+                "commit_id": entry.get("commit_id"),
+                "cataloged": True,
+                "destination": backup_state.get("destination"),
+            }
+    expected_indices = set(expected)
+    checkpoints = []
+    for step in sorted(checkpoint_steps & grouped.keys()):
+        selected_samples, sample_run_status, discarded_samples = _choose_latest_complete_run(
+            grouped[step], expected_indices
+        )
+        checkpoints.append({
             "step": step,
             "final": step == final_step,
             "checkpoint_paths": sorted(checkpoint_paths.get(step, [])),
-            "samples": sorted(grouped[step], key=lambda item: item["prompt_index"]),
-        }
-        for step in sorted(checkpoint_steps & grouped.keys())
-    ]
+            "catalog_checkpoint_id": checkpoint_remote.get(step, {}).get("catalog_checkpoint_id"),
+            "remote_checkpoint": checkpoint_remote.get(step),
+            "samples": selected_samples,
+            "sample_run_status": sample_run_status,
+            "discarded_duplicate_or_partial_samples": discarded_samples,
+        })
     expected_signature = {(index, item["seed"]) for index, item in expected.items()}
     ranked, ranking_error = rank_checkpoints(checkpoints, expected_signature)
+    identity_ranked, identity_ranking_error = rank_identity(checkpoints)
     report = {
         "schema_version": REPORT_SCHEMA,
         "job_config": str(job_config_path),
@@ -205,8 +283,14 @@ def evaluate_job(
         "ranking": {
             "status": "available" if not ranking_error else "unavailable",
             "reason": ranking_error,
-            "method": "mean face cosine similarity when available minus mean clipping proxy; heuristic only, not ground truth about overtraining",
+            "method": "negative mean clipping fraction proxy; heuristic only, not ground truth about overtraining",
             "items": ranked,
+        },
+        "identity_ranking": {
+            "status": "available" if not identity_ranking_error else "unavailable",
+            "reason": identity_ranking_error,
+            "method": "mean face cosine similarity on the same valid prompt-index subset for every checkpoint; heuristic only",
+            "items": identity_ranked,
         },
         "pose_body_limit": "optional backend output is viewpoint- and visibility-dependent and is not a 3D body measurement",
     }

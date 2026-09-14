@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -17,7 +18,8 @@ from .evaluation import evaluate_job
 from .state import atomic_write_json, read_json
 
 
-QUEUE_SCHEMA = 1
+QUEUE_CONFIG_SCHEMA = 1
+QUEUE_STATE_SCHEMA = 2
 
 
 class QueueConfigurationError(ValueError):
@@ -58,7 +60,7 @@ class TrainingQueue:
     ):
         self.config_path = config_path.resolve()
         self.config = _load_one_yaml(self.config_path)
-        if self.config.get("schema_version") != QUEUE_SCHEMA:
+        if self.config.get("schema_version") != QUEUE_CONFIG_SCHEMA:
             raise QueueConfigurationError("unsupported or missing queue schema_version")
         base = self.config_path.parent
         self.trainer_path = (base / self.config["trainer_yaml"]).resolve()
@@ -100,6 +102,8 @@ class TrainingQueue:
                     for item in raw.get("reference_images", [])
                 ],
                 "name": raw.get("name"),
+                "trainer_dataset": raw.get("trainer_dataset", {}),
+                "dataset_revision": raw.get("dataset_revision"),
             }
             digest = hashlib.sha256(_canonical(identity).encode()).hexdigest()[:12]
             job_id = f"{_slug(str(raw.get('name') or Path(raw['folder']).name))}-{digest}"
@@ -125,6 +129,7 @@ class TrainingQueue:
                 catalog = backup.setdefault("catalog", {})
                 catalog["name"] = str(raw.get("catalog_name") or raw.get("name") or job_id)
                 catalog.setdefault("base_arch", process.get("model", {}).get("arch"))
+                catalog.setdefault("base_model", process.get("model", {}).get("name_or_path"))
                 catalog["trigger_word"] = raw.get("trigger_word")
                 catalog["destination_kind"] = str(raw.get("destination_kind", catalog.get("destination_kind", "loras")))
                 backup.setdefault(
@@ -144,50 +149,122 @@ class TrainingQueue:
         return jobs
 
     def _state(self, jobs: list[QueueJob]) -> dict[str, Any]:
-        state = read_json(self.state_path, {"schema_version": QUEUE_SCHEMA, "jobs": {}})
-        if state.get("schema_version") != QUEUE_SCHEMA:
+        state = read_json(self.state_path, {"schema_version": QUEUE_STATE_SCHEMA, "jobs": {}})
+        if state.get("schema_version") == 1:
+            for entry in state.get("jobs", {}).values():
+                legacy = entry.get("status", "pending")
+                entry["training_status"] = "completed" if legacy == "completed" else ("failed" if legacy == "failed" else "pending")
+                entry["evaluation_status"] = "completed" if legacy == "completed" else "pending"
+                if legacy == "running":
+                    entry["interrupted"] = True
+            state["schema_version"] = QUEUE_STATE_SCHEMA
+        if state.get("schema_version") != QUEUE_STATE_SCHEMA:
             raise QueueConfigurationError("unsupported queue state schema")
         state.setdefault("jobs", {})
         for job in jobs:
-            entry = state["jobs"].setdefault(job.job_id, {"status": "pending", "attempts": 0})
-            if entry.get("status") == "running":
-                entry["status"] = "pending"
+            entry = state["jobs"].setdefault(
+                job.job_id,
+                {
+                    "status": "pending",
+                    "training_status": "pending",
+                    "evaluation_status": "pending",
+                    "attempts": 0,
+                },
+            )
+            if entry.get("training_status") == "running":
+                entry["training_status"] = "pending"
                 entry["interrupted"] = True
+            if entry.get("evaluation_status") == "running":
+                entry["evaluation_status"] = "pending"
+                entry["evaluation_interrupted"] = True
         atomic_write_json(self.state_path, state)
         return state
 
+    @contextmanager
+    def _lock(self):
+        import fcntl
+
+        lock_path = self.state_path.with_name(self.state_path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(f"training queue is already running: {self.state_path}") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def run(self, *, dry_run: bool = False) -> dict[str, Any]:
         jobs = self.materialize()
-        state = self._state(jobs)
         if dry_run:
-            return {"dry_run": True, "jobs": [job.job_id for job in jobs], "state_path": str(self.state_path)}
-        continue_on_error = bool(self.config.get("continue_on_error", False))
-        for job in jobs:
-            entry = state["jobs"][job.job_id]
-            if entry.get("status") == "completed":
-                continue
-            entry.update({"status": "running", "attempts": int(entry.get("attempts", 0)) + 1})
-            atomic_write_json(self.state_path, state)
-            env = dict(os.environ)
-            env["TRAINING_AUTOMATION_JOB_CONFIG"] = str(job.config_path)
-            code = self._run_command(
-                [self.python, str(self.repo_root / "run.py"), str(job.config_path)], env
-            )
-            if code != 0:
-                entry.update({"status": "failed", "exit_code": int(code)})
+            return {
+                "dry_run": True,
+                "jobs": [job.job_id for job in jobs],
+                "state_path": str(self.state_path),
+            }
+        with self._lock():
+            state = self._state(jobs)
+            continue_on_error = bool(self.config.get("continue_on_error", False))
+            for job in jobs:
+                entry = state["jobs"][job.job_id]
+                if entry.get("status") == "completed":
+                    continue
+                if entry.get("training_status") != "completed":
+                    entry.update({
+                        "status": "training",
+                        "training_status": "running",
+                        "attempts": int(entry.get("attempts", 0)) + 1,
+                    })
+                    atomic_write_json(self.state_path, state)
+                    env = dict(os.environ)
+                    env["TRAINING_AUTOMATION_JOB_CONFIG"] = str(job.config_path)
+                    code = self._run_command(
+                        [self.python, str(self.repo_root / "run.py"), str(job.config_path)], env
+                    )
+                    if code != 0:
+                        entry.update({"status": "failed", "training_status": "failed", "exit_code": int(code)})
+                        atomic_write_json(self.state_path, state)
+                        if not continue_on_error:
+                            break
+                        continue
+                    entry.update({"status": "training_completed", "training_status": "completed", "exit_code": 0})
+                    atomic_write_json(self.state_path, state)
+
+                evaluation = self.config.get("evaluation", {}) or {}
+                if not evaluation.get("enabled", True):
+                    entry.update({"status": "completed", "evaluation_status": "skipped", "evaluation_report": None})
+                    atomic_write_json(self.state_path, state)
+                    continue
+                if entry.get("evaluation_status") == "completed":
+                    entry["status"] = "completed"
+                    atomic_write_json(self.state_path, state)
+                    continue
+                entry.update({"status": "evaluating", "evaluation_status": "running"})
                 atomic_write_json(self.state_path, state)
-                if not continue_on_error:
-                    break
-                continue
-            evaluation = self.config.get("evaluation", {}) or {}
-            report_path = None
-            if evaluation.get("enabled", True):
-                report_path = evaluate_job(
-                    job_config_path=job.config_path,
-                    output_dir=job.output_root / job.job_id,
-                    reference_images=list(job.reference_images),
-                    config=evaluation,
-                )
-            entry.update({"status": "completed", "exit_code": 0, "evaluation_report": str(report_path) if report_path else None})
-            atomic_write_json(self.state_path, state)
-        return state
+                try:
+                    report_path = evaluate_job(
+                        job_config_path=job.config_path,
+                        output_dir=job.output_root / job.job_id,
+                        reference_images=list(job.reference_images),
+                        config=evaluation,
+                    )
+                except Exception as exc:
+                    entry.update({
+                        "status": "evaluation_failed",
+                        "evaluation_status": "failed",
+                        "evaluation_error": f"{type(exc).__name__}: {exc}",
+                    })
+                    atomic_write_json(self.state_path, state)
+                    if not continue_on_error:
+                        break
+                    continue
+                entry.update({
+                    "status": "completed",
+                    "evaluation_status": "completed",
+                    "evaluation_report": str(report_path),
+                })
+                entry.pop("evaluation_error", None)
+                atomic_write_json(self.state_path, state)
+            return state
