@@ -58,5 +58,5 @@ def test_docker_overlay_keeps_gui_default_and_adds_opt_in_parallel_command():
     assert "COPY docker/automation/run_parallel_training.sh /run-parallel-training" in dockerfile
     assert not any(line.startswith("CMD ") for line in instructions)
     assert not any(line.startswith("ENTRYPOINT ") for line in instructions)
-    assert "python -m training_automation parallel-run" in command
+    assert "python -m training_automation.worker" in command
     assert "InsightFaceCPUBackend" in dockerfile

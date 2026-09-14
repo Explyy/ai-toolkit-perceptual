@@ -9,7 +9,11 @@ import yaml
 
 from training_automation.backup import BackupError
 import training_automation.bootstrap as bootstrap
-from training_automation.bootstrap import run_parallel_bootstrap, validate_manifest
+from training_automation.bootstrap import (
+    NATIVE_KLEIN_FILENAME,
+    run_parallel_bootstrap,
+    validate_manifest,
+)
 from training_automation.queue import QueueJob
 
 
@@ -171,7 +175,19 @@ def private_manifest():
             {
                 "kind": "base_model", "repo_id": "base/repo",
                 "revision": "c" * 40, "local_path": "pinned/base",
-                "allow_patterns": ["model_index.json", "transformer/**"],
+                "artifact_path": "flux-2-klein-base-9b.safetensors",
+                "allow_patterns": ["flux-2-klein-base-9b.safetensors"],
+            },
+            {
+                "kind": "text_encoder", "repo_id": "text/repo",
+                "revision": "e" * 40, "local_path": "pinned/text",
+                "allow_patterns": ["*.json", "*.safetensors"],
+            },
+            {
+                "kind": "vae", "repo_id": "vae/repo",
+                "revision": "f" * 40, "local_path": "pinned/vae",
+                "artifact_path": "ae.safetensors",
+                "allow_patterns": ["ae.safetensors"],
             },
             {
                 "kind": "depth_model", "repo_id": "depth/repo",
@@ -236,7 +252,16 @@ def env(tmp_path):
 def snapshot_fetch(**kwargs):
     target = Path(kwargs["local_dir"])
     target.mkdir(parents=True, exist_ok=True)
-    (target / "snapshot-file").write_text(kwargs["revision"], encoding="utf-8")
+    repo_files = {
+        "base/repo": ["flux-2-klein-base-9b.safetensors"],
+        "text/repo": ["config.json", "model.safetensors", "tokenizer.json"],
+        "vae/repo": ["ae.safetensors"],
+        "depth/repo": ["config.json", "model.safetensors"],
+    }
+    for relative in repo_files[kwargs["repo_id"]]:
+        path = target / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(kwargs["revision"], encoding="utf-8")
     return str(target)
 
 
@@ -255,16 +280,30 @@ def test_parallel_bootstrap_archives_then_deletes_only_bound_instance(tmp_path):
     assert completion["completion"]["reference_provenance"] == "training-set"
     assert completion["completion"]["manifest_revision"] == MANIFEST_REVISION
     assert completion["completion"]["dataset_revision"] == DATASET_REVISION
+    sources = {
+        source["kind"]: source for source in completion["completion"]["model_sources"]
+    }
+    assert sources["base_model"]["local_path"] == "pinned/base"
+    assert sources["base_model"]["artifact_path"] == NATIVE_KLEIN_FILENAME
+    assert sources["text_encoder"]["local_path"] == "pinned/text"
+    assert "artifact_path" not in sources["text_encoder"]
+    assert sources["vae"]["artifact_path"] == "ae.safetensors"
     evidence = {item["relative_path"] for item in completion["evidence"]}
     assert "deployment-manifest.json" in evidence
     assert "model-sources/base_model.json" in evidence
     assert "model-sources/depth_model.json" in evidence
+    assert "model-sources/text_encoder.json" in evidence
+    assert "model-sources/vae.json" in evidence
     trainer = yaml.safe_load(
         (tmp_path / "storage/automation/run-1/a/trainer.yaml").read_text(encoding="utf-8")
     )
     process = trainer["config"]["process"][0]
     assert process["logging"]["use_ui_logger"] is False
     assert "sqlite_db_path" not in process
+    assert process["model"]["name_or_path"].endswith("/models/pinned/base")
+    assert process["model"]["te_name_or_path"].endswith("/models/pinned/text")
+    assert process["model"]["vae_path"].endswith("/models/pinned/vae/ae.safetensors")
+    assert process["depth_consistency"]["model_id"].endswith("/models/pinned/depth")
 
 
 def test_reference_identity_failure_is_durable_and_never_deletes(tmp_path):
@@ -355,6 +394,59 @@ def test_manifest_rejects_unlaunched_third_shard():
     manifest, _ = private_manifest()
     manifest["datasets"][5]["shard_id"] = "c"
     with pytest.raises(BackupError, match="two disjoint three-job shards"):
+        validate_manifest(manifest, run_id="run-1", shard_id="a")
+
+
+def test_legacy_two_role_manifest_remains_valid():
+    manifest, _ = private_manifest()
+    manifest["model_sources"] = [
+        source for source in manifest["model_sources"]
+        if source["kind"] in {"base_model", "depth_model"}
+    ]
+    assert len(validate_manifest(manifest, run_id="run-1", shard_id="a")) == 3
+
+
+def test_diffusers_only_base_fails_native_layout_before_trainer_invocation(tmp_path):
+    client = setup_client()
+    manifest = json.loads(client.snapshots[MANIFEST_REVISION]["private/manifest.json"])
+    manifest["model_sources"] = [
+        source for source in manifest["model_sources"]
+        if source["kind"] in {"base_model", "depth_model"}
+    ]
+    base = next(source for source in manifest["model_sources"] if source["kind"] == "base_model")
+    base.pop("artifact_path")
+    base["allow_patterns"] = ["model_index.json", "transformer/*"]
+    client.snapshots[MANIFEST_REVISION]["private/manifest.json"] = json.dumps(manifest).encode()
+    trainer_calls = []
+
+    def diffusers_snapshot(**kwargs):
+        target = Path(kwargs["local_dir"])
+        target.mkdir(parents=True, exist_ok=True)
+        if kwargs["repo_id"] == "base/repo":
+            (target / "model_index.json").write_text("{}", encoding="utf-8")
+            (target / "transformer").mkdir(exist_ok=True)
+            (target / "transformer/model.safetensors").write_bytes(b"sharded")
+        else:
+            (target / "config.json").write_text("{}", encoding="utf-8")
+        return str(target)
+
+    pod = Pod()
+    with pytest.raises(BackupError, match="native Klein transformer artifact is missing"):
+        run_parallel_bootstrap(
+            env=env(tmp_path), hub_client=client, pod_client=pod,
+            queue_factory=lambda path: trainer_calls.append(path),
+            snapshot_fetch=diffusers_snapshot,
+            recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+        )
+    assert trainer_calls == []
+    assert pod.deleted == []
+    assert not (tmp_path / "storage/automation/run-1/a/queue-state.json").exists()
+
+
+def test_manifest_rejects_unsafe_model_artifact_selector():
+    manifest, _ = private_manifest()
+    manifest["model_sources"][0]["artifact_path"] = "../outside.safetensors"
+    with pytest.raises(BackupError, match="unsafe"):
         validate_manifest(manifest, run_id="run-1", shard_id="a")
 
 

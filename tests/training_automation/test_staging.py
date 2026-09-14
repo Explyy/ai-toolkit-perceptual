@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from training_automation.backup import BackupError
+from training_automation.bootstrap import _stage_model_sources
 from training_automation.staging import PinnedDatasetStager
 
 
@@ -54,3 +55,29 @@ def test_staging_failure_is_durable_and_paths_are_safe(tmp_path):
     dataset["files"][0]["relative_path"] = "../escape"
     with pytest.raises(BackupError, match="unsafe"):
         make_stager(tmp_path, client).stage_dataset(dataset)
+
+
+def test_model_source_without_artifact_selector_accepts_legacy_marker(tmp_path):
+    target = tmp_path / "models/depth"
+    target.mkdir(parents=True)
+    source = {
+        "kind": "depth_model",
+        "repo_id": "depth/repo",
+        "revision": "b" * 40,
+        "local_path": "depth",
+        "allow_patterns": ["config.json", "model.safetensors"],
+    }
+    (target / ".training-automation-source.json").write_text(json.dumps({
+        "repo_id": source["repo_id"],
+        "revision": source["revision"],
+        "allow_patterns": source["allow_patterns"],
+    }), encoding="utf-8")
+
+    def fetch(**kwargs):
+        (Path(kwargs["local_dir"]) / "config.json").write_text("{}", encoding="utf-8")
+        return kwargs["local_dir"]
+
+    resolved = _stage_model_sources(
+        [source], models_root=tmp_path / "models", token="secret", snapshot_fetch=fetch
+    )
+    assert resolved == {"depth_model": str(target)}

@@ -26,6 +26,10 @@ DEFAULT_RECIPE_PATH = Path(
     "/app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml"
 )
 COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+MODEL_SOURCE_KINDS = {"base_model", "depth_model", "text_encoder", "vae"}
+REQUIRED_MODEL_SOURCE_KINDS = {"base_model", "depth_model"}
+NATIVE_KLEIN_FILENAME = "flux-2-klein-base-9b.safetensors"
+FLUX2_VAE_FILENAME = "ae.safetensors"
 
 
 def _component(value: Any, field: str) -> str:
@@ -95,10 +99,17 @@ def validate_manifest(
                 raise BackupError("every reference_path must name a staged dataset file")
     selected = [item for item in normalized if str(item["shard_id"]) == shard_id]
     sources = manifest.get("model_sources")
-    if not isinstance(sources, list) or len(sources) != 2 or {item.get("kind") for item in sources} != {
-        "base_model", "depth_model"
-    }:
-        raise BackupError("model_sources must contain exactly base_model and depth_model")
+    if not isinstance(sources, list) or any(not isinstance(item, Mapping) for item in sources):
+        raise BackupError("model_sources must be a list of mappings")
+    source_kinds = [str(item.get("kind")) for item in sources]
+    if (
+        not REQUIRED_MODEL_SOURCE_KINDS.issubset(source_kinds)
+        or len(source_kinds) != len(set(source_kinds))
+        or not set(source_kinds).issubset(MODEL_SOURCE_KINDS)
+    ):
+        raise BackupError(
+            "model_sources require unique base_model and depth_model roles with optional text_encoder and vae"
+        )
     for source in sources:
         if not source.get("repo_id"):
             raise BackupError("every model source requires repo_id")
@@ -108,6 +119,11 @@ def validate_manifest(
         patterns = source.get("allow_patterns")
         if not isinstance(patterns, list) or not patterns:
             raise BackupError("every model source requires nonempty allow_patterns")
+        artifact_path = source.get("artifact_path")
+        if artifact_path is not None:
+            if source["kind"] not in {"base_model", "vae"}:
+                raise BackupError("artifact_path is supported only for base_model and vae file roles")
+            safe_relative_path(str(artifact_path))
     evaluation = manifest.get("evaluation") or {}
     if (
         evaluation.get("enabled") is not True
@@ -209,6 +225,8 @@ def _stage_model_sources(
             "revision": str(source["revision"]),
             "allow_patterns": list(source["allow_patterns"]),
         }
+        if source.get("artifact_path") is not None:
+            expected_marker["artifact_path"] = str(source["artifact_path"])
         lock_path = target.with_name(target.name + ".snapshot.lock")
         with lock_path.open("a+") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -224,6 +242,62 @@ def _stage_model_sources(
             )
             atomic_write_json(marker, expected_marker)
         resolved[kind] = str(target)
+    return resolved
+
+
+def _selected_artifact(root: Path, value: str, *, role: str) -> Path:
+    relative = safe_relative_path(value)
+    resolved_root = root.resolve()
+    artifact = (resolved_root / relative).resolve()
+    if not artifact.is_relative_to(resolved_root):
+        raise BackupError(f"{role} artifact_path escapes its staged source")
+    if not artifact.is_file():
+        raise BackupError(f"{role} artifact is missing after pinned staging: {artifact}")
+    return artifact
+
+
+def _resolve_model_paths(
+    sources: list[Mapping[str, Any]], staged_roots: Mapping[str, str]
+) -> dict[str, str]:
+    by_kind = {str(source["kind"]): source for source in sources}
+    resolved: dict[str, str] = {}
+
+    base_root = Path(staged_roots["base_model"])
+    base_artifact = _selected_artifact(
+        base_root,
+        str(by_kind["base_model"].get("artifact_path", NATIVE_KLEIN_FILENAME)),
+        role="native Klein transformer",
+    )
+    if base_artifact.name != NATIVE_KLEIN_FILENAME:
+        raise BackupError(
+            f"native Klein transformer must be named {NATIVE_KLEIN_FILENAME}"
+        )
+    resolved["base_model"] = str(base_artifact.parent)
+
+    depth_root = Path(staged_roots["depth_model"])
+    _selected_artifact(depth_root, "config.json", role="depth_model")
+    _selected_artifact(depth_root, "model.safetensors", role="depth_model")
+    resolved["depth_model"] = str(depth_root)
+
+    if "text_encoder" in by_kind:
+        text_encoder_root = Path(staged_roots["text_encoder"])
+        _selected_artifact(text_encoder_root, "config.json", role="text_encoder")
+        weights = [
+            path for path in text_encoder_root.glob("*.safetensors")
+            if path.is_file() and path.resolve().is_relative_to(text_encoder_root.resolve())
+        ]
+        if not weights:
+            raise BackupError("text_encoder staged directory has no safetensors weights")
+        resolved["text_encoder"] = str(text_encoder_root)
+
+    if "vae" in by_kind:
+        resolved["vae"] = str(
+            _selected_artifact(
+                Path(staged_roots["vae"]),
+                str(by_kind["vae"].get("artifact_path", FLUX2_VAE_FILENAME)),
+                role="Flux2 VAE",
+            )
+        )
     return resolved
 
 
@@ -247,6 +321,10 @@ def _write_queue_config(
     process["logging"]["use_ui_logger"] = False
     canonical_base_model = str(process["model"]["name_or_path"])
     process["model"]["name_or_path"] = model_paths["base_model"]
+    if "text_encoder" in model_paths:
+        process["model"]["te_name_or_path"] = model_paths["text_encoder"]
+    if "vae" in model_paths:
+        process["model"]["vae_path"] = model_paths["vae"]
     process["depth_consistency"]["model_id"] = model_paths["depth_model"]
     trainer_path = run_root / "trainer.yaml"
     trainer_path.parent.mkdir(parents=True, exist_ok=True)
@@ -493,11 +571,14 @@ def run_parallel_bootstrap(
             state_path=staging_state,
         )
         staged = {str(item["id"]): stager.stage_dataset(item) for item in selected}
-        model_paths = _stage_model_sources(
+        staged_model_roots = _stage_model_sources(
             list(manifest["model_sources"]),
             models_root=models_root,
             token=values["HF_TOKEN"],
             snapshot_fetch=snapshot_fetch,
+        )
+        model_paths = _resolve_model_paths(
+            list(manifest["model_sources"]), staged_model_roots
         )
         queue_path = _write_queue_config(
             manifest=manifest,
@@ -529,7 +610,7 @@ def run_parallel_bootstrap(
             (state_path, "bootstrap-state.json"),
         ])
         for source in manifest["model_sources"]:
-            marker = Path(model_paths[str(source["kind"])]) / ".training-automation-source.json"
+            marker = Path(staged_model_roots[str(source["kind"])]) / ".training-automation-source.json"
             files.append((marker, f"model-sources/{source['kind']}.json"))
         completion.update({
             "manifest_revision": values["HF_MANIFEST_REVISION"],
@@ -542,7 +623,12 @@ def run_parallel_bootstrap(
                     "kind": source["kind"],
                     "repo_id": source["repo_id"],
                     "revision": source["revision"],
+                    "local_path": source["local_path"],
                     "allow_patterns": source["allow_patterns"],
+                    **(
+                        {"artifact_path": source["artifact_path"]}
+                        if source.get("artifact_path") is not None else {}
+                    ),
                 }
                 for source in manifest["model_sources"]
             ],

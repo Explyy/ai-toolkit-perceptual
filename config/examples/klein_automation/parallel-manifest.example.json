@@ -15,14 +15,31 @@
       "kind": "base_model",
       "repo_id": "black-forest-labs/FLUX.2-klein-base-9B",
       "revision": "32773329fbe7e81a90ef971740e8ba4b0364ecf3",
-      "local_path": "pinned/flux2-klein-base-9b-32773329",
+      "local_path": "native-flux2-klein-9b",
+      "artifact_path": "flux-2-klein-base-9b.safetensors",
       "allow_patterns": [
-        "model_index.json",
-        "scheduler/*",
-        "text_encoder/*",
-        "tokenizer/*",
-        "transformer/*",
-        "vae/*"
+        "flux-2-klein-base-9b.safetensors"
+      ]
+    },
+    {
+      "kind": "text_encoder",
+      "repo_id": "Qwen/Qwen3-8B",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "local_path": "qwen3-8b",
+      "allow_patterns": [
+        "*.json",
+        "*.safetensors",
+        "*.tiktoken"
+      ]
+    },
+    {
+      "kind": "vae",
+      "repo_id": "ai-toolkit/flux2_vae",
+      "revision": "3f679cf232e6d91d28396522d9502c31e8f7ccbe",
+      "local_path": "flux2-vae",
+      "artifact_path": "ae.safetensors",
+      "allow_patterns": [
+        "ae.safetensors"
       ]
     },
     {

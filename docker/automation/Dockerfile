@@ -18,6 +18,7 @@ RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/outp
     && python -m compileall -q /app/ai-toolkit/jobs/process/BaseSDTrainProcess.py \
     && python -m training_automation.recipe /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml /app/ai-toolkit \
     && python -m training_automation --help >/dev/null \
+    && python -c "from training_automation.worker import worker_log_path; assert worker_log_path({'TRAINING_RUN_ID':'smoke','TRAINING_SHARD_ID':'a'}) == __import__('pathlib').Path('/storage/automation/smoke/a/worker.log')" \
     && python -m training_automation run /app/ai-toolkit/config/examples/klein_automation/automation.yaml --dry-run >/tmp/training-automation-dry-run.json \
     && python -c "import json; from training_automation.backends import InsightFaceCPUBackend; p='/opt/training-automation-models'; assert len(json.load(open(p + '/SOURCES.json'))['archive_sha256']) == 64; InsightFaceCPUBackend(model_dir=p + '/insightface/models/buffalo_l')" \
     && rm /tmp/install_training_automation_overlay.py /tmp/install_evaluation_models.py

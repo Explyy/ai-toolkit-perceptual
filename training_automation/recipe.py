@@ -52,6 +52,14 @@ def validate_parallel_recipe(recipe_path: Path, repo_root: Path) -> None:
     trainer_source = (
         repo_root / "extensions_built_in" / "sd_trainer" / "SDTrainer.py"
     ).read_text(encoding="utf-8")
+    klein_source = (
+        repo_root / "extensions_built_in" / "diffusion_models" / "flux2"
+        / "flux2_klein_model.py"
+    ).read_text(encoding="utf-8")
+    flux2_source = (
+        repo_root / "extensions_built_in" / "diffusion_models" / "flux2"
+        / "flux2_model.py"
+    ).read_text(encoding="utf-8")
     required_config = ["preprocess_dataset_raw_config", "isinstance(num_repeats, list)", "self.weight_noise"]
     required_trainer = [
         "from toolkit.subject_mask import cache_subject_masks",
@@ -62,6 +70,18 @@ def validate_parallel_recipe(recipe_path: Path, repo_root: Path) -> None:
     ]
     missing = [token for token in required_config if token not in config_source]
     missing += [token for token in required_trainer if token not in trainer_source]
+    missing += [
+        token for token in ["self.model_config.te_name_or_path", "flux2_klein_te_path"]
+        if token not in klein_source
+    ]
+    missing += [
+        token for token in [
+            "flux-2-klein-base-9b.safetensors",
+            "self.model_config.vae_path",
+            "load_file(transformer_path",
+        ]
+        if token not in f"{klein_source}\n{flux2_source}"
+    ]
     if missing:
         raise BackupError(f"pinned trainer image lacks selected recipe support: {missing}")
 
