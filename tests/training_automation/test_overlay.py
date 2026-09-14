@@ -17,8 +17,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.save_config = SaveConfig(**self.get_conf('save', {}))
 
     def clean_up_saves(self):
-        for item in items_to_remove:
-            print_acc(f"Removing old save: {item}")
+        if os.path.exists(self.save_root):
+            for item in items_to_remove:
+                print_acc(f"Removing old save: {item}")
 
     def save(self, step=None):
         # save learnable params as json if we have thim

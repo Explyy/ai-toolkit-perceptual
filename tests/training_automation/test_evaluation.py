@@ -60,7 +60,7 @@ def test_incomplete_prompt_seed_set_disables_ranking(tmp_path):
         reference_images=[], config={},
     ).read_text())
     assert report["ranking"]["status"] == "unavailable"
-    assert "complete configured" in report["ranking"]["reason"]
+    assert "not comparable" in report["ranking"]["reason"]
 
 
 class Faces:
@@ -90,4 +90,3 @@ def test_human_selection_persists_checkpoint_evidence(tmp_path):
     content = json.loads(selection.read_text())
     assert content["selected_step"] == 200
     assert content["evidence"]["final"] is True
-
