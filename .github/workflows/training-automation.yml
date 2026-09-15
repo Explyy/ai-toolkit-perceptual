@@ -12,6 +12,7 @@ on:
       - "config/examples/klein_automation/**"
       - "docs/training-automation.md"
       - "notebooks/**"
+      - "scripts/**"
       - "jobs/process/BaseSDTrainProcess.py"
       - ".github/workflows/training-automation.yml"
   pull_request:
@@ -22,6 +23,7 @@ on:
       - "config/examples/klein_automation/**"
       - "docs/training-automation.md"
       - "notebooks/**"
+      - "scripts/**"
       - "jobs/process/BaseSDTrainProcess.py"
       - ".github/workflows/training-automation.yml"
   workflow_dispatch:
