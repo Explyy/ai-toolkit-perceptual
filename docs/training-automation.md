@@ -105,9 +105,12 @@ The automatic publisher uses the report's existing shortlist only after rechecki
 ```text
 training-results/<run-id>/<numeric-name>/
 ├── index.json
+├── overview.png
 ├── evaluation-gallery.html
 ├── top-1/
 │   ├── contact-sheet.png
+│   ├── report-index.json
+│   ├── pages/page-01.png ...
 │   ├── selection.json
 │   └── weights/<generation-weight>
 ├── top-2/...
@@ -134,7 +137,73 @@ python -m training_automation publish-run-results /storage/archive \
   --repo-type dataset
 ```
 
-Both publishers require `HF_TOKEN` and `HF_REPO_ID`, refuse public repositories, use parent-commit guards, verify every uploaded byte at the returned immutable revision, and leave original checkpoint paths and catalog history intact. Run them where the private samples and weights already exist; they do not download models to the workstation.
+Each successful publication also updates `training-results/latest/<numeric-name>.json` in the same parent-guarded commit. That pointer names an explicit completed run, job, model, report hash, and completion time; no UUID or lexical path ordering is interpreted as chronology. The per-checkpoint pages contain at most six large uncropped images at 1920 pixels wide, while `contact-sheet.png` is the first concise page and `report-index.json` lists every page. `overview.png` compares the same prompt across the available top three with a raw cosine axis from -1 to 1.
+
+Both publishers require `HF_TOKEN` and `HF_REPO_ID`, refuse public repositories, use parent-commit guards, verify every uploaded byte at the returned immutable revision, and leave original checkpoint paths and catalog history intact. Run them where the private samples and weights already exist; they do not download models to the workstation. Refresh old immutable evidence without regenerating samples or transferring LoRA weights:
+
+```bash
+python -m training_automation refresh-report \
+  /storage/archive/jobs/SUBJECT_JOB/evaluation.json \
+  --samples-root /storage/archive/jobs/SUBJECT_JOB/samples \
+  --run-id RUN_ID --work-dir /storage/report-refresh/SUBJECT_JOB \
+  --repo-type dataset
+```
+
+Refreshed files are additive under `training-results/<run>/<numeric-name>/reports-v2/<evaluation-hash>/`. Their manifest states that source evidence is unchanged and no model weights were transferred.
+
+## Unified GUI and automatic workflow
+
+The overlay provides one additional opt-in command, `/run-unified-training`. It starts `training_automation.unified_supervisor` beside the inherited `/app/start.sh` and then gives the foreground process to the original Alternative Training GUI. The Dockerfile still declares no `CMD` or `ENTRYPOINT`, so an ordinary launch remains the original GUI. Use this command only on the existing Alternative Training template with its established `/storage` volume; do not create a second application or image family.
+
+Copy [unified-workflow.yaml](../config/examples/klein_automation/unified-workflow.yaml) to `/storage/config/klein-unified.yaml`. The recommended environment is:
+
+```text
+HF_TOKEN=<private repository read/write token>
+HF_REPO_ID=<owner/private repository>
+TRAINING_UNIFIED_CONFIG=/storage/config/klein-unified.yaml
+DATASETS_FOLDER=<the exact folder used by the GUI>
+COMFYUI_ROOT=<the existing ComfyUI root, if loras_root is not explicit>
+TRAINING_WORKER_ID=0
+TRAINING_WORKER_COUNT=1
+```
+
+Set the template command to `/run-unified-training`. `TRAINING_GUI_START` may name another existing executable when the inherited image does not use `/app/start.sh`; it is never parsed as a shell command. The automation writes its actual state to `/storage/automation/unified/supervisor-state.json` and its log to `supervisor.log`. An error is recorded as `held`; the GUI stays reachable and the supervisor polls again. Persistent GUI sessions are never automatically deleted.
+
+The dataset root must already exist. If YAML, `DATASETS_FOLDER`, or the optional read-only `gui_settings_file` bridge provide more than one value, every resolved path must be identical. A mismatch stops before sync or training. The LoRA target is likewise explicit through `loras_root`, `LORAS_ROOT`, `comfyui_root`, or `COMFYUI_ROOT`. When none is set, discovery is bounded to direct case-insensitive `ComfyUI` children of `/storage`; zero or multiple matching `models/loras` folders is an actionable held state. Automation does not create a guessed dataset or ComfyUI tree.
+
+At each poll the controller performs these steps in order:
+
+1. Read the private catalog at one immutable Hub revision and sync top-1 result pointers before training. Files go to `models/loras/<numeric-name>/<checkpoint-id>/<weight>` so a new top checkpoint cannot overwrite an older one. Matching bytes are reused; conflicting bytes hold the workflow. A dry run still downloads remote bytes to temporary storage when needed to prove their SHA-256.
+2. Scan immediate dataset folders and require readable supported images with nonempty same-stem `.txt` captions. Spaces, underscores, mixed case, and safe punctuation are accepted. Folder symlinks, file symlinks, nested directories, normalized-name collisions, unsupported visible files, and path escape are rejected. Optional `.training-automation.json` may contain only `catalog_name` and `trigger_word`.
+3. Record the complete image/caption filename, size, and SHA-256 identity in a local and private-Hub workflow ledger. The same snapshot must survive the configured quiet period and a final pre-training rescan. A completed identity is never queued again after local disk replacement. Different bytes at an existing folder become visible `changed` state and never silently start paid work. An incomplete job remains held unless `retry_incomplete: true` is explicitly configured.
+4. Reserve the stable numeric catalog entry, persist a deterministic worker assignment, and order pending jobs by normalized model name unless the notebook supplies an explicit order. `worker.id` and `worker.count` permit two preassigned workers to divide any number of folders without a fixed six/three limit. Per-worker locks reject a duplicate controller while different worker IDs retain disjoint assignments.
+5. Materialize the established masked Klein 9B LoKr recipe, run one GPU training/evaluation sequence, publish the automatic top three, immediately sync the new top one, archive the report and samples, then mark the dataset completed only after the verified archive commit.
+
+Loader accounting reads every image's dimensions, calls the same `toolkit/buckets.py` geometry with divisibility 16, freezes scale 1 with square/random crop disabled, applies resolution repeats `[16,4,1]`, and counts each unpadded partial bucket batch at batch size 4. The default six loader epochs produce 126 source-image exposures; persisted steps equal exact bucket batches per epoch times six. Remote tests compare this implementation directly to the standalone bucket function shipped in the pinned trainer checkout, and the Docker build validates the trainer anchors before use.
+
+Existing completed datasets can be seeded without downloading source photos. Publish a private immutable JSON file and pin it in `discovery.legacy_completed_index`:
+
+```json
+{
+  "schema_version": 1,
+  "datasets": {
+    "EXACT_EXISTING_FOLDER": {
+      "fingerprint": "64_HEX_IMAGE_AND_CAPTION_CONTENT_HASH",
+      "catalog_name": "Existing catalog name",
+      "catalog_id": 1,
+      "trigger_word": "Owhx",
+      "run_id": "EXPLICIT_COMPLETED_RUN_ID",
+      "source_dataset_revision": "40_HEX_REVISION"
+    }
+  }
+}
+```
+
+Historical top-one results with no trustworthy completion timestamp are seeded separately through `sync.legacy_runs`, with an explicit run ID, immutable revision, and model IDs. Future publications use the per-model latest pointer. Neither path sorts UUIDs or guesses which historical run is newest.
+
+The unified recipe [trainer-subject-likeness-masked-klein-9b-v2.yaml](../config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-v2.yaml) preserves the masked Subject Likeness, Klein 9B, LoKr, and weight-noise training settings. Its fixed `subject-likeness-articulated-v2` evaluation cohort contains 12 distinct seeds and cases: two easier face anchors plus rear over-shoulder, contrapposto, rotated seated, cross-legged, squat, one-knee kneeling, mid-stride walking, overhead lunge, table-supported lean, and stair poses. Prompts say `single adult subject [trigger]`, state visible limb geometry, vary wardrobe/location/light, and do not infer gender from a folder name. Case ID, category, seed, and cohort version are recorded in evaluation evidence. Pose values remain 2D image-plane proxies; they do not prove prompt adherence or anatomical correctness, and v1/v2 cohorts must not be compared as if they were identical.
+
+The executable [Klein_Unified_Training.ipynb](../notebooks/Klein_Unified_Training.ipynb) is an optional interface to the same Python modules. Its source checkout is pinned to a concrete commit and every cell is clean. Edit the explicit repository, run ID, dataset, ComfyUI, LoRA, worker, model/rank, and ordering fields. `ACTION="status"` is the safe Run All default and reads durable state. `sync`, `discover`, `run`, and `refresh` perform those named operations and print the returned real state; no cell simulates success or chooses an agent. The token comes from `HF_TOKEN` or a masked `getpass` prompt and is never stored in the notebook.
 
 ## Docker and remote checks
 
