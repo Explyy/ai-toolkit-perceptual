@@ -49,6 +49,9 @@ class FakeHubClient:
             result[path] = {
                 "size": len(payload) + (1 if self.corrupt_metadata else 0),
                 "sha256": hashlib.sha256(payload).hexdigest(),
+                "blob_id": hashlib.sha1(
+                    f"blob {len(payload)}\0".encode("ascii") + payload
+                ).hexdigest(),
             }
         return result
 

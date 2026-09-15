@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from .discovery import (
     load_legacy_completed,
     scan_dataset_root,
 )
+from .dataset_storage import observe_remote_datasets, sync_remote_datasets
 from .queue import TrainingQueue
 from .results import publish_ranked_results
 from .state import atomic_write_json, read_json
@@ -29,6 +31,7 @@ from .sync import sync_latest_loras, sync_ranked_loras
 
 
 UNIFIED_SCHEMA = 1
+_PROCESS_ENV_LOCK = threading.RLock()
 
 
 def _expanded(value: Any, env: Mapping[str, str]) -> Any:
@@ -57,6 +60,40 @@ def _existing_path(value: Any, description: str) -> Path:
     if not str(value or "") or not path.is_dir():
         raise BackupConfigurationError(f"{description} is not an existing directory: {value}")
     return path
+
+
+def _initialize_storage_directories(config: Mapping[str, Any]) -> None:
+    if not bool(config.get("initialize_storage_directories", False)):
+        return
+    storage = Path(str(config.get("storage_root", "/storage"))).expanduser().resolve()
+    if not storage.is_dir() or storage.is_symlink():
+        raise BackupConfigurationError(
+            f"configured storage_root must already be a real directory: {storage}"
+        )
+    targets = []
+    if config.get("dataset_root"):
+        targets.append(Path(str(config["dataset_root"])).expanduser().resolve())
+    if config.get("loras_root"):
+        targets.append(Path(str(config["loras_root"])).expanduser().resolve())
+    elif config.get("comfyui_root"):
+        targets.append(
+            Path(str(config["comfyui_root"])).expanduser().resolve() / "models" / "loras"
+        )
+    if config.get("work_root"):
+        targets.append(Path(str(config["work_root"])).expanduser().resolve())
+    for target in targets:
+        if target != storage and not target.is_relative_to(storage):
+            raise BackupConfigurationError(
+                f"refusing to initialize storage directory outside {storage}: {target}"
+            )
+        cursor = storage
+        for part in target.relative_to(storage).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise BackupConfigurationError(
+                    f"refusing to initialize storage through symlink: {cursor}"
+                )
+        target.mkdir(parents=True, exist_ok=True)
 
 
 def _gui_database(config: Mapping[str, Any]) -> Path:
@@ -206,6 +243,7 @@ def prepare_unified_environment(
     """Resolve and, when explicitly enabled, initialize the GUI storage bridge."""
     values = dict(os.environ if env is None else env)
     config = load_unified_config(config_path, values)
+    _initialize_storage_directories(config)
     return {
         "schema_version": 1,
         "dataset_root": str(resolve_dataset_root(config, values)),
@@ -228,6 +266,17 @@ def _controller_lock(path: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def _shared_storage_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _repo(config: Mapping[str, Any], env: Mapping[str, str]) -> tuple[str, str, str]:
     hub = config.get("hub") or {}
     repo_id = str(hub.get("repo_id") or env.get(str(hub.get("repo_id_env", "HF_REPO_ID")), ""))
@@ -238,6 +287,21 @@ def _repo(config: Mapping[str, Any], env: Mapping[str, str]) -> tuple[str, str, 
     if not repo_id or not token or repo_type not in {"dataset", "model"}:
         raise BackupConfigurationError("private Hub repo, repo type, and credential environment are required")
     return repo_id, repo_type, token
+
+
+@contextmanager
+def _trainer_credential_environment(name: str, value: str):
+    with _PROCESS_ENV_LOCK:
+        existed = name in os.environ
+        previous = os.environ.get(name)
+        os.environ[name] = value
+        try:
+            yield
+        finally:
+            if existed:
+                os.environ[name] = str(previous)
+            else:
+                os.environ.pop(name, None)
 
 
 def _sync_startup(
@@ -310,6 +374,7 @@ def sync_unified_loras(
     """Run the exact startup latest-plus-explicit-history sync without discovery/training."""
     values = dict(os.environ if env is None else env)
     config = load_unified_config(config_path, values)
+    _initialize_storage_directories(config)
     loras_root = resolve_loras_root(config, values)
     repo_id, repo_type, token = _repo(config, values)
     hub = client or HuggingFaceBackupClient(token)
@@ -571,6 +636,7 @@ def run_unified_workflow(
 ) -> dict[str, Any]:
     values = dict(os.environ if env is None else env)
     config = load_unified_config(config_path, values)
+    _initialize_storage_directories(config)
     dataset_root = resolve_dataset_root(config, values)
     loras_root = resolve_loras_root(config, values)
     repo_id, repo_type, token = _repo(config, values)
@@ -588,12 +654,34 @@ def run_unified_workflow(
     if quiet_seconds < 0:
         raise BackupConfigurationError("discovery quiet_seconds cannot be negative")
     worker_root = work_root / f"worker-{worker_id}"
+    trainer_yaml = Path(str((config.get("queue") or {})["trainer_yaml"])).resolve()
+    recipe = yaml.safe_load(trainer_yaml.read_text(encoding="utf-8"))
+    process = recipe["config"]["process"][0]
+    dataset_storage = config.get("dataset_storage") or {}
+    remote_storage_enabled = bool(dataset_storage.get("enabled", False))
     ledger_store = WorkflowLedgerStore(
         client=hub, repo_id=repo_id, repo_type=repo_type,
         remote_path=str(discovery.get("ledger_path", "training-automation/workflow-ledger.json")),
         local_path=worker_root / "ledger" / "workflow-ledger.json",
     )
     with _controller_lock(worker_root / "controller.lock"):
+        remote_first: dict[str, dict[str, Any]] = {}
+        if remote_storage_enabled:
+            dataset_catalog_path = str(
+                dataset_storage.get(
+                    "catalog_path", "training-automation/dataset-catalog.json"
+                )
+            )
+            _, remote_revision = hub.read_remote_file(
+                repo_id, repo_type, dataset_catalog_path
+            )
+            remote_first = observe_remote_datasets(
+                client=hub, repo_id=repo_id, repo_type=repo_type,
+                revision=remote_revision,
+                remote_prefix=str(dataset_storage.get("remote_prefix", "datasets")),
+                work_dir=worker_root / "dataset-observations" / "first",
+                default_trigger_word=str((config.get("queue") or {}).get("trigger_word", "Owhx")),
+            )
         sync_records = (startup_sync or _sync_startup)(
             client=hub, config=config, repo_id=repo_id, repo_type=repo_type,
             loras_root=loras_root, work_root=worker_root, dry_run=dry_run,
@@ -612,6 +700,41 @@ def run_unified_workflow(
         )
         if quiet_seconds:
             sleep(quiet_seconds)
+        remote_dataset_sync: dict[str, Any] | None = None
+        if remote_storage_enabled:
+            dataset_catalog_path = str(
+                dataset_storage.get(
+                    "catalog_path", "training-automation/dataset-catalog.json"
+                )
+            )
+            _, remote_revision = hub.read_remote_file(
+                repo_id, repo_type, dataset_catalog_path
+            )
+            remote_second = observe_remote_datasets(
+                client=hub, repo_id=repo_id, repo_type=repo_type,
+                revision=remote_revision,
+                remote_prefix=str(dataset_storage.get("remote_prefix", "datasets")),
+                work_dir=worker_root / "dataset-observations" / "second",
+                default_trigger_word=str((config.get("queue") or {}).get("trigger_word", "Owhx")),
+            )
+            with _shared_storage_lock(work_root / "dataset-storage" / "sync.lock"):
+                remote_dataset_sync = sync_remote_datasets(
+                    client=hub, repo_id=repo_id, repo_type=repo_type,
+                    first=remote_first, second=remote_second,
+                    dataset_root=dataset_root,
+                    work_dir=work_root / "dataset-storage",
+                    catalog_path=dataset_catalog_path,
+                    model_catalog_path=(
+                        f"{safe_relative_path(str((config.get('sync') or {}).get('catalog_prefix', 'training-backups'))).as_posix()}"
+                        "/catalog.json"
+                    ),
+                    base_arch=str(process["model"]["arch"]),
+                    base_model=str(process["model"]["name_or_path"]),
+                    exposures=int(discovery.get("target_exposures", 126)),
+                    minimum_free_bytes=int(
+                        dataset_storage.get("minimum_free_bytes", 1_073_741_824)
+                    ),
+                )
         second = scan_dataset_root(
             dataset_root, exposures=int(discovery.get("target_exposures", 126)),
             default_trigger_word=str((config.get("queue") or {}).get("trigger_word", "Owhx")),
@@ -619,6 +742,10 @@ def run_unified_workflow(
         ledger, ledger_revision = ledger_store.reconcile(
             second, worker_count=worker_count, quiet_seconds=quiet_seconds,
             now=max(clock(), start + quiet_seconds),
+            verified_stable_fingerprints=tuple(
+                item["fingerprint"]
+                for item in (remote_dataset_sync or {}).get("installed", [])
+            ),
         )
         invalid_assignments = [
             item["folder"] for item in ledger["datasets"].values()
@@ -643,7 +770,8 @@ def run_unified_workflow(
             "schema_version": 1, "worker_id": worker_id,
             "worker_count": worker_count, "dataset_root": str(dataset_root),
             "loras_root": str(loras_root), "ledger_revision": ledger_revision,
-            "sync": sync_records, "pending": [item["folder"] for item in candidates],
+            "sync": sync_records, "remote_datasets": remote_dataset_sync,
+            "pending": [item["folder"] for item in candidates],
         }
         if not candidates or dry_run:
             held = [
@@ -662,9 +790,6 @@ def run_unified_workflow(
             catalog_path=f"{safe_relative_path(str((config.get('sync') or {}).get('catalog_prefix', 'training-backups'))).as_posix()}/catalog.json",
             work_dir=worker_root / "catalog",
         )
-        trainer_yaml = Path(str((config.get("queue") or {})["trainer_yaml"])).resolve()
-        recipe = yaml.safe_load(trainer_yaml.read_text(encoding="utf-8"))
-        process = recipe["config"]["process"][0]
         exports: list[dict[str, Any]] = []
         archives: list[dict[str, Any]] = []
         runs: list[dict[str, Any]] = []
@@ -730,7 +855,9 @@ def run_unified_workflow(
                     job_id=job.job_id,
                     resume_action=resume_action,
                 )
-                state = queue.run()
+                token_env = str((config.get("hub") or {}).get("token_env", "HF_TOKEN"))
+                with _trainer_credential_environment(token_env, token):
+                    state = queue.run()
             assert state is not None
             job_status = (state["jobs"].get(job.job_id) or {}).get("status", "unknown")
             if job_status != "completed":

@@ -8,6 +8,7 @@ from pathlib import Path
 from .backup import BackupConfigurationError, BackupError, HuggingFaceBackupClient, sha256_file
 from .catalog import CatalogStore, restore_generation, restore_training
 from .evaluation import evaluate_job, persist_selection
+from .dataset_storage import upload_dataset_folder
 from .gallery import render_gallery
 from .queue import TrainingQueue
 from .results import (
@@ -104,6 +105,18 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument("--model-id", type=int, action="append", default=[])
     sync.add_argument("--results-prefix", default="training-results")
     sync.add_argument("--dry-run", action="store_true")
+    upload_dataset = commands.add_parser(
+        "upload-dataset",
+        help="upload one validated image/caption folder to private HF dataset storage",
+    )
+    _connection_args(upload_dataset)
+    upload_dataset.set_defaults(repo_type="dataset")
+    upload_dataset.add_argument("folder", type=Path)
+    upload_dataset.add_argument("--remote-folder")
+    upload_dataset.add_argument("--name")
+    upload_dataset.add_argument("--trigger-word", default="Owhx")
+    upload_dataset.add_argument("--work-dir", type=Path, required=True)
+    upload_dataset.set_defaults(remote_prefix="datasets")
     select = commands.add_parser("select", help="persist a human checkpoint choice")
     select.add_argument("report", type=Path)
     select.add_argument("step", type=int)
@@ -250,6 +263,20 @@ def main(argv: list[str] | None = None) -> int:
         else:
             result = sync_latest_loras(**kwargs)
         print(json.dumps(result, indent=2))
+    elif args.command == "upload-dataset":
+        repo_id = args.repo_id or os.environ.get(args.repo_id_env, "")
+        token = os.environ.get(args.token_env)
+        if not repo_id or not token:
+            raise BackupConfigurationError(
+                "private repository id and environment credential are required"
+            )
+        print(json.dumps(upload_dataset_folder(
+            client=HuggingFaceBackupClient(token), repo_id=repo_id,
+            repo_type=args.repo_type, folder=args.folder,
+            remote_folder_name=args.remote_folder, catalog_name=args.name,
+            trigger_word=args.trigger_word, remote_prefix=args.remote_prefix,
+            work_dir=args.work_dir,
+        ), indent=2))
     elif args.command == "select":
         if args.repo_id or os.environ.get(args.repo_id_env):
             if not args.model:

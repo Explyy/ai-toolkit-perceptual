@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol
 
@@ -24,7 +25,8 @@ class CatalogClient(Protocol):
 
 
 def safe_name(value: str) -> str:
-    result = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    folded = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    result = re.sub(r"[^a-z0-9]+", "-", folded.lower()).strip("-")
     if not result:
         raise BackupConfigurationError("catalog name must contain a letter or number")
     return result

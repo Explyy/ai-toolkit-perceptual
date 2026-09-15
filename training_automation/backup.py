@@ -107,6 +107,7 @@ class HuggingFaceBackupClient:
                 result[str(entry.path)] = {
                     "size": getattr(entry, "size", None),
                     "sha256": lfs_sha,
+                    "blob_id": getattr(entry, "blob_id", None),
                 }
         return result
 

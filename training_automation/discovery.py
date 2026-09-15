@@ -18,7 +18,7 @@ from .state import atomic_write_json, read_json
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-DATASET_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9 _.()-]{0,126}[A-Za-z0-9])?$")
+DATASET_NAME_RE = re.compile(r"^(?!\.)(?!.*[\\/])(?!.*[\x00-\x1f]).{1,128}$")
 LEDGER_SCHEMA = 1
 
 
@@ -204,6 +204,9 @@ def scan_dataset_root(
     normalized = [safe_name(item.name) for item in snapshots]
     if len(normalized) != len(set(normalized)):
         raise BackupError("dataset folders resolve to duplicate normalized model names")
+    fingerprints = [item.fingerprint for item in snapshots]
+    if len(fingerprints) != len(set(fingerprints)):
+        raise BackupError("multiple local dataset folders contain identical training content")
     return sorted(snapshots, key=lambda item: (safe_name(item.name), item.folder.casefold()))
 
 
@@ -256,6 +259,7 @@ class WorkflowLedgerStore:
         quiet_seconds: float,
         now: float,
         legacy_completed: Mapping[str, Any] | None = None,
+        verified_stable_fingerprints: Sequence[str] = (),
         attempts: int = 5,
     ) -> tuple[dict[str, Any], str]:
         last_error: Exception | None = None
@@ -267,13 +271,35 @@ class WorkflowLedgerStore:
                     datasets[folder] = dict(record)
             for snapshot in snapshots:
                 current = datasets.get(snapshot.folder)
+                if current is None:
+                    aliases = [
+                        (folder, item) for folder, item in datasets.items()
+                        if item.get("fingerprint") == snapshot.fingerprint
+                    ]
+                    if len(aliases) > 1:
+                        raise BackupError(
+                            f"persisted dataset identity is ambiguous for {snapshot.folder}"
+                        )
+                    if aliases:
+                        previous_folder, current = aliases[0]
+                        if previous_folder != snapshot.folder:
+                            datasets.pop(previous_folder)
+                            current["folder"] = snapshot.folder
+                            current["name"] = snapshot.name
+                            current["trigger_word"] = snapshot.trigger_word
+                            current["folder_aliases"] = sorted(set([
+                                *current.get("folder_aliases", []), previous_folder,
+                            ]))
+                            datasets[snapshot.folder] = current
                 snapshot_data = asdict(snapshot)
                 snapshot_data["files"] = list(snapshot_data["files"])
                 if current is None:
+                    verified_remote = snapshot.fingerprint in set(verified_stable_fingerprints)
                     datasets[snapshot.folder] = {
                         **snapshot_data,
-                        "status": "observing",
+                        "status": "ready" if verified_remote else "observing",
                         "first_observed_at": now,
+                        **({"stable_at": now, "source": "verified-remote-dataset"} if verified_remote else {}),
                         "worker": assigned_worker(
                             snapshot.fingerprint, worker_count, snapshot.folder
                         ),

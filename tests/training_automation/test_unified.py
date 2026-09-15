@@ -13,6 +13,7 @@ from training_automation.queue import TrainingQueue
 from training_automation.state import atomic_write_json, read_json
 from training_automation.unified import (
     _repo,
+    prepare_unified_environment,
     resolve_dataset_root,
     resolve_loras_root,
     run_unified_workflow,
@@ -276,6 +277,32 @@ def test_gui_bridge_can_seed_exact_settings_table_on_clean_first_boot(tmp_path):
         "SELECT key, value FROM Settings"
     ).fetchall() == [("DATASETS_FOLDER", str(desired.resolve()))]
     connection.close()
+
+
+def test_prepare_unified_creates_only_explicit_storage_cache_paths(tmp_path):
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    toolkit = tmp_path / "toolkit"
+    (toolkit / "datasets").mkdir(parents=True)
+    config_path = tmp_path / "first-boot.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "storage_root": str(storage),
+        "dataset_root": str(storage / "datasets"),
+        "comfyui_root": str(storage / "ComfyUI"),
+        "work_root": str(storage / "automation"),
+        "initialize_storage_directories": True,
+        "gui_database": str(toolkit / "aitk_db.db"),
+        "initialize_gui_dataset_root": True,
+        "queue": {"repo_root": str(toolkit)},
+    }, sort_keys=False), encoding="utf-8")
+    result = prepare_unified_environment(config_path, env={})
+    assert result["dataset_root"] == str((storage / "datasets").resolve())
+    assert result["loras_root"] == str(
+        (storage / "ComfyUI" / "models" / "loras").resolve()
+    )
+    assert (storage / "automation").is_dir()
+    assert not (tmp_path / "datasets").exists()
 
 
 def test_instance_environment_overrides_shared_worker_defaults(tmp_path):

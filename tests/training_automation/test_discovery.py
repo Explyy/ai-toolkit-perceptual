@@ -145,3 +145,38 @@ def test_legacy_completed_identity_is_not_requeued(tmp_path):
     )
     assert ledger["datasets"][snapshot.folder]["status"] == "completed"
     assert ledger["datasets"][snapshot.folder]["catalog_name"] == "Freya"
+
+
+def test_completed_legacy_folder_migrates_to_canonical_folder_by_content(tmp_path):
+    original = _dataset(tmp_path / "source", "Training_Def_Owhx_Freya")
+    [legacy_snapshot] = scan_dataset_root(tmp_path / "source")
+    canonical = tmp_path / "datasets" / "0003-freya"
+    canonical.parent.mkdir()
+    original.rename(canonical)
+    (canonical / ".training-automation.json").write_text(json.dumps({
+        "catalog_name": "Freya", "trigger_word": "Owhx",
+    }), encoding="utf-8")
+    [canonical_snapshot] = scan_dataset_root(tmp_path / "datasets")
+    assert canonical_snapshot.fingerprint == legacy_snapshot.fingerprint
+    client = FakeHubClient()
+    client.remote["training-automation/workflow-ledger.json"] = json.dumps({
+        "schema_version": 1,
+        "datasets": {legacy_snapshot.folder: {
+            **legacy_snapshot.__dict__, "files": list(legacy_snapshot.files),
+            "status": "completed", "worker": 0, "run_id": "legacy-run",
+        }},
+    }).encode()
+    client.snapshots[client.revision] = dict(client.remote)
+    store = WorkflowLedgerStore(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        remote_path="training-automation/workflow-ledger.json",
+        local_path=tmp_path / "ledger.json",
+    )
+    ledger, _ = store.reconcile(
+        [canonical_snapshot], worker_count=1, quiet_seconds=60, now=100,
+    )
+    assert set(ledger["datasets"]) == {"0003-freya"}
+    migrated = ledger["datasets"]["0003-freya"]
+    assert migrated["status"] == "completed"
+    assert migrated["run_id"] == "legacy-run"
+    assert migrated["folder_aliases"] == ["Training_Def_Owhx_Freya"]

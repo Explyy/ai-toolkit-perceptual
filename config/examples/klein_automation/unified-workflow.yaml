@@ -1,12 +1,16 @@
 schema_version: 1
 
-# These must point at the existing shared-volume folders used by the GUI.
+# These point at the storage folders used by the GUI. HF remains authoritative;
+# correctness does not require a provider network volume.
 # DATASETS_FOLDER, COMFYUI_ROOT, and LORAS_ROOT environment values are also
 # accepted. If two configured values differ, automation holds before training.
 dataset_root: /storage/datasets
 comfyui_root: /storage/ComfyUI
 storage_root: /storage
 work_root: /storage/automation/unified
+# Explicit first-boot opt-in. Only these configured paths beneath storage_root
+# are created; existing files, settings, and symlinks are never replaced.
+initialize_storage_directories: true
 # The opt-in controller initializes this GUI setting only when it is absent and
 # the native /app/ai-toolkit/datasets folder contains no unseen files.
 gui_database: /app/ai-toolkit/aitk_db.db
@@ -16,6 +20,13 @@ hub:
   repo_id_env: HF_REPO_ID
   repo_type: dataset
   token_env: HF_TOKEN
+
+dataset_storage:
+  enabled: true
+  remote_prefix: datasets
+  catalog_path: training-automation/dataset-catalog.json
+  # Leave at least 1 GiB free after staging the immutable dataset snapshot.
+  minimum_free_bytes: 1073741824
 
 worker:
   # TRAINING_WORKER_ID/COUNT take priority. Two instances of the same template
