@@ -89,6 +89,53 @@ python -m pip install 'mediapipe>=0.10,<0.11'
 
 Set `landmark_backend` to `training_automation.backends:MediaPipePoseCPUBackend` and `landmark_backend_options.model_path` to an already-present Pose Landmarker `.task` file. The backend never downloads a model. It uses image mode, pixel-corrects normalized coordinates with the actual width and height, and reports `occluded` when required shoulder or hip visibility is below `min_visibility`. The 2D width ratio remains dependent on perspective, crop, and pose. The API and explicit model-path contract follow the [official MediaPipe Tasks documentation](https://ai.google.dev/edge/api/mediapipe/python/mp/tasks/vision/PoseLandmarker); actual model inference is a credentialed remote verification limit.
 
+## Portable galleries and automatic result folders
+
+Render a self-contained gallery from an existing report without running inference. `--samples-root` must be one flat directory containing the original sample files; report paths are remapped by basename and duplicate, missing, escaping, unreadable, or unsupported images are rejected. The HTML embeds both compact previews and original image bytes, uses no remote scripts or assets, and preserves each image's proportions:
+
+```bash
+python -m training_automation gallery \
+  /storage/archive/jobs/SUBJECT_JOB/evaluation.json \
+  --samples-root /storage/archive/jobs/SUBJECT_JOB/samples \
+  --output /storage/gallery/SUBJECT_JOB.html
+```
+
+The automatic publisher uses the report's existing shortlist only after rechecking complete comparable prompt/seed sets, available aggregate rankings, and unique verified checkpoint associations. It never makes a human selection or changes `selected_checkpoint_id`. For each available candidate, up to three, it downloads the checkpoint weight at the exact catalog revision, verifies the catalog size and SHA-256, and uploads a verified copy with its raster contact sheet and machine-readable evidence:
+
+```text
+training-results/<run-id>/<numeric-name>/
+├── index.json
+├── evaluation-gallery.html
+├── top-1/
+│   ├── contact-sheet.png
+│   ├── selection.json
+│   └── weights/<generation-weight>
+├── top-2/...
+└── top-3/...
+```
+
+The contact sheet includes all evaluated images for that checkpoint in prompt-index and seed order. Every image remains visible even when face or pose detection is missing or ambiguous. Each `selection.json` records the exact catalog checkpoint ID, source hashes/revision, automatic rank, metrics, and an executable `training_automation restore <numeric-id> --checkpoint-id <checkpoint-id>` command for the canonical ComfyUI path. This rank command bypasses the optional human-selected catalog default explicitly; it does not overwrite that default. Raw face cosine is not a percentage or probability; clipping, sharpness, and image-plane pose values are evidence proxies rather than quality or anatomical scores. If the shortlist is unavailable or contains fewer than three candidates, `index.json` records the reason and actual count without inventing folders or scores.
+
+Publish one reconstructed archived job on a cloud host that holds its samples and has private Hub credentials:
+
+```bash
+python -m training_automation publish-results \
+  /storage/archive/jobs/SUBJECT_JOB/evaluation.json \
+  --samples-root /storage/archive/jobs/SUBJECT_JOB/samples \
+  --run-id RUN_ID --work-dir /storage/results/SUBJECT_JOB \
+  --repo-type dataset
+```
+
+To backfill every direct job in a reconstructed archive deterministically, use one command. The archive must use `jobs/<job-id>/evaluation.json` and `jobs/<job-id>/samples/`, and each report's stable job ID must match its directory:
+
+```bash
+python -m training_automation publish-run-results /storage/archive \
+  --run-id RUN_ID --work-dir /storage/results \
+  --repo-type dataset
+```
+
+Both publishers require `HF_TOKEN` and `HF_REPO_ID`, refuse public repositories, use parent-commit guards, verify every uploaded byte at the returned immutable revision, and leave original checkpoint paths and catalog history intact. Run them where the private samples and weights already exist; they do not download models to the workstation.
+
 ## Docker and remote checks
 
 `docker/automation/Dockerfile` pins `explyy/ai-toolkit-perceptual` to digest `sha256:e604b849fdb6ea88a900f49b8f55dee30b6355d0d87fd7b307a7ae2d9e764b09`. It copies this checkout's automation package and patches four exact save/retention anchors. It does not replace the base image's older perceptual trainer or UI, and inherits its launch command. The build fails if those anchors drift. Mount persistent storage at `/storage`; keep the base image's existing `/workspace` volume when its UI needs it.
@@ -128,6 +175,8 @@ References listed in this manifest are training-set images. Reports and completi
 
 Create each SimplePod instance once through management and never retry an uncertain creation request. Set an exact notes marker such as `training-run:<run_id>;shard:a`, then upload one private binding based on [parallel-binding.example.json](../config/examples/klein_automation/parallel-binding.example.json). Bootstrap polls only the configured binding path for a bounded time. It calls `GET /instances/{id}` and requires exact equality for numeric `id`, `hashId`, and `notes`; it never finds a pod by name or list search. This follows the [official SimplePod API](https://api.simplepod.ai/docs_ai.html), which documents `X-AUTH-TOKEN`, `GET /instances/{id}`, and `DELETE /instances/{id}`.
 
-Successful training alone does not trigger deletion. Every assigned job must have completed training and evaluation, every scheduled 100-step checkpoint plus a non-round final checkpoint must have complete 23-image evidence uniquely associated with a verified catalog receipt, and all archived bytes must pass size plus SHA-256 verification. Archive metadata is fetched from the same immutable Hub revision in batches of at most 100 paths so large sample sets do not exceed the Hub request limit; any failed batch or missing entry fails the complete verification. When Hub metadata lacks a hash, verification downloads the exact immutable revision and hashes those bytes. Configured face and pose backends must load and run, and training-set reference identity must meet its coverage gate. Missing or ambiguous people or faces in generated images are honest evaluated quality outcomes and may make a ranking unavailable without fabricating a score. A second commit publishes `training-runs/<run>/<shard>/completion.json` with the evidence commit and hashes. Bootstrap then re-fetches and re-verifies the same instance identity before issuing one `DELETE /instances/{id}`.
+Successful training alone does not trigger deletion. Every assigned job must have completed training and evaluation, every scheduled 100-step checkpoint plus a non-round final checkpoint must have complete 23-image evidence uniquely associated with a verified catalog receipt, and all archived bytes must pass size plus SHA-256 verification. Before archiving, bootstrap automatically publishes each job's gallery and deterministic top-candidate folders described above and records their immutable revision in completion evidence. Archive metadata is fetched from the same immutable Hub revision in batches of at most 100 paths so large sample sets do not exceed the Hub request limit; any failed batch or missing entry fails the complete verification. When Hub metadata lacks a hash, verification downloads the exact immutable revision and hashes those bytes. Configured face and pose backends must load and run, and training-set reference identity must meet its coverage gate. Missing or ambiguous people or faces in generated images are honest evaluated quality outcomes and may make a ranking unavailable without fabricating a score. A second commit publishes `training-runs/<run>/<shard>/completion.json` with the evidence commit and hashes. Bootstrap then re-fetches and re-verifies the same instance identity before issuing one `DELETE /instances/{id}`.
 
-Any binding, disk, staging, model download, training, backup, evaluation, identity, archive, verification, or delete error writes `bootstrap-state.json` with `status: failed` on persistent storage. Failures before the completion gate never call delete. The `/run-parallel-training` supervisor records the actual traceback and exit status in `worker.log`, then holds the container rather than allowing an automatic restart to erase the console context. The SimplePod template has exit-delete disabled, so a failed held container continues billing. An external management monitor must inspect both instances, alert on failure, and delete them manually; the in-container guard cannot guarantee billing termination when its API call or network fails.
+Any binding, disk, staging, model download, training, backup, evaluation, identity, result export, archive, verification, or delete error writes `bootstrap-state.json` with `status: failed` on persistent storage. The dedicated supervisor automatically retries at most three times only when the persisted queue already proves that every assigned job completed both training and evaluation. It records each attempt and backoff in `worker-recovery-state.json`; a supervisor restart consumes rather than resets that budget. This archive-only path rechecks the immutable manifest, exact run/shard paths, Hub destination, model source markers, completion evidence, and bound instance; it bypasses dataset/model staging, backend preflight, and `TrainingQueue.run`. It then republishes deterministic result artifacts if needed, archives them, and requests deletion only after all verification succeeds. Incomplete queues and all other prior failures remain held for diagnosis rather than restarting training. A persisted prior delete request is treated as uncertain and is never reset or issued again automatically.
+
+Failures before the completion gate never call delete. The `/run-parallel-training` supervisor records the actual traceback and exit status in `worker.log`, then holds the container rather than allowing an automatic restart to erase the console context. The SimplePod template has exit-delete disabled, so a failed held container continues billing. An external management monitor must inspect both instances, alert on failure, and delete them manually; the in-container guard cannot guarantee billing termination when its API call or network fails.

@@ -8,7 +8,13 @@ from pathlib import Path
 from .backup import BackupConfigurationError, BackupError, HuggingFaceBackupClient, sha256_file
 from .catalog import CatalogStore, restore_generation, restore_training
 from .evaluation import evaluate_job, persist_selection
+from .gallery import render_gallery
 from .queue import TrainingQueue
+from .results import (
+    publish_archived_run_results,
+    publish_ranked_results,
+    report_job_id,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,6 +32,33 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("output_dir", type=Path)
     evaluate.add_argument("--reference", action="append", type=Path, default=[])
     evaluate.add_argument("--config", type=Path, help="optional YAML evaluation settings")
+    gallery = commands.add_parser(
+        "gallery", help="render one portable HTML gallery from existing evaluation evidence"
+    )
+    gallery.add_argument("report", type=Path)
+    gallery.add_argument("--samples-root", type=Path, required=True)
+    gallery.add_argument("--output", type=Path, required=True)
+    gallery.add_argument("--title")
+    publish_results = commands.add_parser(
+        "publish-results",
+        help="publish deterministic top-checkpoint grids and verified weight copies",
+    )
+    _connection_args(publish_results)
+    publish_results.add_argument("report", type=Path)
+    publish_results.add_argument("--samples-root", type=Path, required=True)
+    publish_results.add_argument("--run-id", required=True)
+    publish_results.add_argument("--job-id")
+    publish_results.add_argument("--work-dir", type=Path, required=True)
+    publish_results.add_argument("--results-prefix", default="training-results")
+    publish_run_results = commands.add_parser(
+        "publish-run-results",
+        help="publish every job from a reconstructed immutable evidence archive",
+    )
+    _connection_args(publish_run_results)
+    publish_run_results.add_argument("archive_root", type=Path)
+    publish_run_results.add_argument("--run-id", required=True)
+    publish_run_results.add_argument("--work-dir", type=Path, required=True)
+    publish_run_results.add_argument("--results-prefix", default="training-results")
     select = commands.add_parser("select", help="persist a human checkpoint choice")
     select.add_argument("report", type=Path)
     select.add_argument("step", type=int)
@@ -79,6 +112,43 @@ def main(argv: list[str] | None = None) -> int:
             reference_images=args.reference,
             config=config,
         ))
+    elif args.command == "gallery":
+        print(render_gallery(
+            args.report,
+            sample_root=args.samples_root,
+            output_path=args.output,
+            title=args.title,
+        ))
+    elif args.command == "publish-results":
+        store = _store(args)
+        record, evidence_files = publish_ranked_results(
+            client=store.client,
+            repo_id=store.repo_id,
+            repo_type=store.repo_type,
+            run_id=args.run_id,
+            job_id=args.job_id or report_job_id(args.report),
+            report_path=args.report,
+            sample_root=args.samples_root,
+            work_dir=args.work_dir,
+            catalog_prefix=args.remote_prefix,
+            results_prefix=args.results_prefix,
+        )
+        print(json.dumps({
+            **record,
+            "local_evidence": [str(path) for path, _ in evidence_files],
+        }, indent=2))
+    elif args.command == "publish-run-results":
+        store = _store(args)
+        print(json.dumps(publish_archived_run_results(
+            client=store.client,
+            repo_id=store.repo_id,
+            repo_type=store.repo_type,
+            run_id=args.run_id,
+            archive_root=args.archive_root,
+            work_dir=args.work_dir,
+            catalog_prefix=args.remote_prefix,
+            results_prefix=args.results_prefix,
+        ), indent=2))
     elif args.command == "select":
         if args.repo_id or os.environ.get(args.repo_id_env):
             if not args.model:

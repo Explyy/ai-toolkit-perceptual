@@ -1,0 +1,377 @@
+import base64
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+from training_automation.backup import BackupError
+from training_automation.gallery import render_gallery
+import training_automation.results as results
+from training_automation.results import (
+    publish_archived_run_results,
+    publish_ranked_results,
+)
+
+
+FAKE_SPEC = importlib.util.spec_from_file_location(
+    "result_export_fakes", Path(__file__).with_name("fakes.py")
+)
+FAKES = importlib.util.module_from_spec(FAKE_SPEC)
+assert FAKE_SPEC.loader is not None
+FAKE_SPEC.loader.exec_module(FAKES)
+FakeHubClient = FAKES.FakeHubClient
+
+
+def _write_samples(root: Path, steps=(100, 200, 300)) -> dict[int, list[dict]]:
+    root.mkdir(parents=True)
+    result = {}
+    for step in steps:
+        samples = []
+        for index, size in enumerate(((18, 9), (9, 18), (12, 12))):
+            name = f"123__{step:09d}_{index}.png"
+            Image.new("RGB", size, (step // 2, 20 + index, 80)).save(root / name)
+            samples.append({
+                "path": f"/deleted/private/pod/{name}",
+                "prompt_index": index,
+                "prompt": "<script>private prompt</script>" if index == 0 else f"prompt {index}",
+                "seed": 42,
+                "metrics": {
+                    "clipping_fraction_proxy": 0.01 * index,
+                    "sharpness_laplacian_variance_proxy": 0.2 + index,
+                },
+                "identity": {
+                    "status": "missing" if index == 2 else "available",
+                    "cosine_similarity": None if index == 2 else 0.5 + step / 1000 + index / 100,
+                    "reason": "no face detected" if index == 2 else None,
+                },
+                "pose_body_landmarks": {
+                    "status": "available" if index != 2 else "occluded",
+                    "values": {
+                        "ratios": {"shoulder_to_hip_width": 1.2 + index / 10},
+                        "joint_angles": {"left_elbow_degrees": 120.0},
+                    } if index != 2 else None,
+                    "reason": "2D image-plane proxy" if index != 2 else "joint hidden",
+                },
+            })
+        result[step] = samples
+    return result
+
+
+def _report(samples: dict[int, list[dict]], shortlist_status="available") -> dict:
+    order = [200, 100, 300]
+    identity_aggregates = [
+        {
+            "step": step,
+            "mean_face_cosine_similarity": {200: 0.81, 100: 0.79, 300: 0.75}[step],
+            "prompt_indices": [0, 1],
+        }
+        for step in order
+    ]
+    shortlist = [
+        {
+            **item,
+            "mean_clipping_fraction_proxy": sum(
+                sample["metrics"]["clipping_fraction_proxy"]
+                for sample in samples[item["step"]]
+            ) / len(samples[item["step"]]),
+        }
+        for item in identity_aggregates
+    ]
+    return {
+        "schema_version": 1,
+        "job_config": "/storage/generated/subject-job.yaml",
+        "checkpoints": [
+            {
+                "step": step,
+                "final": step == 300,
+                "catalog_checkpoint_id": f"checkpoint-{step}",
+                "remote_checkpoint": {"commit_id": "r0"},
+                "remote_association": {"status": "unique", "reason": None},
+                "sample_run_status": "complete",
+                "samples": samples[step],
+            }
+            for step in (100, 200, 300)
+        ],
+        "identity_ranking": {
+            "status": "available",
+            "reason": None,
+            "method": "raw common-face cosine",
+            "items": identity_aggregates,
+        },
+        "ranking": {
+            "status": "available",
+            "reason": None,
+        },
+        "automatic_shortlist": {
+            "status": shortlist_status,
+            "reason": None if shortlist_status == "available" else "fewer than three common faces",
+            "method": "face cosine descending, clipping ascending, step ascending",
+            "items": shortlist if shortlist_status == "available" else [],
+        },
+    }
+
+
+def _catalog_and_client(report: dict) -> tuple[FakeHubClient, bytes]:
+    client = FakeHubClient()
+    checkpoints = []
+    for checkpoint in report["checkpoints"]:
+        step = checkpoint["step"]
+        payload = f"immutable-weight-{step}".encode()
+        remote = f"training-backups/models/0001-subject/checkpoints/checkpoint-{step}/weights/model-{step}.safetensors"
+        client.remote[remote] = payload
+        checkpoints.append({
+            "checkpoint_id": f"checkpoint-{step}",
+            "step": step,
+            "final": step == 300,
+            "revision": "r0",
+            "weights": [{
+                "remote_path": remote,
+                "generation_relative_path": f"0001-subject/model-{step}.safetensors",
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }],
+            "resume_artifacts": [],
+        })
+    catalog = json.dumps({
+        "schema_version": 2,
+        "models": [{
+            "id": 1,
+            "name": "Subject",
+            "folder": "0001-subject",
+            "base_arch": "flux2_klein_9b",
+            "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+            "trigger_word": "TOKEN",
+            "destination_kind": "loras",
+            "checkpoints": checkpoints,
+            "selected_checkpoint_id": "checkpoint-300",
+            "selection": {"checkpoint_id": "checkpoint-300"},
+        }],
+    }, sort_keys=True).encode()
+    client.remote["training-backups/catalog.json"] = catalog
+    client.snapshots["r0"] = dict(client.remote)
+    return client, catalog
+
+
+def test_gallery_is_self_contained_ranked_and_escapes_untrusted_text(tmp_path):
+    samples = _write_samples(tmp_path / "samples")
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(_report(samples)), encoding="utf-8")
+    output = render_gallery(
+        report_path,
+        sample_root=tmp_path / "samples",
+        output_path=tmp_path / "gallery.html",
+        title="<img src=x onerror=alert(1)>",
+    )
+    content = output.read_text(encoding="utf-8")
+    first_payload = (tmp_path / "samples" / "123__000000100_0.png").read_bytes()
+    assert "&lt;img src=x onerror=alert(1)&gt;" in content
+    assert "<script>private prompt</script>" not in content
+    assert "&lt;script&gt;private prompt&lt;/script&gt;" in content
+    assert f"data:image/png;base64,{base64.b64encode(first_payload).decode()}" in content
+    assert content.index("Step 200") < content.index("Step 100") < content.index("Step 300")
+    assert "raw face cosine</dt><dd>missing: no face detected" in content
+    assert "Raw cosine is not a percentage" in content
+    assert "object-fit" not in content and "height:150px" not in content
+
+
+def test_gallery_rejects_duplicate_basename_remapping(tmp_path):
+    samples = _write_samples(tmp_path / "samples", steps=(100,))
+    report = _report({100: samples[100], 200: samples[100], 300: samples[100]})
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(BackupError, match="duplicate sample basename"):
+        render_gallery(
+            report_path,
+            sample_root=tmp_path / "samples",
+            output_path=tmp_path / "gallery.html",
+        )
+
+
+def test_publisher_creates_verified_top_three_without_changing_selection(tmp_path):
+    samples = _write_samples(tmp_path / "samples")
+    report = _report(samples)
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    client, original_catalog = _catalog_and_client(report)
+
+    record, evidence = publish_ranked_results(
+        client=client,
+        repo_id="owner/private",
+        repo_type="dataset",
+        run_id="run-1",
+        job_id="subject-job",
+        report_path=report_path,
+        sample_root=tmp_path / "samples",
+        work_dir=tmp_path / "results",
+        sleep=lambda _: None,
+    )
+
+    assert record["status"] == "available"
+    assert [item["step"] for item in record["candidates"]] == [200, 100, 300]
+    assert record["canonical_selected_checkpoint_id"] == "checkpoint-300"
+    assert client.remote["training-backups/catalog.json"] == original_catalog
+    for rank, step in enumerate((200, 100, 300), 1):
+        root = f"training-results/run-1/0001-subject/top-{rank}"
+        assert f"{root}/contact-sheet.png" in client.remote
+        assert f"{root}/selection.json" in client.remote
+        copied = client.remote[f"{root}/weights/model-{step}.safetensors"]
+        assert copied == f"immutable-weight-{step}".encode()
+        manifest = json.loads(client.remote[f"{root}/selection.json"])
+        assert manifest["rank"] == rank
+        assert manifest["catalog_checkpoint_id"] == f"checkpoint-{step}"
+        assert len(manifest["samples"]) == 3
+        assert manifest["canonical_selection_unchanged"] is True
+        assert manifest["restore"]["argv"][-2:] == [
+            "--comfy-root", "/workspace/ComfyUI"
+        ]
+        assert f"--checkpoint-id checkpoint-{step}" in manifest["restore"]["command"]
+    assert "training-results/run-1/0001-subject/index.json" in client.remote
+    assert "training-results/run-1/0001-subject/evaluation-gallery.html" in client.remote
+    assert {relative for _, relative in evidence} >= {
+        "results/0001-subject/index.json",
+        "results/0001-subject/top-1/contact-sheet.png",
+    }
+
+
+def test_unavailable_shortlist_publishes_reason_without_top_folder(tmp_path):
+    samples = _write_samples(tmp_path / "samples")
+    report = _report(samples, shortlist_status="unavailable")
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    client, _ = _catalog_and_client(report)
+
+    record, _ = publish_ranked_results(
+        client=client,
+        repo_id="owner/private",
+        repo_type="dataset",
+        run_id="run-1",
+        job_id="subject-job",
+        report_path=report_path,
+        sample_root=tmp_path / "samples",
+        work_dir=tmp_path / "results",
+        sleep=lambda _: None,
+    )
+
+    assert record["status"] == "unavailable"
+    assert record["exported_candidate_count"] == 0
+    assert "common faces" in record["reason"]
+    assert not any("/top-" in path for path in client.remote)
+
+
+def test_publisher_rejects_catalog_weight_hash_mismatch(tmp_path):
+    samples = _write_samples(tmp_path / "samples")
+    report = _report(samples)
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    client, _ = _catalog_and_client(report)
+    client.corrupt_metadata = True
+
+    with pytest.raises(BackupError, match="bounded retries"):
+        publish_ranked_results(
+            client=client,
+            repo_id="owner/private",
+            repo_type="dataset",
+            run_id="run-1",
+            job_id="subject-job",
+            report_path=report_path,
+            sample_root=tmp_path / "samples",
+            work_dir=tmp_path / "results",
+            max_attempts=1,
+        )
+    assert not any(path.startswith("training-results/") for path in client.remote)
+
+
+def test_publisher_refuses_to_replace_different_existing_result_evidence(tmp_path):
+    samples = _write_samples(tmp_path / "samples")
+    report = _report(samples)
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    client, _ = _catalog_and_client(report)
+    index_path = "training-results/run-1/0001-subject/index.json"
+    original = b'{"run_id":"another-run","job_id":"another-job"}'
+    client.remote[index_path] = original
+    client.snapshots["r0"][index_path] = original
+
+    with pytest.raises(BackupError, match="bounded retries"):
+        publish_ranked_results(
+            client=client,
+            repo_id="owner/private",
+            repo_type="dataset",
+            run_id="run-1",
+            job_id="subject-job",
+            report_path=report_path,
+            sample_root=tmp_path / "samples",
+            work_dir=tmp_path / "results",
+            max_attempts=1,
+        )
+    assert client.remote[index_path] == original
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report["ranking"].update(status="unavailable"),
+        lambda report: report["checkpoints"][0].update(sample_run_status="incomplete"),
+        lambda report: report["checkpoints"][0]["remote_association"].update(
+            status="ambiguous"
+        ),
+        lambda report: report["automatic_shortlist"]["items"].reverse(),
+    ],
+)
+def test_available_shortlist_must_retain_complete_deterministic_gates(
+    tmp_path, mutation
+):
+    samples = _write_samples(tmp_path / "samples")
+    report = _report(samples)
+    mutation(report)
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    client, _ = _catalog_and_client(report)
+
+    with pytest.raises(BackupError, match="bounded retries"):
+        publish_ranked_results(
+            client=client,
+            repo_id="owner/private",
+            repo_type="dataset",
+            run_id="run-1",
+            job_id="subject-job",
+            report_path=report_path,
+            sample_root=tmp_path / "samples",
+            work_dir=tmp_path / "results",
+            max_attempts=1,
+        )
+    assert not any(path.startswith("training-results/") for path in client.remote)
+
+
+def test_archived_run_backfill_discovers_every_job_without_manual_choice(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "archive"
+    called = []
+    for job_id in ("job-b", "job-a"):
+        job_root = archive / "jobs" / job_id
+        (job_root / "samples").mkdir(parents=True)
+        (job_root / "evaluation.json").write_text(
+            json.dumps({"job_config": f"/old/generated/{job_id}.yaml"}),
+            encoding="utf-8",
+        )
+
+    def publish(**kwargs):
+        called.append(kwargs["job_id"])
+        return {"job_id": kwargs["job_id"]}, []
+
+    monkeypatch.setattr(results, "publish_ranked_results", publish)
+    records = publish_archived_run_results(
+        client=FakeHubClient(),
+        repo_id="owner/private",
+        repo_type="dataset",
+        run_id="run-1",
+        archive_root=archive,
+        work_dir=tmp_path / "work",
+    )
+
+    assert called == ["job-a", "job-b"]
+    assert [item["job_id"] for item in records] == called

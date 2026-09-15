@@ -17,8 +17,9 @@ from .catalog import CatalogStore, resolve_model, safe_relative_path
 from .evaluation import preflight_evaluation_backends
 from .lifecycle import SimplePodClient, verify_instance_identity, wait_for_binding
 from .queue import TrainingQueue
+from .results import publish_ranked_results
 from .staging import COMMIT_RE, PinnedDatasetStager
-from .state import atomic_write_json
+from .state import atomic_write_json, read_json
 
 
 MANIFEST_SCHEMA = 1
@@ -43,6 +44,15 @@ def _component(value: Any, field: str) -> str:
     if not COMPONENT_RE.fullmatch(text):
         raise BackupError(f"{field} must be one safe path component")
     return text
+
+
+def _load_object(path: Path, description: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise BackupError(f"{description} is missing: {path}")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise BackupError(f"{description} must be a JSON object")
+    return document
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -588,6 +598,221 @@ def _completion_evidence(
     return files, {"jobs": completion_jobs, "job_count": len(completion_jobs)}
 
 
+def _binding_for_manifest(
+    *,
+    client: HuggingFaceBackupClient,
+    simplepod: SimplePodClient,
+    manifest: Mapping[str, Any],
+    repo_id: str,
+    repo_type: str,
+    run_id: str,
+    shard_id: str,
+):
+    binding_config = manifest.get("binding") or {}
+    binding_path = str(binding_config.get("remote_path", "")).replace("{shard_id}", shard_id)
+    safe_relative_path(binding_path)
+    binding = wait_for_binding(
+        source=client,
+        repo_id=repo_id,
+        repo_type=repo_type,
+        remote_path=binding_path,
+        run_id=run_id,
+        shard_id=shard_id,
+        wait_seconds=float(binding_config.get("wait_seconds", 900)),
+        poll_seconds=float(binding_config.get("poll_seconds", 5)),
+    )
+    verify_instance_identity(simplepod, binding)
+    return binding
+
+
+def _validate_recovery_queue(
+    queue: TrainingQueue,
+    *,
+    run_root: Path,
+    output_root: Path,
+    repo_id: str,
+    repo_type: str,
+    shard_id: str,
+) -> dict[str, Any]:
+    expected = {
+        "state_path": run_root / "queue-state.json",
+        "generated_dir": run_root / "generated",
+        "training_folder": output_root,
+    }
+    for field, path in expected.items():
+        if Path(queue.config.get(field, "")).resolve() != path.resolve():
+            raise BackupError(f"archive recovery queue has unexpected {field}")
+    backup = queue.config.get("checkpoint_backup") or {}
+    if (
+        str(queue.config.get("shard_id")) != shard_id
+        or backup.get("repo_id") != repo_id
+        or backup.get("repo_type") != repo_type
+    ):
+        raise BackupError("archive recovery queue identity does not match this process")
+    queue_state = read_json(queue.state_path, {})
+    jobs = queue_state.get("jobs") if isinstance(queue_state, Mapping) else None
+    if not isinstance(jobs, Mapping) or not jobs:
+        raise BackupError("archive recovery requires a completed persisted queue")
+    if any(
+        item.get("status") != "completed"
+        or item.get("training_status") != "completed"
+        or item.get("evaluation_status") != "completed"
+        for item in jobs.values()
+    ):
+        raise BackupError("automatic restart is limited to completed training and evaluation")
+    return dict(queue_state)
+
+
+def _publish_job_results(
+    *,
+    queue: TrainingQueue,
+    files: list[tuple[Path, str]],
+    completion: dict[str, Any],
+    client: HuggingFaceBackupClient,
+    repo_id: str,
+    repo_type: str,
+    run_id: str,
+    run_root: Path,
+    catalog_prefix: str,
+) -> None:
+    completion_by_job = {item["job_id"]: item for item in completion["jobs"]}
+    for job in queue.materialize():
+        output = job.output_root / job.job_id
+        record, evidence_files = publish_ranked_results(
+            client=client,
+            repo_id=repo_id,
+            repo_type=repo_type,
+            run_id=run_id,
+            job_id=job.job_id,
+            report_path=output / ".automation" / "evaluation.json",
+            sample_root=output / "samples",
+            work_dir=run_root / "results" / job.job_id,
+            catalog_prefix=catalog_prefix,
+        )
+        files.extend(evidence_files)
+        completion_by_job[job.job_id]["automatic_result_export"] = record
+
+
+def _verified_source_marker(source: Mapping[str, Any], models_root: Path) -> Path:
+    marker = (
+        models_root / safe_relative_path(str(source["local_path"]))
+        / ".training-automation-source.json"
+    )
+    expected = {
+        "repo_id": str(source["repo_id"]),
+        "revision": str(source["revision"]),
+        "allow_patterns": list(source["allow_patterns"]),
+    }
+    if source.get("artifact_path") is not None:
+        expected["artifact_path"] = str(source["artifact_path"])
+    if _load_object(marker, f"model source marker {source['kind']}") != expected:
+        raise BackupError(f"model source marker differs from manifest: {source['kind']}")
+    return marker
+
+
+def _finalize_completed_run(
+    *,
+    values: Mapping[str, str],
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+    queue: TrainingQueue,
+    queue_state: Mapping[str, Any],
+    staging_state: Path,
+    client: HuggingFaceBackupClient,
+    simplepod: SimplePodClient,
+    binding: Any,
+    state: dict[str, Any],
+    state_path: Path,
+    run_root: Path,
+    models_root: Path,
+    repo_id: str,
+    repo_type: str,
+    run_id: str,
+    shard_id: str,
+) -> dict[str, Any]:
+    files, completion = _completion_evidence(
+        queue,
+        queue_state,
+        require_identity=bool(
+            (manifest.get("evaluation") or {}).get("require_identity_available", True)
+        ),
+        staging_state=staging_state,
+    )
+    catalog_prefix = str(
+        (manifest.get("catalog") or {}).get("remote_prefix", "training-backups")
+    )
+    _publish_job_results(
+        queue=queue,
+        files=files,
+        completion=completion,
+        client=client,
+        repo_id=repo_id,
+        repo_type=repo_type,
+        run_id=run_id,
+        run_root=run_root,
+        catalog_prefix=catalog_prefix,
+    )
+    state.update({"status": "archiving", "instance_id": binding.instance_id})
+    state.pop("error", None)
+    atomic_write_json(state_path, state)
+    files.extend([
+        (manifest_path, "deployment-manifest.json"),
+        (state_path, "bootstrap-state.json"),
+    ])
+    worker_recovery_state = run_root / "worker-recovery-state.json"
+    if worker_recovery_state.is_file():
+        files.append((worker_recovery_state, "worker-recovery-state.json"))
+    for source in manifest["model_sources"]:
+        marker = _verified_source_marker(source, models_root)
+        files.append((marker, f"model-sources/{source['kind']}.json"))
+    completion.update({
+        "manifest_revision": values["HF_MANIFEST_REVISION"],
+        "dataset_revision": manifest["dataset_revision"],
+        "reference_provenance": str(
+            (manifest.get("evaluation") or {}).get("reference_provenance", "unspecified")
+        ),
+        "model_sources": [
+            {
+                "kind": source["kind"],
+                "repo_id": source["repo_id"],
+                "revision": source["revision"],
+                "local_path": source["local_path"],
+                "allow_patterns": source["allow_patterns"],
+                **(
+                    {"artifact_path": source["artifact_path"]}
+                    if source.get("artifact_path") is not None else {}
+                ),
+            }
+            for source in manifest["model_sources"]
+        ],
+    })
+    archive = EvidenceArchive(
+        client=client,
+        repo_id=repo_id,
+        repo_type=repo_type,
+        remote_prefix=str(
+            (manifest.get("archive") or {}).get("remote_prefix", "training-runs")
+        ),
+        run_id=run_id,
+        shard_id=shard_id,
+        state_path=run_root / "archive-state.json",
+    )
+    archive_state = archive.publish(files, completion)
+    if archive_state.get("status") != "completed":
+        raise BackupError("remote completion archive did not verify")
+    verify_instance_identity(simplepod, binding)
+    state.update({
+        "status": "delete-requested",
+        "archive_completion_revision": archive_state["completion_revision"],
+        "delete_requested": True,
+    })
+    atomic_write_json(state_path, state)
+    simplepod.delete(binding.instance_id)
+    state["status"] = "delete-accepted"
+    atomic_write_json(state_path, state)
+    return state
+
+
 def run_parallel_bootstrap(
     *,
     env: Mapping[str, str] | None = None,
@@ -616,11 +841,32 @@ def run_parallel_bootstrap(
     models_root = storage_root / "models"
     state_path = run_root / "bootstrap-state.json"
     run_root.mkdir(parents=True, exist_ok=True)
-    state: dict[str, Any] = {
-        "schema_version": 1, "run_id": run_id, "shard_id": shard_id,
-        "status": "starting", "delete_requested": False,
-    }
-    atomic_write_json(state_path, state)
+    has_prior_state = state_path.is_file()
+    prior_state = read_json(state_path, {}) if has_prior_state else None
+    if has_prior_state and (
+        not isinstance(prior_state, Mapping)
+        or prior_state.get("schema_version") != 1
+        or prior_state.get("run_id") != run_id
+        or prior_state.get("shard_id") != shard_id
+    ):
+        raise BackupError("persisted bootstrap state belongs to a different run or shard")
+    if has_prior_state and bool(prior_state.get("delete_requested")):
+        raise BackupError(
+            "automatic restart refused because a prior delete request has an uncertain outcome"
+        )
+    state: dict[str, Any] = (
+        dict(prior_state)
+        if has_prior_state
+        else {
+            "schema_version": 1,
+            "run_id": run_id,
+            "shard_id": shard_id,
+            "status": "starting",
+            "delete_requested": False,
+        }
+    )
+    if not has_prior_state:
+        atomic_write_json(state_path, state)
     client = hub_client or HuggingFaceBackupClient(values["HF_TOKEN"])
     simplepod = pod_client or SimplePodClient(values["SIMPLEPOD_API_TOKEN"])
     try:
@@ -633,6 +879,51 @@ def run_parallel_bootstrap(
             work_dir=run_root,
         )
         manifest_path = run_root / "deployment-manifest.json"
+        if has_prior_state:
+            local_manifest = _load_object(manifest_path, "persisted deployment manifest")
+            if local_manifest != manifest:
+                raise BackupError("persisted deployment manifest differs from its immutable revision")
+            validate_manifest(manifest, run_id=run_id, shard_id=shard_id)
+            binding = _binding_for_manifest(
+                client=client,
+                simplepod=simplepod,
+                manifest=manifest,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                run_id=run_id,
+                shard_id=shard_id,
+            )
+            queue = queue_factory(run_root / "queue.yaml")
+            queue_state = _validate_recovery_queue(
+                queue,
+                run_root=run_root,
+                output_root=output_root,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                shard_id=shard_id,
+            )
+            state["status"] = "archive-recovery"
+            state.pop("error", None)
+            atomic_write_json(state_path, state)
+            return _finalize_completed_run(
+                values=values,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                queue=queue,
+                queue_state=queue_state,
+                staging_state=run_root / "staging-state.json",
+                client=client,
+                simplepod=simplepod,
+                binding=binding,
+                state=state,
+                state_path=state_path,
+                run_root=run_root,
+                models_root=models_root,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                run_id=run_id,
+                shard_id=shard_id,
+            )
         atomic_write_json(manifest_path, manifest)
         selected = validate_manifest(manifest, run_id=run_id, shard_id=shard_id)
         recipe = recipe_path or Path(values.get("TRAINING_RECIPE_PATH", DEFAULT_RECIPE_PATH))
@@ -649,20 +940,15 @@ def run_parallel_bootstrap(
             work_dir=run_root,
             canonical_base_model=canonical_base_model,
         )
-        binding_config = manifest.get("binding") or {}
-        binding_path = str(binding_config.get("remote_path", "")).replace("{shard_id}", shard_id)
-        safe_relative_path(binding_path)
-        binding = wait_for_binding(
-            source=client,
+        binding = _binding_for_manifest(
+            client=client,
+            simplepod=simplepod,
+            manifest=manifest,
             repo_id=repo_id,
             repo_type=repo_type,
-            remote_path=binding_path,
             run_id=run_id,
             shard_id=shard_id,
-            wait_seconds=float(binding_config.get("wait_seconds", 900)),
-            poll_seconds=float(binding_config.get("poll_seconds", 5)),
         )
-        verify_instance_identity(simplepod, binding)
         minimum_free = int(manifest["storage"]["minimum_free_bytes"])
         available = shutil.disk_usage(storage_root).free
         if available < minimum_free:
@@ -708,65 +994,25 @@ def run_parallel_bootstrap(
         atomic_write_json(state_path, state)
         queue = queue_factory(queue_path)
         queue_state = queue.run()
-        files, completion = _completion_evidence(
-            queue,
-            queue_state,
-            require_identity=bool((manifest.get("evaluation") or {}).get("require_identity_available", True)),
+        return _finalize_completed_run(
+            values=values,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            queue=queue,
+            queue_state=queue_state,
             staging_state=staging_state,
-        )
-        state["status"] = "archiving"
-        atomic_write_json(state_path, state)
-        files.extend([
-            (manifest_path, "deployment-manifest.json"),
-            (state_path, "bootstrap-state.json"),
-        ])
-        for source in manifest["model_sources"]:
-            marker = Path(staged_model_roots[str(source["kind"])]) / ".training-automation-source.json"
-            files.append((marker, f"model-sources/{source['kind']}.json"))
-        completion.update({
-            "manifest_revision": values["HF_MANIFEST_REVISION"],
-            "dataset_revision": manifest["dataset_revision"],
-            "reference_provenance": str(
-                (manifest.get("evaluation") or {}).get("reference_provenance", "unspecified")
-            ),
-            "model_sources": [
-                {
-                    "kind": source["kind"],
-                    "repo_id": source["repo_id"],
-                    "revision": source["revision"],
-                    "local_path": source["local_path"],
-                    "allow_patterns": source["allow_patterns"],
-                    **(
-                        {"artifact_path": source["artifact_path"]}
-                        if source.get("artifact_path") is not None else {}
-                    ),
-                }
-                for source in manifest["model_sources"]
-            ],
-        })
-        archive = EvidenceArchive(
             client=client,
+            simplepod=simplepod,
+            binding=binding,
+            state=state,
+            state_path=state_path,
+            run_root=run_root,
+            models_root=models_root,
             repo_id=repo_id,
             repo_type=repo_type,
-            remote_prefix=str((manifest.get("archive") or {}).get("remote_prefix", "training-runs")),
             run_id=run_id,
             shard_id=shard_id,
-            state_path=run_root / "archive-state.json",
         )
-        archive_state = archive.publish(files, completion)
-        if archive_state.get("status") != "completed":
-            raise BackupError("remote completion archive did not verify")
-        verify_instance_identity(simplepod, binding)
-        state.update({
-            "status": "delete-requested",
-            "archive_completion_revision": archive_state["completion_revision"],
-            "delete_requested": True,
-        })
-        atomic_write_json(state_path, state)
-        simplepod.delete(binding.instance_id)
-        state["status"] = "delete-accepted"
-        atomic_write_json(state_path, state)
-        return state
     except Exception as exc:
         state.update({
             "status": "failed",

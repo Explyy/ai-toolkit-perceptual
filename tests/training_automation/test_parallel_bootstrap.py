@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from training_automation.bootstrap import (
     validate_manifest,
 )
 from training_automation.queue import QueueJob
+from training_automation.worker import run_worker
 
 
 FAKE_SPEC = importlib.util.spec_from_file_location("parallel_bootstrap_fakes", Path(__file__).with_name("fakes.py"))
@@ -29,6 +31,19 @@ DATASET_REVISION = "b" * 40
 @pytest.fixture(autouse=True)
 def fake_backend_preflight(monkeypatch):
     monkeypatch.setattr(bootstrap, "preflight_evaluation_backends", lambda config: {})
+
+    def publish_results(**kwargs):
+        path = Path(kwargs["work_dir"]) / "index.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"status":"available"}', encoding="utf-8")
+        return ({
+            "status": "available",
+            "exported_candidate_count": 3,
+            "remote_root": f"training-results/{kwargs['run_id']}/{kwargs['job_id']}",
+            "revision": "result-revision",
+        }, [(path, f"results/{kwargs['job_id']}/index.json")])
+
+    monkeypatch.setattr(bootstrap, "publish_ranked_results", publish_results)
 
 
 class Pod:
@@ -313,6 +328,9 @@ def test_parallel_bootstrap_archives_then_deletes_only_bound_instance(tmp_path):
     assert completion["completion"]["reference_provenance"] == "training-set"
     assert completion["completion"]["manifest_revision"] == MANIFEST_REVISION
     assert completion["completion"]["dataset_revision"] == DATASET_REVISION
+    first_job = completion["completion"]["jobs"][0]
+    assert first_job["automatic_result_export"]["status"] == "available"
+    assert first_job["automatic_result_export"]["exported_candidate_count"] == 3
     sources = {
         source["kind"]: source for source in completion["completion"]["model_sources"]
     }
@@ -327,6 +345,7 @@ def test_parallel_bootstrap_archives_then_deletes_only_bound_instance(tmp_path):
     assert "model-sources/depth_model.json" in evidence
     assert "model-sources/text_encoder.json" in evidence
     assert "model-sources/vae.json" in evidence
+    assert "results/subject-0-job/index.json" in evidence
     trainer = yaml.safe_load(
         (tmp_path / "storage/automation/run-1/a/trainer.yaml").read_text(encoding="utf-8")
     )
@@ -484,6 +503,197 @@ def test_configured_pose_backend_failure_never_deletes(tmp_path):
             snapshot_fetch=snapshot_fetch,
             recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
         )
+    assert pod.deleted == []
+
+
+def test_completed_queue_restart_runs_archive_only_then_deletes(tmp_path, monkeypatch):
+    class InterruptArchiveClient(FakeHubClient):
+        fail_archive = True
+
+        def commit_files(self, repo_id, repo_type, artifacts, message, parent_commit=None):
+            if self.fail_archive and message.startswith("Archive"):
+                raise RuntimeError("archive transport interrupted")
+            return super().commit_files(
+                repo_id, repo_type, artifacts, message, parent_commit
+            )
+
+    class OneAttemptArchive(bootstrap.EvidenceArchive):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs, max_attempts=1, sleep=lambda _: None)
+
+    client = InterruptArchiveClient()
+    prepared = setup_client()
+    client.remote = dict(prepared.remote)
+    client.snapshots = {key: dict(value) for key, value in prepared.snapshots.items()}
+    client.revision = prepared.revision
+    pod = Pod()
+    original_archive = bootstrap.EvidenceArchive
+    monkeypatch.setattr(bootstrap, "EvidenceArchive", OneAttemptArchive)
+    with pytest.raises(BackupError, match="evidence archive failed"):
+        run_parallel_bootstrap(
+            env=env(tmp_path), hub_client=client, pod_client=pod,
+            queue_factory=CompletedQueue, snapshot_fetch=snapshot_fetch,
+            recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+        )
+    failed = json.loads(
+        (tmp_path / "storage/automation/run-1/a/bootstrap-state.json").read_text()
+    )
+    assert failed["status"] == "failed" and failed["delete_requested"] is False
+    assert pod.deleted == []
+
+    class RecoveryQueue(CompletedQueue):
+        run_calls = 0
+
+        def run(self):
+            type(self).run_calls += 1
+            raise AssertionError("archive recovery must not invoke training queue run")
+
+    client.fail_archive = False
+    monkeypatch.setattr(bootstrap, "EvidenceArchive", original_archive)
+    monkeypatch.setattr(
+        bootstrap,
+        "preflight_evaluation_backends",
+        lambda config: (_ for _ in ()).throw(AssertionError("recovery must not load backends")),
+    )
+    result = run_parallel_bootstrap(
+        env=env(tmp_path), hub_client=client, pod_client=pod,
+        queue_factory=RecoveryQueue,
+        snapshot_fetch=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("recovery must not stage models")
+        ),
+        recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+    )
+    assert result["status"] == "delete-accepted"
+    assert RecoveryQueue.run_calls == 0
+    assert pod.deleted == [42]
+
+
+def test_supervisor_automatically_retries_only_completed_finalization(
+    tmp_path, monkeypatch
+):
+    class InterruptArchiveClient(FakeHubClient):
+        fail_archive = True
+
+        def commit_files(self, repo_id, repo_type, artifacts, message, parent_commit=None):
+            if self.fail_archive and message.startswith("Archive training evidence"):
+                raise RuntimeError("transient archive interruption")
+            return super().commit_files(
+                repo_id, repo_type, artifacts, message, parent_commit=parent_commit
+            )
+
+    class OneAttemptArchive(bootstrap.EvidenceArchive):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs, max_attempts=1, sleep=lambda _: None)
+
+    class RecoveryQueue(CompletedQueue):
+        def run(self):
+            raise AssertionError("supervisor recovery must not invoke training")
+
+    prepared = setup_client()
+    client = InterruptArchiveClient()
+    client.remote = dict(prepared.remote)
+    client.snapshots = {
+        key: dict(value) for key, value in prepared.snapshots.items()
+    }
+    client.revision = prepared.revision
+    pod = Pod()
+    attempts = []
+    monkeypatch.setattr(bootstrap, "EvidenceArchive", OneAttemptArchive)
+
+    class Process:
+        def __init__(self, output, exit_code):
+            self.stdout = io.StringIO(output)
+            self.exit_code = exit_code
+
+        def wait(self):
+            return self.exit_code
+
+    def popen(command, **kwargs):
+        attempts.append(command)
+        if len(attempts) == 2:
+            client.fail_archive = False
+        try:
+            run_parallel_bootstrap(
+                env=kwargs["env"],
+                hub_client=client,
+                pod_client=pod,
+                queue_factory=CompletedQueue if len(attempts) == 1 else RecoveryQueue,
+                snapshot_fetch=snapshot_fetch,
+                recipe_path=(
+                    Path(__file__).parents[2]
+                    / "config/examples/klein_automation/"
+                    "trainer-subject-likeness-masked-klein-9b.yaml"
+                ),
+            )
+        except BackupError as exc:
+            return Process(f"{type(exc).__name__}: {exc}\n", 1)
+        return Process("archive verified and delete accepted\n", 0)
+
+    held = []
+    result = run_worker(
+        env=env(tmp_path),
+        popen=popen,
+        hold=lambda: held.append(True),
+        sleep=lambda _: None,
+        console=io.StringIO(),
+    )
+
+    recovery = json.loads(
+        (tmp_path / "storage/automation/run-1/a/worker-recovery-state.json")
+        .read_text(encoding="utf-8")
+    )
+    assert result == 0
+    assert len(attempts) == 2
+    assert held == []
+    assert recovery["status"] == "completed"
+    assert pod.deleted == [42]
+    completion = json.loads(client.remote["training-runs/run-1/a/completion.json"])
+    assert "worker-recovery-state.json" in {
+        item["relative_path"] for item in completion["evidence"]
+    }
+
+
+def test_restart_never_retries_an_uncertain_delete(tmp_path):
+    state_path = tmp_path / "storage/automation/run-1/a/bootstrap-state.json"
+    state_path.parent.mkdir(parents=True)
+    original = {
+        "schema_version": 1,
+        "run_id": "run-1",
+        "shard_id": "a",
+        "status": "failed",
+        "delete_requested": True,
+        "error": "delete response was lost",
+    }
+    state_path.write_text(json.dumps(original), encoding="utf-8")
+    pod = Pod()
+    with pytest.raises(BackupError, match="uncertain outcome"):
+        run_parallel_bootstrap(
+            env=env(tmp_path), hub_client=setup_client(), pod_client=pod,
+            queue_factory=lambda path: (_ for _ in ()).throw(
+                AssertionError("uncertain deletion must stop before queue construction")
+            ),
+        )
+    assert json.loads(state_path.read_text()) == original
+    assert pod.deleted == []
+
+
+def test_restart_never_treats_an_empty_persisted_state_as_a_fresh_run(tmp_path):
+    state_path = tmp_path / "storage/automation/run-1/a/bootstrap-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text("{}", encoding="utf-8")
+    pod = Pod()
+
+    with pytest.raises(BackupError, match="different run or shard"):
+        run_parallel_bootstrap(
+            env=env(tmp_path),
+            hub_client=setup_client(),
+            pod_client=pod,
+            queue_factory=lambda path: (_ for _ in ()).throw(
+                AssertionError("invalid persisted state must stop before queue construction")
+            ),
+        )
+
+    assert state_path.read_text(encoding="utf-8") == "{}"
     assert pod.deleted == []
 
 
