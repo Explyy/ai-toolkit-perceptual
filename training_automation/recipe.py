@@ -72,7 +72,6 @@ def _validate_recipe(recipe_path: Path, repo_root: Path, *, prompt_count: int) -
         "self.subject_mask_config",
         "self.depth_consistency_config",
         "diff_output_preservation requires a trigger_word",
-        "self.cached_dop_class_embeds",
     ]
     missing = [token for token in required_config if token not in config_source]
     missing += [token for token in required_trainer if token not in trainer_source]
