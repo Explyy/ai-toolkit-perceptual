@@ -493,6 +493,68 @@ def _completed_at(clock: Callable[[], float]) -> str:
     return datetime.fromtimestamp(float(clock()), timezone.utc).isoformat()
 
 
+def _queue_resume_action(
+    *,
+    state_path: Path,
+    job_id: str,
+    phase: Mapping[str, Any],
+    phase_existed: bool,
+    ledger_status: str,
+    retry_incomplete: bool,
+) -> tuple[str, dict[str, Any] | None]:
+    """Classify a queue boundary without letting TrainingQueue normalize it first."""
+    phase_name = str(phase.get("phase") or "")
+    if not state_path.is_file():
+        if not phase_existed and ledger_status == "ready" and phase_name == "prepared":
+            return "fresh", None
+        raise BackupError(
+            f"queue state is missing for previously dispatched dataset job: {job_id}"
+        )
+    state = read_json(state_path, {})
+    schema = state.get("schema_version")
+    if schema not in {1, 2} or not isinstance(state.get("jobs"), Mapping):
+        raise BackupError(f"queue state is invalid for dataset job: {job_id}")
+    entry = state["jobs"].get(job_id)
+    if not isinstance(entry, Mapping):
+        raise BackupError(f"queue state does not contain the expected dataset job: {job_id}")
+
+    if schema == 1:
+        legacy = str(entry.get("status") or "pending")
+        training_status = "completed" if legacy == "completed" else legacy
+        evaluation_status = "completed" if legacy == "completed" else "pending"
+    else:
+        training_status = str(entry.get("training_status") or "pending")
+        evaluation_status = str(entry.get("evaluation_status") or "pending")
+    completed = (
+        training_status == "completed"
+        and evaluation_status in {"completed", "skipped"}
+    )
+    if completed:
+        return "completed", state
+    if training_status == "completed":
+        if phase_name not in {"training_dispatched", "queue_incomplete"}:
+            raise BackupError(
+                f"queue evidence conflicts with durable dataset phase for job: {job_id}"
+            )
+        if evaluation_status == "failed" and not (
+            retry_incomplete and ledger_status == "incomplete"
+        ):
+            raise BackupError(
+                f"evaluation retry requires discovery.retry_incomplete for job: {job_id}"
+            )
+        return "resume_evaluation", state
+    if (
+        phase_name == "queue_incomplete"
+        and retry_incomplete
+        and ledger_status == "incomplete"
+        and training_status in {"pending", "failed"}
+    ):
+        return "retry_incomplete", state
+    raise BackupError(
+        f"training outcome is uncertain; refusing automatic paid retraining for job: {job_id}"
+    )
+
+
 def run_unified_workflow(
     config_path: Path,
     *,
@@ -624,6 +686,7 @@ def run_unified_workflow(
                 raise BackupError(
                     f"durable execution state is missing for previously dispatched dataset: {item['folder']}"
                 )
+            phase_existed = phase_path.is_file()
             phase = _phase_state(phase_path, identity, run_id)
             ledger_store.update_status(
                 str(item["folder"]), str(item["fingerprint"]), "queued",
@@ -649,7 +712,26 @@ def run_unified_workflow(
             if len(jobs) != 1:
                 raise BackupError("per-dataset queue must materialize exactly one job")
             job = jobs[0]
-            state = queue.run()
+            resume_action, raw_state = _queue_resume_action(
+                state_path=queue.state_path,
+                job_id=job.job_id,
+                phase=phase,
+                phase_existed=phase_existed,
+                ledger_status=str(item.get("status") or ""),
+                retry_incomplete=bool(discovery.get("retry_incomplete", False)),
+            )
+            if resume_action == "completed":
+                state = raw_state
+            else:
+                _record_phase(
+                    phase_path,
+                    phase,
+                    "training_dispatched",
+                    job_id=job.job_id,
+                    resume_action=resume_action,
+                )
+                state = queue.run()
+            assert state is not None
             job_status = (state["jobs"].get(job.job_id) or {}).get("status", "unknown")
             if job_status != "completed":
                 _record_phase(

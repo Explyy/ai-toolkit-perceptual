@@ -411,6 +411,133 @@ def test_missing_local_execution_state_for_dispatched_dataset_fails_closed(tmp_p
         run_unified_workflow(_config(tmp_path, 0, 1), **common)
 
 
+def test_missing_queue_state_after_completed_training_refuses_retraining(tmp_path):
+    (tmp_path / "ComfyUI" / "models" / "loras").mkdir(parents=True)
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    _dataset(datasets, "Ada_Lovelace")
+    client = FakeHubClient()
+    client.remote["training-backups/catalog.json"] = json.dumps({
+        "schema_version": 2, "models": []
+    }).encode()
+    client.snapshots[client.revision] = dict(client.remote)
+
+    class CountingQueue(FakeQueue):
+        calls = 0
+
+        def run(self):
+            type(self).calls += 1
+            return super().run()
+
+    common = dict(
+        env={"HF_TOKEN": "secret"}, client=client, queue_factory=CountingQueue,
+        sleep=lambda _: None, clock=lambda: 100, startup_sync=lambda **kwargs: [],
+        publisher=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("export stopped")),
+        latest_sync=lambda **kwargs: {"status": "completed"}, archive_factory=FakeArchive,
+    )
+    with pytest.raises(RuntimeError, match="export stopped"):
+        run_unified_workflow(_config(tmp_path, 0, 1), **common)
+    queue_state = next((tmp_path / "automation").rglob("queue-state.json"))
+    queue_state.unlink()
+    with pytest.raises(Exception, match="queue state is missing"):
+        run_unified_workflow(_config(tmp_path, 0, 1), **common)
+    assert CountingQueue.calls == 1
+
+
+def test_interrupted_training_is_not_automatically_retried(tmp_path):
+    (tmp_path / "ComfyUI" / "models" / "loras").mkdir(parents=True)
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    _dataset(datasets, "Ada_Lovelace")
+    client = FakeHubClient()
+    client.remote["training-backups/catalog.json"] = json.dumps({
+        "schema_version": 2, "models": []
+    }).encode()
+    client.snapshots[client.revision] = dict(client.remote)
+
+    class InterruptedQueue(FakeQueue):
+        calls = 0
+
+        def run(self):
+            type(self).calls += 1
+            job = self.materialize()[0]
+            atomic_write_json(self.state_path, {
+                "schema_version": 2,
+                "jobs": {job.job_id: {
+                    "status": "training",
+                    "training_status": "running",
+                    "evaluation_status": "pending",
+                    "attempts": 1,
+                }},
+            })
+            raise RuntimeError("simulated process termination")
+
+    common = dict(
+        env={"HF_TOKEN": "secret"}, client=client,
+        sleep=lambda _: None, clock=lambda: 100, startup_sync=lambda **kwargs: [],
+        publisher=lambda **kwargs: ({"status": "available", "revision": client.revision}, []),
+        latest_sync=lambda **kwargs: {"status": "completed"}, archive_factory=FakeArchive,
+    )
+    with pytest.raises(RuntimeError, match="simulated process termination"):
+        run_unified_workflow(
+            _config(tmp_path, 0, 1), queue_factory=InterruptedQueue, **common
+        )
+
+    class RejectQueue(FakeQueue):
+        calls = 0
+
+        def run(self):
+            type(self).calls += 1
+            raise AssertionError("interrupted training must not be dispatched again")
+
+    with pytest.raises(Exception, match="outcome is uncertain"):
+        run_unified_workflow(
+            _config(tmp_path, 0, 1), queue_factory=RejectQueue, **common
+        )
+    assert InterruptedQueue.calls == 1
+    assert RejectQueue.calls == 0
+
+
+def test_completed_queue_resumes_export_without_invoking_trainer(tmp_path):
+    (tmp_path / "ComfyUI" / "models" / "loras").mkdir(parents=True)
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    _dataset(datasets, "Ada_Lovelace")
+    client = FakeHubClient()
+    client.remote["training-backups/catalog.json"] = json.dumps({
+        "schema_version": 2, "models": []
+    }).encode()
+    client.snapshots[client.revision] = dict(client.remote)
+
+    class CountingQueue(FakeQueue):
+        calls = 0
+
+        def run(self):
+            type(self).calls += 1
+            return super().run()
+
+    exports = []
+
+    def publisher(**kwargs):
+        exports.append(kwargs["job_id"])
+        if len(exports) == 1:
+            raise RuntimeError("export stopped")
+        return {"status": "available", "revision": client.revision}, []
+
+    common = dict(
+        env={"HF_TOKEN": "secret"}, client=client, queue_factory=CountingQueue,
+        sleep=lambda _: None, clock=lambda: 100, startup_sync=lambda **kwargs: [],
+        publisher=publisher,
+        latest_sync=lambda **kwargs: {"status": "completed"}, archive_factory=FakeArchive,
+    )
+    with pytest.raises(RuntimeError, match="export stopped"):
+        run_unified_workflow(_config(tmp_path, 0, 1), **common)
+    result = run_unified_workflow(_config(tmp_path, 0, 1), **common)
+    assert result["status"] == "completed"
+    assert CountingQueue.calls == 1
+    assert len(exports) == 2
+
+
 def test_two_workers_with_same_work_root_use_disjoint_mutable_staging(tmp_path):
     (tmp_path / "ComfyUI" / "models" / "loras").mkdir(parents=True)
     datasets = tmp_path / "datasets"
