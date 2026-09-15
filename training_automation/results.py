@@ -776,41 +776,45 @@ def publish_ranked_results(
                     PurePosixPath(safe_relative_path(results_prefix).as_posix())
                     / "latest" / f"{model_folder.name}.json"
                 )
-                prior_pointer, _ = client.read_remote_file(
-                    repo_id, repo_type, str(pointer_path)
-                )
                 resolved_completed_at = completed_at
-                if prior_pointer is not None:
-                    try:
-                        prior = json.loads(prior_pointer)
-                    except (TypeError, ValueError) as exc:
-                        raise BackupError("existing latest result pointer is invalid JSON") from exc
-                    if (
-                        prior.get("run_id") == run_id
-                        and prior.get("job_id") == job_id
-                        and prior.get("evaluation_report_sha256") == report_sha256
-                    ):
-                        resolved_completed_at = str(prior.get("completed_at") or resolved_completed_at or "")
-                if not resolved_completed_at:
-                    resolved_completed_at = datetime.now(timezone.utc).isoformat()
-                pointer = {
-                    "schema_version": 1,
-                    "status": "completed",
-                    "run_id": run_id,
-                    "job_id": job_id,
-                    "completed_at": resolved_completed_at,
-                    "evaluation_report_sha256": report_sha256,
-                    "index_path": str(remote_root / "index.json"),
-                    "model": index["model"],
-                }
-                pointer_local = work_dir / "latest-result-pointer.json"
-                atomic_write_json(pointer_local, pointer)
-                pointer_artifact = LocalArtifact(
-                    str(pointer_local), str(pointer_path), pointer_local.stat().st_size,
-                    sha256_file(pointer_local), role="result-pointer",
-                    relative_path=f"latest/{model_folder.name}.json",
-                )
-                uploads = [*local_uploads, *weight_uploads, pointer_artifact]
+                pointer_artifact = None
+                if shortlist:
+                    prior_pointer, _ = client.read_remote_file(
+                        repo_id, repo_type, str(pointer_path)
+                    )
+                    if prior_pointer is not None:
+                        try:
+                            prior = json.loads(prior_pointer)
+                        except (TypeError, ValueError) as exc:
+                            raise BackupError("existing latest result pointer is invalid JSON") from exc
+                        if (
+                            prior.get("run_id") == run_id
+                            and prior.get("job_id") == job_id
+                            and prior.get("evaluation_report_sha256") == report_sha256
+                        ):
+                            resolved_completed_at = str(prior.get("completed_at") or resolved_completed_at or "")
+                    if not resolved_completed_at:
+                        resolved_completed_at = datetime.now(timezone.utc).isoformat()
+                    pointer = {
+                        "schema_version": 1,
+                        "status": "completed",
+                        "run_id": run_id,
+                        "job_id": job_id,
+                        "completed_at": resolved_completed_at,
+                        "evaluation_report_sha256": report_sha256,
+                        "index_path": str(remote_root / "index.json"),
+                        "model": index["model"],
+                    }
+                    pointer_local = work_dir / "latest-result-pointer.json"
+                    atomic_write_json(pointer_local, pointer)
+                    pointer_artifact = LocalArtifact(
+                        str(pointer_local), str(pointer_path), pointer_local.stat().st_size,
+                        sha256_file(pointer_local), role="result-pointer",
+                        relative_path=f"latest/{model_folder.name}.json",
+                    )
+                uploads = [*local_uploads, *weight_uploads]
+                if pointer_artifact is not None:
+                    uploads.append(pointer_artifact)
                 revision = client.commit_files(
                     repo_id,
                     repo_type,
@@ -830,7 +834,7 @@ def publish_ranked_results(
                     **index,
                     "revision": revision,
                     "remote_root": str(remote_root),
-                    "latest_pointer": str(pointer_path),
+                    "latest_pointer": str(pointer_path) if pointer_artifact is not None else None,
                     "completed_at": resolved_completed_at,
                 }
                 return record, evidence_files

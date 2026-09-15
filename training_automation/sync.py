@@ -374,6 +374,8 @@ def sync_latest_loras(
             or pointer.get("status") != "completed"
             or int((pointer.get("model") or {}).get("id", -1)) != model_id
             or (pointer.get("model") or {}).get("folder") != folder.name
+            or pointer.get("index_path")
+            != f"{safe_relative_path(results_prefix).as_posix()}/{pointer.get('run_id')}/{folder.name}/index.json"
         ):
             raise BackupError(f"latest result pointer identity is invalid: {folder.name}")
         result = sync_ranked_loras(

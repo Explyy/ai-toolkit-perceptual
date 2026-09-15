@@ -324,6 +324,8 @@ def test_unavailable_shortlist_publishes_reason_without_top_folder(tmp_path):
     )
 
     assert record["status"] == "unavailable"
+    assert record["latest_pointer"] is None
+    assert "training-results/latest/0001-subject.json" not in client.remote
     assert record["exported_candidate_count"] == 0
     assert "common faces" in record["reason"]
     assert not any("/top-" in path for path in client.remote)

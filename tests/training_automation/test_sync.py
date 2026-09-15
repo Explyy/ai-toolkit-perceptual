@@ -72,6 +72,7 @@ def _client() -> tuple[SyncFake, str, bytes]:
     pointer = {
         "schema_version": 1, "status": "completed", "run_id": "run-one",
         "model": {"id": 1, "folder": folder},
+        "index_path": f"{result_root}/index.json",
     }
     client.remote = {
         "training-backups/catalog.json": json.dumps(catalog).encode(),

@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).parents[2]))
 
 from training_automation.reporting import render_checkpoint_pages, render_top_comparison
 
