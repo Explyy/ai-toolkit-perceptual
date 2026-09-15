@@ -19,8 +19,14 @@ def supervise(
     once: bool = False,
 ) -> int:
     values = dict(os.environ if env is None else env)
+    worker_id = int(values.get("TRAINING_WORKER_ID", "0"))
+    if worker_id < 0:
+        raise ValueError("TRAINING_WORKER_ID cannot be negative")
     status_path = Path(
-        values.get("TRAINING_UNIFIED_STATUS", "/storage/automation/unified/supervisor-state.json")
+        values.get(
+            "TRAINING_UNIFIED_STATUS",
+            f"/storage/automation/unified/worker-{worker_id}/supervisor-state.json",
+        )
     )
     interval = float(values.get("TRAINING_UNIFIED_POLL_SECONDS", "60"))
     if interval < 1:

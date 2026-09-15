@@ -322,7 +322,7 @@ def sync_unified_loras(
         raise BackupConfigurationError("worker id must fall within configured worker count")
     work_root = Path(str(config.get("work_root", "/storage/automation/unified"))).resolve()
     worker_root = work_root / f"worker-{worker_id}"
-    with _controller_lock(worker_root / "sync-controller.lock"):
+    with _controller_lock(worker_root / "controller.lock"):
         return _sync_startup(
             client=hub, config=config, repo_id=repo_id, repo_type=repo_type,
             loras_root=loras_root, work_root=worker_root, dry_run=dry_run,

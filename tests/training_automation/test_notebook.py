@@ -52,7 +52,10 @@ def test_notebook_default_run_all_reads_status_without_clone_or_token(tmp_path, 
     status = {"schema_version": 1, "status": "idle", "attempts": 2}
     work = tmp_path / "work"
     work.mkdir()
-    (work / "supervisor-state.json").write_text(json.dumps(status), encoding="utf-8")
+    (work / "worker-0").mkdir()
+    (work / "worker-0" / "supervisor-state.json").write_text(
+        json.dumps(status), encoding="utf-8"
+    )
 
     def forbidden(*args, **kwargs):
         raise AssertionError("default status action must not invoke a subprocess")

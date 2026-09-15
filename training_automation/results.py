@@ -1079,7 +1079,11 @@ def refresh_archived_run_reports(
     )
     if not completion_paths:
         raise BackupError(f"no immutable archive completion exists for run {run_id}")
-    operation_root = (work_dir.resolve() / run_id / source_revision).resolve()
+    staging_parent = work_dir.resolve()
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    operation_root = Path(tempfile.mkdtemp(
+        prefix=f"{run_id}-{source_revision[:12]}-", dir=staging_parent,
+    )).resolve()
     records = []
     found_jobs: set[str] = set()
     for completion_path in completion_paths:

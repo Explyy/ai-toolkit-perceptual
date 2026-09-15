@@ -78,5 +78,7 @@ def test_docker_overlay_adds_one_opt_in_unified_gui_entrypoint_without_changing_
     assert command.index("prepare-unified") < command.index("unified_supervisor") < command.index('exec "$gui_start"')
     assert 'exec "$gui_start"' in command
     assert 'TRAINING_GUI_START:-/start.sh' in command
+    assert 'worker-${worker_id}/supervisor.log' in command
+    assert 'worker-${worker_id}/supervisor-state.json' in command
     assert "test -x /start.sh" in dockerfile
     assert "HF_TOKEN" not in command
