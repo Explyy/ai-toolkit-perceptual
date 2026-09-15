@@ -757,6 +757,10 @@ def test_hf_seed_rehydrates_empty_cache_migrates_legacy_and_second_startup_is_id
     ]
 
     monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.setenv("DATASETS_FOLDER", str(tmp_path / "datasets"))
+    monkeypatch.setenv(
+        "LORAS_ROOT", str(tmp_path / "ComfyUI" / "models" / "loras")
+    )
     monkeypatch.setattr(unified_module, "HuggingFaceBackupClient", lambda _: client)
     assert cli_main(["unified", str(config_path), "--dry-run"]) == 0
     second = json.loads(capsys.readouterr().out)
