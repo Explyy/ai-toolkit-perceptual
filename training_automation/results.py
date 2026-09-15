@@ -1067,6 +1067,10 @@ def refresh_archived_run_reports(
         if catalog_payload is None or not source_revision:
             raise BackupError("cannot pin archive refresh to a catalog repository revision")
     source_revision = str(source_revision)
+    if not re.fullmatch(r"[0-9a-f]{40}", source_revision):
+        raise BackupError(
+            "archive refresh source_revision must be an immutable 40-character commit SHA"
+        )
     archive_root = (
         PurePosixPath(safe_relative_path(archive_prefix).as_posix()) / run_id
     )
@@ -1113,6 +1117,10 @@ def refresh_archived_run_reports(
         if found_jobs & selected_jobs:
             raise BackupError("an archived job is claimed by multiple completion manifests")
         evidence_revision = str(completion["evidence_revision"])
+        if not re.fullmatch(r"[0-9a-f]{40}", evidence_revision):
+            raise BackupError(
+                f"archive evidence_revision must be an immutable 40-character commit SHA: {completion_path}"
+            )
         evidence_by_relative: dict[str, Mapping[str, Any]] = {}
         for item in completion.get("evidence") or []:
             if not isinstance(item, Mapping):

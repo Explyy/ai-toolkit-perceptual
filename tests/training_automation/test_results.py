@@ -34,6 +34,8 @@ FAKES = importlib.util.module_from_spec(FAKE_SPEC)
 assert FAKE_SPEC.loader is not None
 FAKE_SPEC.loader.exec_module(FAKES)
 FakeHubClient = FAKES.FakeHubClient
+ARCHIVE_COMPLETION_REVISION = "a" * 40
+ARCHIVE_EVIDENCE_REVISION = "b" * 40
 
 
 def _write_samples(root: Path, steps=(100, 200, 300)) -> dict[int, list[dict]]:
@@ -485,7 +487,10 @@ def test_older_or_unknown_completion_never_replaces_newer_latest_pointer(tmp_pat
     assert client.remote[pointer_path] == newest_pointer
 
 
-def _install_archive(client, report, sample_root, *, corrupt=False):
+def _install_archive(
+    client, report, sample_root, *, corrupt=False,
+    evidence_revision=ARCHIVE_EVIDENCE_REVISION,
+):
     run_id = "run-archive"
     shard = "worker-a"
     job_id = "subject-job"
@@ -511,11 +516,15 @@ def _install_archive(client, report, sample_root, *, corrupt=False):
         "run_id": run_id,
         "shard_id": shard,
         "status": "completed",
-        "evidence_revision": "r0",
+        "evidence_revision": evidence_revision,
         "evidence": entries,
         "completion": {"jobs": [{"job_id": job_id}]},
     }).encode()
-    client.snapshots["r0"] = dict(client.remote)
+    evidence_snapshot = dict(client.remote)
+    evidence_snapshot.pop(completion_path)
+    client.snapshots[evidence_revision] = evidence_snapshot
+    client.revision = ARCHIVE_COMPLETION_REVISION
+    client.snapshots[ARCHIVE_COMPLETION_REVISION] = dict(client.remote)
 
 
 def test_refreshes_historical_reports_from_verified_hub_archive_without_weights(tmp_path):
@@ -526,14 +535,14 @@ def test_refreshes_historical_reports_from_verified_hub_archive_without_weights(
 
     result = refresh_archived_run_reports(
         client=client, repo_id="owner/private", repo_type="dataset",
-        run_id="run-archive", source_revision="r0",
+        run_id="run-archive", source_revision=ARCHIVE_COMPLETION_REVISION,
         work_dir=tmp_path / "refresh", job_ids=("subject-job",),
     )
 
     assert result["status"] == "completed"
     assert result["model_weights_transferred"] is False
     assert [item["job_id"] for item in result["jobs"]] == ["subject-job"]
-    assert result["jobs"][0]["archive_evidence_revision"] == "r0"
+    assert result["jobs"][0]["archive_evidence_revision"] == ARCHIVE_EVIDENCE_REVISION
     assert any("/reports-v2/" in path for path in client.remote)
     assert not any(
         "/reports-v2/" in path and "/weights/" in path for path in client.remote
@@ -550,11 +559,63 @@ def test_archive_refresh_rejects_size_equal_hash_mismatch(tmp_path):
     )
     payload = client.remote[evidence_path]
     client.remote[evidence_path] = bytes([payload[0] ^ 1]) + payload[1:]
-    client.snapshots["r0"] = dict(client.remote)
+    client.snapshots[ARCHIVE_EVIDENCE_REVISION] = dict(client.remote)
 
     with pytest.raises(BackupError, match="hash verification failed"):
         refresh_archived_run_reports(
             client=client, repo_id="owner/private", repo_type="dataset",
-            run_id="run-archive", source_revision="r0",
+            run_id="run-archive", source_revision=ARCHIVE_COMPLETION_REVISION,
             work_dir=tmp_path / "refresh",
         )
+
+
+def test_archive_refresh_rejects_mutable_source_revision_before_download(tmp_path):
+    class DownloadCountingClient(FakeHubClient):
+        downloads = 0
+
+        def download_file(self, *args, **kwargs):
+            type(self).downloads += 1
+            return super().download_file(*args, **kwargs)
+
+    client = DownloadCountingClient()
+    with pytest.raises(BackupError, match="immutable 40-character commit SHA"):
+        refresh_archived_run_reports(
+            client=client, repo_id="owner/private", repo_type="dataset",
+            run_id="run-archive", source_revision="main",
+            work_dir=tmp_path / "refresh",
+        )
+    assert DownloadCountingClient.downloads == 0
+
+
+def test_archive_refresh_rejects_mutable_evidence_revision_before_evidence_download(
+    tmp_path,
+):
+    samples = _write_samples(tmp_path / "samples", steps=(100, 200, 300))
+    report = _report(samples)
+
+    class DownloadRecordingClient(FakeHubClient):
+        def __init__(self):
+            super().__init__()
+            self.downloads = []
+
+        def download_file(self, repo_id, repo_type, path, revision, destination):
+            self.downloads.append((path, revision))
+            return super().download_file(repo_id, repo_type, path, revision, destination)
+
+    client = DownloadRecordingClient()
+    catalog_client, _ = _catalog_and_client(report)
+    client.remote = dict(catalog_client.remote)
+    client.snapshots = dict(catalog_client.snapshots)
+    _install_archive(
+        client, report, tmp_path / "samples", evidence_revision="main"
+    )
+    with pytest.raises(BackupError, match="evidence_revision.*immutable"):
+        refresh_archived_run_reports(
+            client=client, repo_id="owner/private", repo_type="dataset",
+            run_id="run-archive", source_revision=ARCHIVE_COMPLETION_REVISION,
+            work_dir=tmp_path / "refresh",
+        )
+    assert client.downloads == [(
+        "training-archives/run-archive/worker-a/completion.json",
+        ARCHIVE_COMPLETION_REVISION,
+    )]
