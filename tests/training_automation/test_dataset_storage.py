@@ -312,3 +312,27 @@ def test_upload_commits_payload_then_manifest_and_refuses_existing_folder(tmp_pa
             folder=folder, remote_folder_name="José Persona",
             work_dir=tmp_path / "again",
         )
+
+
+def test_upload_rejects_hidden_omissions_and_symlink_folder(tmp_path):
+    folder = _folder(tmp_path / "source", name="Complete Person")
+    client = FakeHubClient()
+    client.revision = REVISION_A
+    client.snapshots = {REVISION_A: {}}
+    (folder / ".unexpected-cache").write_text("must not disappear", encoding="utf-8")
+    with pytest.raises(BackupError, match="unlisted local files"):
+        upload_dataset_folder(
+            client=client, repo_id="owner/private", repo_type="dataset",
+            folder=folder, work_dir=tmp_path / "upload",
+        )
+    (folder / ".unexpected-cache").unlink()
+    link = tmp_path / "linked-dataset"
+    try:
+        link.symlink_to(folder, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    with pytest.raises(BackupError, match="must not be a symlink"):
+        upload_dataset_folder(
+            client=client, repo_id="owner/private", repo_type="dataset",
+            folder=link, work_dir=tmp_path / "upload-link",
+        )

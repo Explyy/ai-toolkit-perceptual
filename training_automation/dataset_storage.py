@@ -298,14 +298,16 @@ class DatasetCatalogStore:
             if not isinstance(item, Mapping):
                 raise BackupError("remote dataset catalog entry is invalid")
             numeric_id = int(item.get("id", 0))
+            name = _display_name(item.get("name"), "catalog name")
+            trigger_word = _display_name(item.get("trigger_word"), "catalog trigger_word")
             fingerprint = str(item.get("fingerprint") or "")
             canonical = str(item.get("canonical_folder") or "")
             if (
                 numeric_id <= 0 or numeric_id in seen_ids
                 or not SHA256_RE.fullmatch(fingerprint)
                 or fingerprint in seen_fingerprints
-                or canonical != f"{numeric_id:04d}-{safe_name(str(item.get('name') or ''))}"
-                or not str(item.get("trigger_word") or "")
+                or canonical != f"{numeric_id:04d}-{safe_name(name)}"
+                or not trigger_word
                 or not isinstance(item.get("image_count"), int)
                 or int(item["image_count"]) <= 0
                 or not isinstance(item.get("sources"), list)
@@ -672,6 +674,8 @@ def upload_dataset_folder(
     """Atomically upload one validated image/caption folder plus its final manifest."""
     if not client.repo_is_private(repo_id, repo_type):
         raise BackupError("dataset upload requires a private repository")
+    if folder.is_symlink():
+        raise BackupError("dataset upload folder must not be a symlink")
     folder = folder.resolve()
     name = _display_name(catalog_name or folder.name, "catalog_name")
     trigger = _display_name(trigger_word, "trigger_word")
@@ -680,6 +684,10 @@ def upload_dataset_folder(
         resolutions=(512, 768, 1024), repeats=(16, 4, 1),
         bucket_divisibility=16, default_trigger_word=trigger,
     )
+    allowed_local = {*snapshot.files, REMOTE_MANIFEST}
+    omitted = sorted(path.name for path in folder.iterdir() if path.name not in allowed_local)
+    if omitted:
+        raise BackupError(f"dataset upload refuses unlisted local files: {omitted}")
     source_name = _display_name(remote_folder_name or folder.name, "source folder")
     prefix = PurePosixPath(safe_relative_path(remote_prefix).as_posix()) / source_name
     _, parent = client.read_remote_file(repo_id, repo_type, f"{prefix}/{REMOTE_MANIFEST}")
