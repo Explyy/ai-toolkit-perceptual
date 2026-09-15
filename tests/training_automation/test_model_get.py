@@ -281,6 +281,29 @@ def test_existing_conflicting_file_is_never_overwritten(tmp_path):
     assert len(opener.requests) == 1
 
 
+@pytest.mark.parametrize(("racing_bytes", "expected_code"), [(b"new", 0), (b"other", 2)])
+def test_atomic_publication_handles_same_and_conflicting_concurrent_writer(tmp_path, monkeypatch, racing_bytes, expected_code):
+    payload = b"new"
+    destination = tmp_path / "model.safetensors"
+
+    def concurrent_link(_source, target):
+        Path(target).write_bytes(racing_bytes)
+        raise FileExistsError(target)
+
+    monkeypatch.setattr(model_get.os, "link", concurrent_link)
+    code, stdout, stderr = run_cli(
+        ["https://huggingface.co/owner/repo/blob/main/weights/model.safetensors", "--dir", str(tmp_path)],
+        Opener(hf_routes(payload)),
+    )
+    assert code == expected_code
+    assert destination.read_bytes() == racing_bytes
+    if expected_code == 0:
+        assert "Pubblicato da un altro processo e verificato" in stderr
+        assert "Verificato:" in stdout
+    else:
+        assert "Conflitto" in stderr
+
+
 @pytest.mark.parametrize(
     ("headers", "body", "message"),
     [
@@ -357,6 +380,15 @@ def test_cross_host_redirect_strips_authorization_and_query_secret():
     assert redirected.get_header("Authorization") is None
     assert "token=" not in redirected.full_url
     assert "signature=keep" in redirected.full_url
+
+
+def test_cross_host_redirect_preserves_signed_cdn_query_byte_for_byte():
+    handler = model_get.SecureRedirectHandler()
+    request = urllib.request.Request("https://huggingface.co/file", headers={"Authorization": "Bearer secret"})
+    signed = "https://cdn.example/file?X-Amz-Credential=a%2Fb%2Bc&X-Amz-Signature=abc%2F123"
+    redirected = handler.redirect_request(request, None, 302, "Found", {}, signed)
+    assert redirected.full_url == signed
+    assert redirected.get_header("Authorization") is None
 
 
 def test_same_host_redirect_keeps_authorization():

@@ -75,7 +75,10 @@ def _validate_https_url(url: str, *, initial: bool = False) -> urllib.parse.Spli
 
 def _strip_sensitive_query(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
-    clean = [(key, value) for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key.lower() not in SENSITIVE_QUERY_KEYS]
+    pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(key.lower() in SENSITIVE_QUERY_KEYS for key, _ in pairs):
+        return url
+    clean = [(key, value) for key, value in pairs if key.lower() not in SENSITIVE_QUERY_KEYS]
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(clean), parsed.fragment))
 
 
