@@ -161,6 +161,36 @@ def test_ambiguous_repo_fails_noninteractive_with_choices(tmp_path):
     assert "--file" in stderr
 
 
+def test_hf_metadata_rejects_backslash_traversal_path(tmp_path):
+    metadata = hf_metadata(
+        b"unused",
+        files=[{"rfilename": "weights\\..\\other.safetensors", "lfs": {"sha256": "1" * 64, "size": 6}}],
+    )
+    opener = Opener(hf_routes(b"unused", metadata=metadata))
+    code, _, stderr = run_cli(["https://huggingface.co/owner/repo", "--dir", str(tmp_path), "--dry-run"], opener)
+    assert code == 2
+    assert "Percorso file remoto non sicuro" in stderr
+    assert len(opener.requests) == 1
+
+
+def test_explicit_remote_file_rejects_backslash_traversal(tmp_path):
+    routes = hf_routes(b"unused")
+    routes.pop(next(url for url in routes if "/resolve/" in url))
+    code, _, stderr = run_cli(
+        [
+            "https://huggingface.co/owner/repo",
+            "--file",
+            "..\\other.safetensors",
+            "--dir",
+            str(tmp_path),
+            "--dry-run",
+        ],
+        Opener(routes),
+    )
+    assert code == 2
+    assert "Percorso file remoto non sicuro" in stderr
+
+
 def test_ambiguous_repo_offers_numbered_interactive_choice(tmp_path):
     payload = b"second"
     digest = hashlib.sha256(payload).hexdigest()

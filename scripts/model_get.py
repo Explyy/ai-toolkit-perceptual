@@ -161,7 +161,7 @@ class HttpClient:
 def _safe_remote_path(value: str) -> str:
     decoded = urllib.parse.unquote(value)
     pure = Path(decoded)
-    if not decoded or decoded.startswith(("/", "\\")) or ".." in pure.parts or CONTROL_RE.search(decoded):
+    if not decoded or decoded.startswith("/") or "\\" in decoded or ".." in pure.parts or CONTROL_RE.search(decoded):
         raise ModelGetError("Percorso file remoto non sicuro.")
     return decoded
 
