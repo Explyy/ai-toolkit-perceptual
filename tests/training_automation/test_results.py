@@ -5,14 +5,24 @@ import json
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from training_automation.backup import BackupError
 from training_automation.gallery import render_gallery
 import training_automation.results as results
 from training_automation.results import (
+    BODY_FONT_SIZE,
+    CARD_WIDTH,
+    GRID_GAP,
+    SAMPLE_HEADING_FONT_SIZE,
+    SHEET_HEADING_FONT_SIZE,
+    _scalable_font,
+    _sample_text_rows,
+    _text_width,
+    _wrap_text_pixels,
     publish_archived_run_results,
     publish_ranked_results,
+    render_contact_sheet,
 )
 
 
@@ -190,6 +200,51 @@ def test_gallery_rejects_duplicate_basename_remapping(tmp_path):
         )
 
 
+def test_contact_sheet_uses_readable_measured_type_and_preserves_every_image(
+    tmp_path,
+):
+    samples = _write_samples(tmp_path / "samples", steps=(100,))
+    checkpoint = {"step": 100, "samples": samples[100]}
+    aggregate = {
+        "step": 100,
+        "mean_face_cosine_similarity": 0.75,
+        "mean_clipping_fraction_proxy": 0.01,
+        "prompt_indices": [0, 1],
+    }
+    output = render_contact_sheet(
+        checkpoint,
+        sample_root=tmp_path / "samples",
+        output_path=tmp_path / "contact-sheet.png",
+        heading="0001-subject · top-1 · step 100",
+        aggregate=aggregate,
+    )
+
+    assert BODY_FONT_SIZE >= 18
+    assert SAMPLE_HEADING_FONT_SIZE >= 24
+    assert SHEET_HEADING_FONT_SIZE >= 24
+    with Image.open(output) as sheet:
+        sheet.load()
+        assert sheet.width == 2 * CARD_WIDTH + 3 * GRID_GAP
+        colors = set(sheet.getdata())
+    for index in range(3):
+        assert (50, 20 + index, 80) in colors
+
+    font = _scalable_font(BODY_FONT_SIZE)
+    probe = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(probe)
+    wrapped = _wrap_text_pixels(
+        draw,
+        "one " + "unbroken-token-" * 80,
+        font=font,
+        max_width=260,
+    )
+    assert len(wrapped) > 2
+    assert all(_text_width(draw, line, font) <= 260 for line in wrapped)
+    visible_rows = _sample_text_rows(samples[100][0])
+    assert any("Shoulder / hip width" in text for _, text in visible_rows)
+    assert not any("left_elbow_degrees" in text for _, text in visible_rows)
+
+
 def test_publisher_creates_verified_top_three_without_changing_selection(tmp_path):
     samples = _write_samples(tmp_path / "samples")
     report = _report(samples)
@@ -223,6 +278,11 @@ def test_publisher_creates_verified_top_three_without_changing_selection(tmp_pat
         assert manifest["rank"] == rank
         assert manifest["catalog_checkpoint_id"] == f"checkpoint-{step}"
         assert len(manifest["samples"]) == 3
+        assert (
+            manifest["samples"][0]["pose_body_landmarks"]["values"]
+            ["joint_angles"]["left_elbow_degrees"]
+            == 120.0
+        )
         assert manifest["canonical_selection_unchanged"] is True
         assert manifest["restore"]["argv"][-2:] == [
             "--comfy-root", "/workspace/ComfyUI"

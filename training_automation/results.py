@@ -6,7 +6,6 @@ import re
 import shlex
 import shutil
 import tempfile
-import textwrap
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -20,6 +19,15 @@ from .state import atomic_write_json
 
 
 COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+BODY_FONT_SIZE = 20
+SAMPLE_HEADING_FONT_SIZE = 24
+SHEET_HEADING_FONT_SIZE = 30
+CARD_WIDTH = 860
+MEDIA_MAX_SIZE = (360, 420)
+CARD_PADDING = 18
+CARD_TEXT_X = 402
+CARD_TEXT_WIDTH = CARD_WIDTH - CARD_TEXT_X - CARD_PADDING
+GRID_GAP = 18
 
 
 class ResultsClient(Protocol):
@@ -77,20 +85,71 @@ def _number(value: Any) -> str:
     return f"{number:.6f}" if math.isfinite(number) else "unavailable"
 
 
-def _flatten(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
-    if not isinstance(value, Mapping):
-        return [(prefix or "value", value)]
-    flattened = []
-    for key in sorted(value, key=str):
-        label = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value[key], Mapping):
-            flattened.extend(_flatten(value[key], label))
-        else:
-            flattened.append((label, value[key]))
-    return flattened
+def _scalable_font(size: int) -> ImageFont.ImageFont:
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        for candidate in (
+            "DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ):
+            try:
+                return ImageFont.truetype(candidate, size=size)
+            except OSError:
+                continue
+    raise BackupError(f"contact sheet requires a scalable font at {size}px")
 
 
-def _sample_lines(sample: Mapping[str, Any]) -> list[str]:
+def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+    box = draw.textbbox((0, 0), text or " ", font=font)
+    return box[2] - box[0]
+
+
+def _wrap_text_pixels(
+    draw: ImageDraw.ImageDraw,
+    text: Any,
+    *,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap untrusted text to a measured pixel width, splitting long tokens safely."""
+    words = str(text).replace("\r", " ").replace("\n", " \n ").split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if word == "\n":
+            lines.append(current)
+            current = ""
+            continue
+        candidate = f"{current} {word}".strip()
+        if _text_width(draw, candidate, font) <= max_width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        fragment = ""
+        for character in word:
+            candidate = fragment + character
+            if fragment and _text_width(draw, candidate, font) > max_width:
+                lines.append(fragment)
+                fragment = character
+            else:
+                fragment = candidate
+        current = fragment
+    if current or not lines:
+        lines.append(current)
+    return lines
+
+
+def _line_height(font: ImageFont.ImageFont) -> int:
+    box = font.getbbox("Ag")
+    return box[3] - box[1]
+
+
+def _sample_text_rows(sample: Mapping[str, Any]) -> list[tuple[str, str]]:
     identity = sample.get("identity") or {}
     metrics = sample.get("metrics") or {}
     pose = sample.get("pose_body_landmarks") or {}
@@ -99,18 +158,42 @@ def _sample_lines(sample: Mapping[str, Any]) -> list[str]:
         if identity.get("status") == "available"
         else str(identity.get("status", "unavailable"))
     )
-    lines = [
-        f"Prompt {sample.get('prompt_index')} | seed {sample.get('seed')}",
-        f"Raw face cosine: {identity_value}",
-        f"Clipping fraction proxy: {_number(metrics.get('clipping_fraction_proxy'))}",
-        f"Sharpness proxy: {_number(metrics.get('sharpness_laplacian_variance_proxy'))}",
-        f"Pose status: {pose.get('status', 'unavailable')}",
+    rows = [
+        ("heading", f"Prompt {sample.get('prompt_index')} · seed {sample.get('seed')}"),
+        ("primary", f"Raw face cosine  {identity_value}"),
+        ("metric", f"Clipping proxy  {_number(metrics.get('clipping_fraction_proxy'))}"),
+        ("metric", f"Sharpness proxy  {_number(metrics.get('sharpness_laplacian_variance_proxy'))}"),
+        ("status", f"Pose status  {pose.get('status', 'unavailable')}"),
     ]
     if pose.get("status") == "available":
-        lines.extend(f"{key}: {_number(value)}" for key, value in _flatten(pose.get("values") or {}))
-    prompt = str(sample.get("prompt") or "prompt unavailable")
-    lines.extend(["", *textwrap.wrap(prompt, width=46)])
-    return lines
+        ratios = ((pose.get("values") or {}).get("ratios") or {})
+        for key, label in (
+            ("shoulder_to_hip_width", "Shoulder / hip width"),
+            ("left_thigh_to_torso", "Left thigh / torso"),
+            ("right_thigh_to_torso", "Right thigh / torso"),
+        ):
+            if ratios.get(key) is not None:
+                rows.append(("metric", f"{label}  {_number(ratios[key])}"))
+    rows.append(("prompt", f"Prompt text  {sample.get('prompt') or 'unavailable'}"))
+    return rows
+
+
+def _layout_rows(
+    draw: ImageDraw.ImageDraw,
+    rows: Sequence[tuple[str, str]],
+    *,
+    fonts: Mapping[str, ImageFont.ImageFont],
+    max_width: int,
+) -> tuple[list[tuple[str, str, ImageFont.ImageFont]], int]:
+    lines = []
+    height = 0
+    for style, text in rows:
+        font = fonts[style]
+        for line in _wrap_text_pixels(draw, text, font=font, max_width=max_width):
+            lines.append((style, line, font))
+            height += _line_height(font) + 7
+        height += 5 if style in {"heading", "status"} else 0
+    return lines, height
 
 
 def _safe_sample(sample_root: Path, raw_path: Any) -> tuple[Path, str]:
@@ -146,7 +229,24 @@ def render_contact_sheet(
 ) -> Path:
     """Create a deterministic two-column raster sheet without cropping sample images."""
     sample_root = sample_root.resolve()
-    font = ImageFont.load_default()
+    body_font = _scalable_font(BODY_FONT_SIZE)
+    sample_heading_font = _scalable_font(SAMPLE_HEADING_FONT_SIZE)
+    sheet_heading_font = _scalable_font(SHEET_HEADING_FONT_SIZE)
+    fonts = {
+        "heading": sample_heading_font,
+        "primary": body_font,
+        "metric": body_font,
+        "status": body_font,
+        "prompt": body_font,
+    }
+    colors = {
+        "heading": "#ffffff",
+        "primary": "#8fe3d0",
+        "metric": "#d9dee7",
+        "status": "#f0c875",
+        "prompt": "#aeb8c8",
+    }
+    probe_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     cards = []
     seen = set()
     samples = sorted(
@@ -164,53 +264,87 @@ def render_contact_sheet(
                 media = opened.convert("RGB")
         except Exception as exc:
             raise BackupError(f"contact sheet sample is not a readable image: {name}") from exc
-        media.thumbnail((330, 360))
-        lines = _sample_lines(sample)
-        text = "\n".join(lines)
-        probe = Image.new("RGB", (1, 1))
-        bounds = ImageDraw.Draw(probe).multiline_textbbox((0, 0), text, font=font, spacing=3)
-        text_height = bounds[3] - bounds[1]
-        card_height = max(media.height, text_height) + 28
-        card = Image.new("RGB", (720, card_height), "#121722")
+        media.thumbnail(MEDIA_MAX_SIZE)
+        lines, text_height = _layout_rows(
+            probe_draw,
+            _sample_text_rows(sample),
+            fonts=fonts,
+            max_width=CARD_TEXT_WIDTH,
+        )
+        card_height = max(media.height, text_height) + 2 * CARD_PADDING
+        card = Image.new("RGB", (CARD_WIDTH, card_height), "#121722")
         draw = ImageDraw.Draw(card)
         draw.rectangle((0, 0, card.width - 1, card.height - 1), outline="#344055")
-        card.paste(media, (14, 14))
-        draw.multiline_text((366, 14), text, fill="#eef1f5", font=font, spacing=3)
+        card.paste(media, (CARD_PADDING, CARD_PADDING))
+        y = CARD_PADDING
+        for style, line, font in lines:
+            draw.text((CARD_TEXT_X, y), line, fill=colors[style], font=font)
+            y += _line_height(font) + 7
+            if style in {"heading", "status"}:
+                y += 5
         cards.append(card)
     if not cards:
         raise BackupError("contact sheet checkpoint has no samples")
     columns = 2
-    gap = 14
-    title_lines = [
-        heading,
-        f"Checkpoint aggregate raw mean face cosine: {_number(aggregate.get('mean_face_cosine_similarity'))}",
-        f"Checkpoint aggregate mean clipping proxy: {_number(aggregate.get('mean_clipping_fraction_proxy'))}",
-        "Common valid-face prompts used by aggregate: "
-        + ", ".join(str(value) for value in aggregate.get("prompt_indices") or []),
-        "Individual values appear beside each uncropped image; pose values are image-plane proxies.",
+    header_rows = [
+        ("heading", heading),
+        (
+            "primary",
+            "CHECKPOINT AGGREGATE · raw mean face cosine  "
+            + _number(aggregate.get("mean_face_cosine_similarity")),
+        ),
+        (
+            "metric",
+            "Mean clipping proxy  "
+            + _number(aggregate.get("mean_clipping_fraction_proxy")),
+        ),
+        (
+            "metric",
+            "Common valid-face prompts  "
+            + ", ".join(str(value) for value in aggregate.get("prompt_indices") or []),
+        ),
+        (
+            "prompt",
+            "Individual values sit beside each uncropped image. Pose values are image-plane proxies.",
+        ),
     ]
-    title_text = "\n".join(title_lines)
-    title_probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    title_bounds = title_probe.multiline_textbbox(
-        (0, 0), title_text, font=font, spacing=4
+    header_fonts = {
+        **fonts,
+        "heading": sheet_heading_font,
+    }
+    width = columns * CARD_WIDTH + (columns + 1) * GRID_GAP
+    header_lines, header_text_height = _layout_rows(
+        probe_draw,
+        header_rows,
+        fonts=header_fonts,
+        max_width=width - 2 * GRID_GAP,
     )
-    title_height = title_bounds[3] - title_bounds[1] + 2 * gap
+    title_height = header_text_height + 2 * GRID_GAP
     row_heights = [
         max(card.height for card in cards[row:row + columns])
         for row in range(0, len(cards), columns)
     ]
-    width = columns * 720 + (columns + 1) * gap
-    height = title_height + sum(row_heights) + (len(row_heights) + 1) * gap
+    height = (
+        title_height
+        + sum(row_heights)
+        + (len(row_heights) + 1) * GRID_GAP
+    )
     sheet = Image.new("RGB", (width, height), "#0c0e12")
     draw = ImageDraw.Draw(sheet)
-    draw.multiline_text(
-        (gap, gap), title_text, fill="#eef1f5", font=font, spacing=4
-    )
-    y = title_height + gap
+    y = GRID_GAP
+    for style, line, font in header_lines:
+        draw.text((GRID_GAP, y), line, fill=colors[style], font=font)
+        y += _line_height(font) + 7
+        if style in {"heading", "status"}:
+            y += 5
+    y = title_height + GRID_GAP
     for row_index, row_height in enumerate(row_heights):
         for column, card in enumerate(cards[row_index * columns:(row_index + 1) * columns]):
-            sheet.paste(card, (gap + column * (720 + gap), y))
-        y += row_height + gap
+            sheet.paste(
+                card,
+                (GRID_GAP + column * (CARD_WIDTH + GRID_GAP), y),
+            )
+        y += row_height + GRID_GAP
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(output_path, format="PNG", optimize=True)
     return output_path
