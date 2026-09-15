@@ -79,6 +79,8 @@ Identity is `unavailable`, `missing`, or `ambiguous` unless exactly one face exi
 
 The parallel image pins `yolo11n-pose.pt` from Ultralytics assets v8.4.0 at SHA-256 `869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0`. `UltralyticsPoseCPUBackend` converts decoded RGB images to contiguous BGR arrays at the Ultralytics NumPy boundary and uses the image's existing dependency on CPU with fixed confidence, IoU, image size, disabled augmentation, and at most two detections. It requires exactly one person and reports missing, ambiguous, occluded, or degenerate outcomes without scores. Available results contain pixel-corrected 2D shoulder/hip, limb/torso ratios, and joint angles. They are viewpoint-sensitive proxies, not anatomical ground truth or proof that a text pose was followed. Ultralytics software and models require AGPL-3.0 compliance or an applicable Enterprise license.
 
+Pinned Ultralytics 8.4.61 assigns an empty `CUDA_VISIBLE_DEVICES` value when CPU prediction selects its device. Evaluation snapshots whether this variable was absent or explicitly set, restores that exact state after backend preflight and every evaluation attempt, and also encloses the queue call so an exceptional or substituted backend cannot leak the mutation. The next training subprocess therefore inherits the queue's original authorized GPU visibility. This restoration does not turn a real CUDA failure into success; the fresh trainer still performs its own hardware checks.
+
 For a generic installation, the older MediaPipe seam remains available in a separate CPU evaluation environment:
 
 ```bash

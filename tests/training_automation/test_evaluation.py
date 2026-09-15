@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -296,3 +297,72 @@ def test_evaluate_cli_processes_existing_samples_without_training(tmp_path):
     config_path, output = setup_job(tmp_path)
     assert cli.main(["evaluate", str(config_path), str(output)]) == 0
     assert (output / ".automation" / "evaluation.json").is_file()
+
+
+class MutatingPoseBackend:
+    def __init__(self, *, fail=False):
+        self.fail = fail
+
+    def metrics(self, image):
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        if self.fail:
+            raise RuntimeError("pose inference failed")
+        return {"status": "missing", "values": None, "reason": "test"}
+
+
+@pytest.mark.parametrize("initial", [None, "", "0"])
+def test_evaluate_job_restores_exact_cuda_visibility(initial, tmp_path, monkeypatch):
+    if initial is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", initial)
+    config_path, output = setup_job(tmp_path)
+    monkeypatch.setattr(
+        evaluation, "_load_backend",
+        lambda spec, options: MutatingPoseBackend() if spec == "mutating:pose" else None,
+    )
+    evaluation.evaluate_job(
+        job_config_path=config_path, output_dir=output, reference_images=[],
+        config={"landmark_backend": "mutating:pose"},
+    )
+    if initial is None:
+        assert "CUDA_VISIBLE_DEVICES" not in os.environ
+    else:
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == initial
+
+
+@pytest.mark.parametrize("initial", [None, "0"])
+def test_evaluate_job_restores_cuda_visibility_when_backend_raises(
+    initial, tmp_path, monkeypatch,
+):
+    if initial is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", initial)
+    config_path, output = setup_job(tmp_path)
+    monkeypatch.setattr(
+        evaluation, "_load_backend",
+        lambda spec, options: MutatingPoseBackend(fail=True) if spec == "mutating:pose" else None,
+    )
+    with pytest.raises(RuntimeError, match="pose inference failed"):
+        evaluation.evaluate_job(
+            job_config_path=config_path, output_dir=output, reference_images=[],
+            config={"landmark_backend": "mutating:pose"},
+        )
+    if initial is None:
+        assert "CUDA_VISIBLE_DEVICES" not in os.environ
+    else:
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == initial
+
+
+def test_backend_preflight_restores_cuda_visibility_when_loading_raises(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    def failing_load(spec, options):
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        raise RuntimeError("backend load failed")
+
+    monkeypatch.setattr(evaluation, "_load_backend", failing_load)
+    with pytest.raises(RuntimeError, match="backend load failed"):
+        evaluation.preflight_evaluation_backends({"face_backend": "mutating:face"})
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ

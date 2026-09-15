@@ -14,7 +14,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
-from .evaluation import evaluate_job
+from .evaluation import evaluate_job, preserve_cuda_visibility
 from .state import atomic_write_json, read_json
 
 
@@ -344,12 +344,13 @@ class TrainingQueue:
                 entry.update({"status": "evaluating", "evaluation_status": "running"})
                 atomic_write_json(self.state_path, state)
                 try:
-                    report_path = evaluate_job(
-                        job_config_path=job.config_path,
-                        output_dir=job.output_root / job.job_id,
-                        reference_images=list(job.reference_images),
-                        config=evaluation,
-                    )
+                    with preserve_cuda_visibility():
+                        report_path = evaluate_job(
+                            job_config_path=job.config_path,
+                            output_dir=job.output_root / job.job_id,
+                            reference_images=list(job.reference_images),
+                            config=evaluation,
+                        )
                 except Exception as exc:
                     entry.update({
                         "status": "evaluation_failed",

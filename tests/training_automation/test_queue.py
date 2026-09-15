@@ -1,6 +1,7 @@
 import json
 import fcntl
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -224,6 +225,59 @@ def test_evaluation_failure_retries_without_relaunching_training(tmp_path, monke
     assert entry["status"] == "completed"
     assert len(launches) == 1
     assert len(evaluations) == 2
+
+
+@pytest.mark.parametrize("initial", [None, "0"])
+def test_two_sequential_jobs_inherit_original_gpu_visibility_after_mutating_evaluation(
+    initial, tmp_path, monkeypatch,
+):
+    if initial is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", initial)
+    config = write_configs(tmp_path)
+    document = yaml.safe_load(config.read_text())
+    document["evaluation"] = {"enabled": True}
+    document["datasets"].append({**document["datasets"][0], "name": "Person Two"})
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    trainer_visibility = []
+
+    def launch(command, env):
+        trainer_visibility.append(("CUDA_VISIBLE_DEVICES" in env, env.get("CUDA_VISIBLE_DEVICES")))
+        return 0
+
+    def mutating_evaluation(**kwargs):
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        report = tmp_path / f"evaluation-{len(trainer_visibility)}.json"
+        report.write_text("{}", encoding="utf-8")
+        return report
+
+    monkeypatch.setattr(queue_module, "evaluate_job", mutating_evaluation)
+    state = TrainingQueue(config, run_command=launch).run()
+    expected = (initial is not None, initial)
+    assert trainer_visibility == [expected, expected]
+    assert {entry["status"] for entry in state["jobs"].values()} == {"completed"}
+    if initial is None:
+        assert "CUDA_VISIBLE_DEVICES" not in os.environ
+    else:
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == initial
+
+
+def test_queue_restores_gpu_visibility_when_evaluation_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    config = write_configs(tmp_path)
+    document = yaml.safe_load(config.read_text())
+    document["evaluation"] = {"enabled": True}
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    def failing_evaluation(**kwargs):
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        raise RuntimeError("evaluation failed")
+
+    monkeypatch.setattr(queue_module, "evaluate_job", failing_evaluation)
+    state = TrainingQueue(config, run_command=lambda command, env: 0).run()
+    assert next(iter(state["jobs"].values()))["evaluation_status"] == "failed"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "3"
 
 
 def test_queue_lock_refuses_second_launcher(tmp_path):

@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib
 import json
 import math
+import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
@@ -22,6 +24,21 @@ class FaceBackend(Protocol):
     def embeddings(self, image: np.ndarray) -> list[np.ndarray]: ...
 
 
+@contextmanager
+def preserve_cuda_visibility():
+    """Restore the caller's exact GPU visibility after CPU-only evaluation code."""
+    key = "CUDA_VISIBLE_DEVICES"
+    was_present = key in os.environ
+    previous = os.environ.get(key)
+    try:
+        yield
+    finally:
+        if was_present:
+            os.environ[key] = previous if previous is not None else ""
+        else:
+            os.environ.pop(key, None)
+
+
 def _backend_provenance(backend: Any | None, spec: str | None) -> dict[str, Any]:
     if backend is None:
         return {"status": "unavailable", "backend": spec, "reason": "backend not configured"}
@@ -31,12 +48,13 @@ def _backend_provenance(backend: Any | None, spec: str | None) -> dict[str, Any]
 
 def preflight_evaluation_backends(config: Mapping[str, Any]) -> dict[str, Any]:
     """Load configured backends before a paid training process starts."""
-    face = _load_backend(config.get("face_backend"), config.get("face_backend_options", {}))
-    landmark = _load_backend(config.get("landmark_backend"), config.get("landmark_backend_options", {}))
-    return {
-        "face_backend": _backend_provenance(face, config.get("face_backend")),
-        "pose_backend": _backend_provenance(landmark, config.get("landmark_backend")),
-    }
+    with preserve_cuda_visibility():
+        face = _load_backend(config.get("face_backend"), config.get("face_backend_options", {}))
+        landmark = _load_backend(config.get("landmark_backend"), config.get("landmark_backend_options", {}))
+        return {
+            "face_backend": _backend_provenance(face, config.get("face_backend")),
+            "pose_backend": _backend_provenance(landmark, config.get("landmark_backend")),
+        }
 
 
 def _load_backend(spec: str | None, options: Mapping[str, Any]) -> Any | None:
@@ -288,7 +306,7 @@ def _choose_latest_complete_run(
     return [selected[index] for index in sorted(selected)], status, discarded
 
 
-def evaluate_job(
+def _evaluate_job(
     *,
     job_config_path: Path,
     output_dir: Path,
@@ -444,6 +462,22 @@ def evaluate_job(
     report_path = output_dir / ".automation" / "evaluation.json"
     atomic_write_json(report_path, report)
     return report_path
+
+
+def evaluate_job(
+    *,
+    job_config_path: Path,
+    output_dir: Path,
+    reference_images: list[Path],
+    config: Mapping[str, Any],
+) -> Path:
+    with preserve_cuda_visibility():
+        return _evaluate_job(
+            job_config_path=job_config_path,
+            output_dir=output_dir,
+            reference_images=reference_images,
+            config=config,
+        )
 
 
 def persist_selection(report_path: Path, step: int, note: str) -> Path:
