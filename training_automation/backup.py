@@ -104,11 +104,14 @@ class HuggingFaceBackupClient:
                     lfs_sha = lfs.get("sha256") or lfs.get("oid")
                 elif lfs is not None:
                     lfs_sha = getattr(lfs, "sha256", None) or getattr(lfs, "oid", None)
-                result[str(entry.path)] = {
+                metadata = {
                     "size": getattr(entry, "size", None),
                     "sha256": lfs_sha,
-                    "blob_id": getattr(entry, "blob_id", None),
                 }
+                blob_id = getattr(entry, "blob_id", None)
+                if blob_id:
+                    metadata["blob_id"] = blob_id
+                result[str(entry.path)] = metadata
         return result
 
     def read_remote_file(self, repo_id: str, repo_type: str, path: str) -> tuple[bytes | None, str]:

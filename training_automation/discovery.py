@@ -204,9 +204,6 @@ def scan_dataset_root(
     normalized = [safe_name(item.name) for item in snapshots]
     if len(normalized) != len(set(normalized)):
         raise BackupError("dataset folders resolve to duplicate normalized model names")
-    fingerprints = [item.fingerprint for item in snapshots]
-    if len(fingerprints) != len(set(fingerprints)):
-        raise BackupError("multiple local dataset folders contain identical training content")
     return sorted(snapshots, key=lambda item: (safe_name(item.name), item.folder.casefold()))
 
 
