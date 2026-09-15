@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 
@@ -10,7 +11,6 @@ OLD_ENABLED = "diff_output_preservation: false,"
 NEW_ENABLED = "diff_output_preservation: opts.subjectMask,"
 OLD_CLASS = "diff_output_preservation_class: 'person',"
 NEW_CLASS = "diff_output_preservation_class: opts.subjectMask ? 'woman' : 'person',"
-OLD_DESCRIPTION = "'what they caption.',"
 NEW_DESCRIPTION = "'what they caption. Differential Output Preservation is enabled with class woman.',"
 
 
@@ -28,11 +28,13 @@ def patch_woman_preset(source: str) -> str:
         raise RuntimeError("unsupported UI quickstarts: DOP field anchors changed")
     if subject.count("id: 'subject_likeness_masked_flux2_klein9b'") != 1:
         raise RuntimeError("unsupported UI quickstarts: masked preset identity changed")
-    if subject.count(OLD_DESCRIPTION) != 1:
-        raise RuntimeError("unsupported UI quickstarts: masked preset description changed")
     patched = subject.replace(OLD_ENABLED, NEW_ENABLED, 1)
     patched = patched.replace(OLD_CLASS, NEW_CLASS, 1)
-    patched = patched.replace(OLD_DESCRIPTION, NEW_DESCRIPTION, 1)
+    description = re.compile(r"(?P<prefix>description:\s*)(?P<quote>['\"])(?P<body>.*?)(?P=quote),", re.DOTALL)
+    match = description.search(patched)
+    if match is None:
+        raise RuntimeError("unsupported UI quickstarts: masked preset description field missing")
+    patched = patched[:match.start()] + match.group("prefix") + NEW_DESCRIPTION + patched[match.end():]
     return source[:start] + patched + source[end:]
 
 
