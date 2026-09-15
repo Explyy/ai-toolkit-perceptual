@@ -16,6 +16,7 @@ RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/outp
     && python /tmp/install_training_automation_overlay.py --root /app/ai-toolkit \
     && python /tmp/install_evaluation_models.py \
     && chmod 0755 /run-parallel-training /run-unified-training \
+    && test -x /start.sh \
     && python -m compileall -q /app/ai-toolkit/training_automation \
     && python -m compileall -q /app/ai-toolkit/jobs/process/BaseSDTrainProcess.py \
     && python -m training_automation.recipe /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml /app/ai-toolkit \

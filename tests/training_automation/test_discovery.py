@@ -105,6 +105,25 @@ def test_remote_ledger_quiet_period_assignments_completion_and_changed_hold(tmp_
     assert held["datasets"][selected.folder]["status"] == "changed"
 
 
+def test_upload_that_changes_during_quiet_period_restarts_observation(tmp_path):
+    folder = _dataset(tmp_path / "datasets", "Person Uploading")
+    client = FakeHubClient()
+    store = WorkflowLedgerStore(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        remote_path="training-automation/workflow-ledger.json",
+        local_path=tmp_path / "ledger.json",
+    )
+    first = scan_dataset_root(tmp_path / "datasets")
+    store.reconcile(first, worker_count=1, quiet_seconds=60, now=100)
+    (folder / "image-0.txt").write_text("upload still changing", encoding="utf-8")
+    second = scan_dataset_root(tmp_path / "datasets")
+    observing, _ = store.reconcile(second, worker_count=1, quiet_seconds=60, now=160)
+    assert observing["datasets"][folder.name]["status"] == "observing"
+    assert observing["datasets"][folder.name]["first_observed_at"] == 160
+    ready, _ = store.reconcile(second, worker_count=1, quiet_seconds=60, now=220)
+    assert ready["datasets"][folder.name]["status"] == "ready"
+
+
 def test_legacy_completed_identity_is_not_requeued(tmp_path):
     _dataset(tmp_path / "datasets", "Training_Def_Owhx_Freya")
     [snapshot] = scan_dataset_root(tmp_path / "datasets")

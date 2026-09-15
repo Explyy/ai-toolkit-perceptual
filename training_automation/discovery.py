@@ -97,6 +97,9 @@ def _snapshot_folder(
     if not DATASET_NAME_RE.fullmatch(folder.name):
         raise BackupError(f"dataset folder name contains unsupported characters: {folder.name}")
     entries = sorted(folder.iterdir(), key=lambda path: path.name.casefold())
+    casefolded = [path.name.casefold() for path in entries]
+    if len(casefolded) != len(set(casefolded)):
+        raise BackupError(f"dataset folder contains case-ambiguous filenames: {folder.name}")
     if any(path.is_symlink() for path in entries):
         raise BackupError(f"dataset folder contains a symlink: {folder.name}")
     if any(path.is_dir() for path in entries):
@@ -105,6 +108,9 @@ def _snapshot_folder(
     if not images:
         raise BackupError(f"dataset folder contains no supported images: {folder.name}")
     allowed = {path.name for path in images}
+    stems = [path.stem.casefold() for path in images]
+    if len(stems) != len(set(stems)):
+        raise BackupError(f"dataset folder contains images with duplicate caption stems: {folder.name}")
     captions = []
     for image in images:
         caption = image.with_suffix(".txt")
@@ -274,6 +280,16 @@ class WorkflowLedgerStore:
                     }
                     continue
                 if current.get("fingerprint") != snapshot.fingerprint:
+                    if current.get("status") == "observing":
+                        datasets[snapshot.folder] = {
+                            **snapshot_data,
+                            "status": "observing",
+                            "first_observed_at": now,
+                            "worker": assigned_worker(
+                                snapshot.fingerprint, worker_count, snapshot.folder
+                            ),
+                        }
+                        continue
                     current.update({
                         "status": "changed",
                         "observed_fingerprint": snapshot.fingerprint,

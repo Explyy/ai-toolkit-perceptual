@@ -149,14 +149,26 @@ def _sync_startup(
         work_dir=work_root / "sync" / "latest", ranks=(1,),
         catalog_prefix=catalog_prefix, results_prefix=results_prefix, dry_run=dry_run,
     )]
+    latest_model_ids = {
+        int(item["model_id"]) for item in records[0].get("files") or []
+    }
     for seed in sync_config.get("legacy_runs") or []:
         if not isinstance(seed, Mapping):
             raise BackupConfigurationError("sync legacy_runs entries must be mappings")
+        configured_model_ids = tuple(int(value) for value in seed.get("model_ids") or [])
+        if not configured_model_ids:
+            raise BackupConfigurationError("each historical sync seed requires explicit model_ids")
+        seed_model_ids = tuple(
+            value for value in configured_model_ids
+            if int(value) not in latest_model_ids
+        )
+        if not seed_model_ids:
+            continue
         records.append(sync_ranked_loras(
             client=client, repo_id=repo_id, repo_type=repo_type,
             source_revision=str(seed["revision"]), run_id=str(seed["run_id"]),
             loras_root=loras_root, work_dir=work_root / "sync" / "legacy" / str(seed["run_id"]),
-            ranks=(1,), model_ids=tuple(int(value) for value in seed.get("model_ids") or []),
+            ranks=(1,), model_ids=seed_model_ids,
             catalog_prefix=catalog_prefix, results_prefix=results_prefix, dry_run=dry_run,
         ))
     if any(item["status"] == "conflicts" for item in records):
@@ -182,21 +194,22 @@ def _ordered_candidates(
     ledger: Mapping[str, Any], *, worker_id: int, explicit_order: Sequence[str],
     include_incomplete: bool,
 ) -> list[dict[str, Any]]:
-    candidates = [
+    eligible_statuses = (
+        {"ready", "queued", "incomplete"} if include_incomplete else {"ready", "queued"}
+    )
+    eligible = [
         dict(item) for item in ledger["datasets"].values()
-        if int(item.get("worker", -1)) == worker_id
-        and item.get("status") in (
-            {"ready", "queued", "incomplete"} if include_incomplete else {"ready", "queued"}
-        )
+        if item.get("status") in eligible_statuses
     ]
+    candidates = [item for item in eligible if int(item.get("worker", -1)) == worker_id]
     lookup: dict[str, int] = {}
     for index, value in enumerate(explicit_order):
         key = safe_name(str(value))
         if key in lookup:
             raise BackupConfigurationError("explicit dataset order contains duplicates")
         lookup[key] = index
-    known = {safe_name(str(item["name"])) for item in candidates} | {
-        safe_name(str(item["folder"])) for item in candidates
+    known = {safe_name(str(item["name"])) for item in eligible} | {
+        safe_name(str(item["folder"])) for item in eligible
     }
     missing = set(lookup) - known
     if missing:
@@ -343,6 +356,20 @@ def run_unified_workflow(
             second, worker_count=worker_count, quiet_seconds=quiet_seconds,
             now=max(clock(), start + quiet_seconds),
         )
+        invalid_assignments = [
+            item["folder"] for item in ledger["datasets"].values()
+            if item.get("status") not in {"completed", "changed"}
+            and (
+                not isinstance(item.get("worker"), int)
+                or int(item["worker"]) < 0
+                or int(item["worker"]) >= worker_count
+            )
+        ]
+        if invalid_assignments:
+            raise BackupError(
+                "persisted worker assignments do not fit configured worker_count: "
+                f"{sorted(invalid_assignments)}"
+            )
         candidates = _ordered_candidates(
             ledger, worker_id=worker_id,
             explicit_order=tuple(discovery.get("order") or []),
@@ -434,16 +461,20 @@ def run_unified_workflow(
                 (path, f"jobs/{job.job_id}/samples/{path.name}")
                 for path in sorted((output / "samples").iterdir()) if path.is_file()
             )
-            latest_result = latest_sync(
-                client=hub, repo_id=repo_id, repo_type=repo_type,
-                source_revision=str(record["revision"]), loras_root=loras_root,
-                work_dir=run_root / "sync-after-export" / job.job_id,
-                model_ids=(int(models[str(item["folder"])]["id"]),), ranks=(1,),
-                catalog_prefix=str((config.get("sync") or {}).get("catalog_prefix", "training-backups")),
-                results_prefix=str((config.get("sync") or {}).get("results_prefix", "training-results")),
-            )
-            if latest_result["status"] != "completed":
-                raise BackupError(f"post-export top1 sync failed: {item['folder']}")
+            if record.get("status") == "available":
+                latest_result = latest_sync(
+                    client=hub, repo_id=repo_id, repo_type=repo_type,
+                    source_revision=str(record["revision"]), loras_root=loras_root,
+                    work_dir=run_root / "sync-after-export" / job.job_id,
+                    model_ids=(int(models[str(item["folder"])]["id"]),), ranks=(1,),
+                    catalog_prefix=str((config.get("sync") or {}).get("catalog_prefix", "training-backups")),
+                    results_prefix=str((config.get("sync") or {}).get("results_prefix", "training-results")),
+                )
+                if latest_result["status"] != "completed":
+                    raise BackupError(f"post-export top1 sync failed: {item['folder']}")
+                record["top1_sync_status"] = "completed"
+            else:
+                record["top1_sync_status"] = "unavailable"
         archive = archive_factory(
             client=hub, repo_id=repo_id, repo_type=repo_type,
             remote_prefix=str((config.get("archive") or {}).get("remote_prefix", "training-archives")),

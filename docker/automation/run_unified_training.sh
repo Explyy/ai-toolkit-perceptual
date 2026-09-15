@@ -2,7 +2,7 @@
 set -eu
 
 config_path="${TRAINING_UNIFIED_CONFIG:-/storage/config/klein-unified.yaml}"
-gui_start="${TRAINING_GUI_START:-/app/start.sh}"
+gui_start="${TRAINING_GUI_START:-/start.sh}"
 log_path="${TRAINING_UNIFIED_LOG:-/storage/automation/unified/supervisor.log}"
 
 if [ ! -f "$config_path" ]; then
