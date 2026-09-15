@@ -702,7 +702,10 @@ def upload_dataset_folder(
             role="dataset-source", relative_path=relative,
         ))
     work_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = work_dir / "dataset-manifest.json"
+    manifest_path = work_dir / (
+        "dataset-manifest-"
+        f"{hashlib.sha256(str(prefix).encode()).hexdigest()}-{snapshot.fingerprint}.json"
+    )
     atomic_write_json(manifest_path, {
         "schema_version": DATASET_MANIFEST_SCHEMA,
         "catalog_name": name, "trigger_word": trigger, "files": files,
