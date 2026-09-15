@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -20,6 +21,7 @@ from .queue import TrainingQueue
 from .results import publish_ranked_results
 from .staging import COMMIT_RE, PinnedDatasetStager
 from .state import atomic_write_json, read_json
+from .sync import sync_ranked_loras
 
 
 MANIFEST_SCHEMA = 1
@@ -33,7 +35,8 @@ REQUIRED_MODEL_SOURCE_KINDS = {"base_model", "depth_model"}
 NATIVE_KLEIN_FILENAME = "flux-2-klein-base-9b.safetensors"
 FLUX2_VAE_FILENAME = "ae.safetensors"
 LEGACY_TRAINING_STEPS = 1200
-SAMPLE_EVERY = 100
+DEFAULT_SAMPLE_EVERY = 200
+SUPPORTED_SAMPLE_CADENCES = {100, DEFAULT_SAMPLE_EVERY}
 RESOLUTION_REPEATS = [16, 4, 1]
 TRAIN_BATCH_SIZE = 4
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
@@ -107,8 +110,11 @@ def _validate_checkpoint_policy(manifest: Mapping[str, Any]) -> None:
         raise BackupError("checkpoint_policy requires exactly save_every and max_local_step_saves")
     save_every = _positive_int(raw["save_every"], "checkpoint_policy.save_every")
     _positive_int(raw["max_local_step_saves"], "checkpoint_policy.max_local_step_saves")
-    if save_every != SAMPLE_EVERY:
-        raise BackupError(f"checkpoint_policy.save_every must equal sample cadence {SAMPLE_EVERY}")
+    if save_every not in SUPPORTED_SAMPLE_CADENCES:
+        raise BackupError(
+            "checkpoint_policy.save_every must be one of "
+            f"{sorted(SUPPORTED_SAMPLE_CADENCES)}"
+        )
 
 
 def validate_manifest(
@@ -411,6 +417,14 @@ def _write_queue_config(
 ) -> Path:
     recipe = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
     process = recipe["config"]["process"][0]
+    checkpoint_policy = manifest.get("checkpoint_policy")
+    cadence = (
+        int(checkpoint_policy["save_every"])
+        if checkpoint_policy is not None
+        else int((process.get("sample") or {}).get("sample_every", DEFAULT_SAMPLE_EVERY))
+    )
+    process.setdefault("save", {})["save_every"] = cadence
+    process.setdefault("sample", {})["sample_every"] = cadence
     process.pop("sqlite_db_path", None)
     process["logging"]["use_ui_logger"] = False
     canonical_base_model = str(process["model"]["name_or_path"])
@@ -467,7 +481,7 @@ def _write_queue_config(
             },
         },
         "evaluation": evaluation,
-        **({"checkpoint_policy": manifest["checkpoint_policy"]} if "checkpoint_policy" in manifest else {}),
+        **({"checkpoint_policy": checkpoint_policy} if checkpoint_policy is not None else {}),
         "datasets": datasets,
     }
     queue_path = run_root / "queue.yaml"
@@ -523,7 +537,13 @@ def _completion_evidence(
         expected_sample_count = len(configured_samples) if isinstance(configured_samples, list) else 0
         final_step = int(process.get("train", {}).get("steps", 0))
         sample_every = int(sample_config.get("sample_every", 0))
-        if expected_sample_count != 23 or final_step <= 0 or sample_every != SAMPLE_EVERY:
+        save_every = int((process.get("save") or {}).get("save_every", 0))
+        if (
+            expected_sample_count <= 0
+            or final_step <= 0
+            or sample_every not in SUPPORTED_SAMPLE_CADENCES
+            or save_every != sample_every
+        ):
             raise BackupError(f"job {job.job_id} does not retain the required evaluation schedule")
         checkpoints_by_step = {int(item.get("step", -1)): item for item in report_checkpoints}
         expected_steps = set(range(sample_every, final_step, sample_every)) | {final_step}
@@ -674,6 +694,8 @@ def _publish_job_results(
     run_id: str,
     run_root: Path,
     catalog_prefix: str,
+    completed_at: str,
+    loras_root: Path | None,
 ) -> None:
     completion_by_job = {item["job_id"]: item for item in completion["jobs"]}
     for job in queue.materialize():
@@ -688,9 +710,29 @@ def _publish_job_results(
             sample_root=output / "samples",
             work_dir=run_root / "results" / job.job_id,
             catalog_prefix=catalog_prefix,
+            completed_at=completed_at,
         )
         files.extend(evidence_files)
         completion_by_job[job.job_id]["automatic_result_export"] = record
+        if loras_root is not None:
+            sync_receipt = sync_ranked_loras(
+                client=client,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                source_revision=str(record["revision"]),
+                run_id=run_id,
+                loras_root=loras_root,
+                work_dir=run_root / "results" / job.job_id / "lora-sync",
+                ranks=(1, 2, 3),
+                model_ids=(int(record["model"]["id"]),),
+                catalog_prefix=catalog_prefix,
+            )
+            if sync_receipt.get("status") != "completed":
+                raise BackupError(f"job {job.job_id} ranked LoRA sync did not complete")
+            sync_path = run_root / "results" / job.job_id / "ranked-lora-sync.json"
+            atomic_write_json(sync_path, sync_receipt)
+            files.append((sync_path, f"jobs/{job.job_id}/ranked-lora-sync.json"))
+            completion_by_job[job.job_id]["ranked_lora_sync"] = sync_receipt
 
 
 def _verified_source_marker(source: Mapping[str, Any], models_root: Path) -> Path:
@@ -738,9 +780,20 @@ def _finalize_completed_run(
         ),
         staging_state=staging_state,
     )
+    completed_at = str(state.get("completed_at") or "")
+    if not completed_at:
+        completed_at = datetime.now(timezone.utc).isoformat()
+        state["completed_at"] = completed_at
+    state.update({"status": "publishing-results", "instance_id": binding.instance_id})
+    state.pop("error", None)
+    atomic_write_json(state_path, state)
     catalog_prefix = str(
         (manifest.get("catalog") or {}).get("remote_prefix", "training-backups")
     )
+    loras_root_value = values.get("TRAINING_LORAS_ROOT")
+    loras_root = Path(loras_root_value).expanduser().resolve() if loras_root_value else None
+    if loras_root is not None and not loras_root.is_dir():
+        raise BackupError(f"TRAINING_LORAS_ROOT is not an existing directory: {loras_root}")
     _publish_job_results(
         queue=queue,
         files=files,
@@ -751,6 +804,8 @@ def _finalize_completed_run(
         run_id=run_id,
         run_root=run_root,
         catalog_prefix=catalog_prefix,
+        completed_at=completed_at,
+        loras_root=loras_root,
     )
     state.update({"status": "archiving", "instance_id": binding.instance_id})
     state.pop("error", None)
@@ -766,6 +821,7 @@ def _finalize_completed_run(
         marker = _verified_source_marker(source, models_root)
         files.append((marker, f"model-sources/{source['kind']}.json"))
     completion.update({
+        "completed_at": completed_at,
         "manifest_revision": values["HF_MANIFEST_REVISION"],
         "dataset_revision": manifest["dataset_revision"],
         "reference_provenance": str(

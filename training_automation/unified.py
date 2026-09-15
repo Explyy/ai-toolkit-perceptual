@@ -510,7 +510,7 @@ def _write_queue(
         "state_path": str(work_root / "queue-state.json"),
         "continue_on_error": False,
         "training_folder": str(Path(str(queue_config.get("output_root", "/storage/output"))).resolve()),
-        "checkpoint_policy": dict(config.get("checkpoint_policy") or {"save_every": 100, "max_local_step_saves": 5}),
+        "checkpoint_policy": dict(config.get("checkpoint_policy") or {"save_every": 200, "max_local_step_saves": 5}),
         "checkpoint_backup": {
             "enabled": True, "repo_id": repo_id, "repo_type": repo_type,
             "token_env": str((config.get("hub") or {}).get("token_env", "HF_TOKEN")),

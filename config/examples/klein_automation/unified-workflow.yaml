@@ -70,7 +70,7 @@ queue:
   trigger_word: Owhx
 
 checkpoint_policy:
-  save_every: 100
+  save_every: 200
   max_local_step_saves: 5
 
 evaluation:

@@ -24,7 +24,7 @@ config:
           ignore_if_contains: []
       save:
         dtype: bf16
-        save_every: 25
+        save_every: 200
         max_step_saves_to_keep: 120
         save_format: diffusers
         push_to_hub: false
@@ -107,7 +107,7 @@ config:
         layer_offloading_transformer_percent: 1
       sample:
         sampler: flowmatch
-        sample_every: 100
+        sample_every: 200
         width: 640
         height: 960
         samples:
