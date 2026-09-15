@@ -260,6 +260,7 @@ class WorkflowLedgerStore:
         attempts: int = 5,
     ) -> tuple[dict[str, Any], str]:
         last_error: Exception | None = None
+        verified_fingerprints = set(verified_stable_fingerprints)
         for _ in range(attempts):
             ledger, parent = self.read()
             datasets = ledger["datasets"]
@@ -268,7 +269,7 @@ class WorkflowLedgerStore:
                     datasets[folder] = dict(record)
             for snapshot in snapshots:
                 current = datasets.get(snapshot.folder)
-                if current is None:
+                if current is None and snapshot.fingerprint in verified_fingerprints:
                     aliases = [
                         (folder, item) for folder, item in datasets.items()
                         if item.get("fingerprint") == snapshot.fingerprint
@@ -291,7 +292,7 @@ class WorkflowLedgerStore:
                 snapshot_data = asdict(snapshot)
                 snapshot_data["files"] = list(snapshot_data["files"])
                 if current is None:
-                    verified_remote = snapshot.fingerprint in set(verified_stable_fingerprints)
+                    verified_remote = snapshot.fingerprint in verified_fingerprints
                     datasets[snapshot.folder] = {
                         **snapshot_data,
                         "status": "ready" if verified_remote else "observing",
