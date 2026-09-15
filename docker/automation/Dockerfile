@@ -16,6 +16,10 @@ COPY docker/automation/run_unified_training.sh /run-unified-training
 RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/output \
     && python /tmp/install_training_automation_overlay.py --root /app/ai-toolkit \
     && python /tmp/install_woman_preset.py --root /app/ai-toolkit \
+    && cd /app/ai-toolkit/ui \
+    && npm run build \
+    && grep -R -q -F "Differential Output Preservation is enabled with class woman." .next \
+    && cd /app/ai-toolkit \
     && python /tmp/install_evaluation_models.py \
     && chmod 0755 /run-parallel-training /run-unified-training \
     && test -x /start.sh \
