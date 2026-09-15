@@ -7,6 +7,8 @@ import sys
 
 import numpy as np
 
+sys.path.insert(0, "/app/ai-toolkit")
+
 from training_automation.backends import UltralyticsPoseCPUBackend
 from training_automation.evaluation import preserve_cuda_visibility
 
