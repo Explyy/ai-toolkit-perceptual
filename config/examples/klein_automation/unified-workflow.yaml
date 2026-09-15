@@ -41,6 +41,9 @@ worker:
 sync:
   catalog_prefix: training-backups
   results_prefix: training-results
+  # Install every available automatic shortlist rank into the canonical
+  # numeric-name model folder. Missing/conflicting rank evidence holds safely.
+  ranks: [1, 2, 3]
   # Historical runs have no trustworthy chronology. Seed them explicitly once:
   # legacy_runs:
   #   - run_id: e372619d-f4dc-4f4b-a2ba-b0df127e24fc
@@ -49,7 +52,9 @@ sync:
 
 discovery:
   quiet_seconds: 60
-  target_exposures: 126
+  # Seven complete 16+4+1 loader epochs expose every original photo 147 times,
+  # the nearest complete-epoch schedule to the requested target of 150.
+  target_exposures: 147
   ledger_path: training-automation/workflow-ledger.json
   retry_incomplete: false
   order: []

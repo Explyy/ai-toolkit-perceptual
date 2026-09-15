@@ -26,6 +26,9 @@ def _validate_recipe(recipe_path: Path, repo_root: Path, *, prompt_count: int) -
         ("train", "weight_noise", "enabled"): True,
         ("train", "weight_noise", "mode"): "relative",
         ("train", "weight_noise", "sigma"): 0.0125,
+        ("train", "diff_output_preservation"): True,
+        ("train", "diff_output_preservation_multiplier"): 1,
+        ("train", "diff_output_preservation_class"): "woman",
         ("network", "type"): "lokr",
         ("network", "linear"): 32,
         ("datasets", "num_repeats"): [16, 4, 1],
@@ -67,6 +70,8 @@ def _validate_recipe(recipe_path: Path, repo_root: Path, *, prompt_count: int) -
         "def _inject_weight_noise",
         "self.subject_mask_config",
         "self.depth_consistency_config",
+        "diff_output_preservation requires a trigger_word",
+        "self.cached_dop_class_embeds",
     ]
     missing = [token for token in required_config if token not in config_source]
     missing += [token for token in required_trainer if token not in trainer_source]

@@ -31,6 +31,7 @@ from .sync import sync_latest_loras, sync_ranked_loras
 
 
 UNIFIED_SCHEMA = 1
+DEFAULT_TARGET_EXPOSURES = 147
 _PROCESS_ENV_LOCK = threading.RLock()
 
 
@@ -304,12 +305,25 @@ def _trainer_credential_environment(name: str, value: str):
                 os.environ.pop(name, None)
 
 
+def _sync_ranks(config: Mapping[str, Any], ranks: Sequence[int] | None = None) -> tuple[int, ...]:
+    raw = list((config.get("sync") or {}).get("ranks", [1])) if ranks is None else list(ranks)
+    if (
+        not raw
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in raw)
+        or len(raw) != len(set(raw))
+        or any(value not in {1, 2, 3} for value in raw)
+    ):
+        raise BackupConfigurationError("sync.ranks must contain unique integers chosen from 1, 2, and 3")
+    return tuple(sorted(raw))
+
+
 def _sync_startup(
     *, client: Any, config: Mapping[str, Any], repo_id: str, repo_type: str,
     loras_root: Path, work_root: Path, dry_run: bool,
-    ranks: Sequence[int] = (1,), model_ids: Sequence[int] = (),
+    ranks: Sequence[int] | None = None, model_ids: Sequence[int] = (),
 ) -> list[dict[str, Any]]:
     sync_config = config.get("sync") or {}
+    ranks = _sync_ranks(config, ranks)
     catalog_prefix = str(sync_config.get("catalog_prefix", "training-backups"))
     results_prefix = str(sync_config.get("results_prefix", "training-results"))
     _, revision = client.read_remote_file(
@@ -368,12 +382,13 @@ def sync_unified_loras(
     env: Mapping[str, str] | None = None,
     client: Any | None = None,
     dry_run: bool = False,
-    ranks: Sequence[int] = (1,),
+    ranks: Sequence[int] | None = None,
     model_ids: Sequence[int] = (),
 ) -> list[dict[str, Any]]:
     """Run the exact startup latest-plus-explicit-history sync without discovery/training."""
     values = dict(os.environ if env is None else env)
     config = load_unified_config(config_path, values)
+    ranks = _sync_ranks(config, ranks)
     _initialize_storage_directories(config)
     loras_root = resolve_loras_root(config, values)
     repo_id, repo_type, token = _repo(config, values)
@@ -636,6 +651,7 @@ def run_unified_workflow(
 ) -> dict[str, Any]:
     values = dict(os.environ if env is None else env)
     config = load_unified_config(config_path, values)
+    sync_ranks = _sync_ranks(config)
     _initialize_storage_directories(config)
     dataset_root = resolve_dataset_root(config, values)
     loras_root = resolve_loras_root(config, values)
@@ -697,9 +713,10 @@ def run_unified_workflow(
         sync_records = (startup_sync or _sync_startup)(
             client=hub, config=config, repo_id=repo_id, repo_type=repo_type,
             loras_root=loras_root, work_root=worker_root, dry_run=dry_run,
+            ranks=sync_ranks,
         )
         first = scan_dataset_root(
-            dataset_root, exposures=int(discovery.get("target_exposures", 126)),
+            dataset_root, exposures=int(discovery.get("target_exposures", DEFAULT_TARGET_EXPOSURES)),
             default_trigger_word=str((config.get("queue") or {}).get("trigger_word", "Owhx")),
         )
         start = clock()
@@ -742,13 +759,13 @@ def run_unified_workflow(
                     ),
                     base_arch=canonical_base_arch,
                     base_model=canonical_base_model,
-                    exposures=int(discovery.get("target_exposures", 126)),
+                    exposures=int(discovery.get("target_exposures", DEFAULT_TARGET_EXPOSURES)),
                     minimum_free_bytes=int(
                         dataset_storage.get("minimum_free_bytes", 1_073_741_824)
                     ),
                 )
         second = scan_dataset_root(
-            dataset_root, exposures=int(discovery.get("target_exposures", 126)),
+            dataset_root, exposures=int(discovery.get("target_exposures", DEFAULT_TARGET_EXPOSURES)),
             default_trigger_word=str((config.get("queue") or {}).get("trigger_word", "Owhx")),
         )
         ledger, ledger_revision = ledger_store.reconcile(
@@ -859,7 +876,7 @@ def run_unified_workflow(
                 repo_id=repo_id, repo_type=repo_type, worker_id=worker_id,
             )
             before_training = {snapshot.folder: snapshot.fingerprint for snapshot in scan_dataset_root(
-                dataset_root, exposures=int(discovery.get("target_exposures", 126)),
+                dataset_root, exposures=int(discovery.get("target_exposures", DEFAULT_TARGET_EXPOSURES)),
                 default_trigger_word=str((config.get("queue") or {}).get("trigger_word", "Owhx")),
             )}
             if before_training.get(str(item["folder"])) != item["fingerprint"]:
@@ -928,14 +945,20 @@ def run_unified_workflow(
                     client=hub, repo_id=repo_id, repo_type=repo_type,
                     source_revision=str(record["revision"]), loras_root=loras_root,
                     work_dir=run_root / "sync-after-export",
-                    model_ids=(int(model["id"]),), ranks=(1,),
+                    model_ids=(int(model["id"]),), ranks=sync_ranks,
                     catalog_prefix=str((config.get("sync") or {}).get("catalog_prefix", "training-backups")),
                     results_prefix=str((config.get("sync") or {}).get("results_prefix", "training-results")),
                 )
                 if latest_result["status"] != "completed":
-                    raise BackupError(f"post-export top1 sync failed: {item['folder']}")
-                record["top1_sync_status"] = "completed"
+                    raise BackupError(f"post-export ranked sync failed: {item['folder']}")
+                record["rank_sync_status"] = "completed"
+                record["rank_sync_ranks"] = list(sync_ranks)
+                record["top1_sync_status"] = (
+                    "completed" if 1 in sync_ranks else "not-configured"
+                )
             else:
+                record["rank_sync_status"] = "unavailable"
+                record["rank_sync_ranks"] = list(sync_ranks)
                 record["top1_sync_status"] = "unavailable"
             _record_phase(phase_path, phase, "synced", completed_at=completed_at)
             archive_files: list[tuple[Path, str]] = [

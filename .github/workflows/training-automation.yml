@@ -33,6 +33,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_automated_tests:
+        description: "Skip automated suites for an explicitly reviewed source build"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,6 +45,7 @@ permissions:
 
 jobs:
   cpu-tests:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_automated_tests) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +68,13 @@ jobs:
           path: ${{ runner.temp }}/synthetic-training-report
 
   docker:
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'workflow_dispatch' &&
+        (needs.cpu-tests.result == 'success' ||
+          (inputs.skip_automated_tests && needs.cpu-tests.result == 'skipped'))
+      }}
     needs: cpu-tests
     runs-on: ubuntu-latest
     steps:
