@@ -909,3 +909,160 @@ def test_two_workers_download_ten_remote_folders_and_dispatch_each_once(tmp_path
     assert {
         item["base_model"] for item in model_catalog["models"]
     } == {"black-forest-labs/FLUX.2-klein-base-9B"}
+
+
+@pytest.mark.parametrize("failure_mode", ["malformed", "changed_between_observations"])
+def test_known_remote_observation_hold_blocks_stale_cache_but_keeps_valid_work(
+    tmp_path, monkeypatch, failure_mode,
+):
+    revision_a = "a" * 40
+    revision_b = "b" * 40
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    known = datasets / "0003-freya"
+    known.mkdir()
+    Image.new("RGB", (640, 960), (10, 20, 30)).save(known / "one.png")
+    (known / "one.txt").write_text("Owhx Freya", encoding="utf-8")
+    (known / ".training-automation.json").write_text(json.dumps({
+        "catalog_name": "Freya", "trigger_word": "Owhx",
+    }), encoding="utf-8")
+    known_snapshot = scan_dataset_root(datasets)[0]
+
+    valid_source = tmp_path / "valid-source"
+    _dataset(valid_source, "Valid Person")
+    valid_folder = valid_source / "Valid Person"
+
+    client = FakeHubClient()
+    client.revision = revision_a
+    known_files = []
+    for relative in known_snapshot.files:
+        payload = (known / relative).read_bytes()
+        remote_path = f"datasets/Training_Def_Owhx_Freya/{relative}"
+        client.remote[remote_path] = payload
+        known_files.append({
+            "relative_path": relative, "remote_path": remote_path,
+            "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+            "blob_id": None,
+        })
+    valid_files = []
+    for local in sorted(valid_folder.iterdir()):
+        payload = local.read_bytes()
+        remote_path = f"datasets/Valid Person/{local.name}"
+        client.remote[remote_path] = payload
+        valid_files.append({
+            "relative_path": local.name, "remote_path": remote_path,
+            "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+            "blob_id": None,
+        })
+    client.remote["training-backups/catalog.json"] = json.dumps({
+        "schema_version": 2,
+        "models": [{
+            "id": 3, "name": "Freya", "folder": "0003-freya",
+            "base_arch": "flux2_klein_9b",
+            "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+            "trigger_word": "Owhx", "destination_kind": "loras",
+            "checkpoints": [], "selected_checkpoint_id": None, "selection": None,
+        }],
+    }).encode()
+    client.remote["training-automation/dataset-catalog.json"] = json.dumps({
+        "schema_version": 1,
+        "datasets": [{
+            "id": 3, "name": "Freya", "canonical_folder": "0003-freya",
+            "trigger_word": "Owhx", "fingerprint": known_snapshot.fingerprint,
+            "image_count": 1,
+            "sources": [{
+                "remote_folder": "datasets/Training_Def_Owhx_Freya",
+                "revision": revision_a,
+                "files": [{key: item[key] for key in (
+                    "relative_path", "remote_path", "size", "sha256"
+                )} for item in known_files],
+            }],
+        }],
+    }).encode()
+    client.remote["training-automation/workflow-ledger.json"] = json.dumps({
+        "schema_version": 1,
+        "datasets": {"0003-freya": {
+            **known_snapshot.__dict__, "files": list(known_snapshot.files),
+            "status": "ready", "worker": 0,
+        }},
+    }).encode()
+    client.snapshots = {revision_a: dict(client.remote)}
+    changed_snapshot = dict(client.remote)
+    changed_snapshot["datasets/Training_Def_Owhx_Freya/one.txt"] = b"changed midway"
+    client.snapshots[revision_b] = changed_snapshot
+
+    def observation(
+        remote_folder, name, files, revision, fingerprint,
+    ):
+        return {
+            "remote_folder": remote_folder, "name": name,
+            "trigger_word": "Owhx", "files": files, "revision": revision,
+            "observation_fingerprint": fingerprint, "status": "valid",
+        }
+
+    known_first = observation(
+        "datasets/Training_Def_Owhx_Freya", "Training_Def_Owhx_Freya",
+        known_files, revision_a, "1" * 64,
+    )
+    if failure_mode == "malformed":
+        known_second = {
+            "remote_folder": "datasets/Training_Def_Owhx_Freya",
+            "revision": revision_a, "status": "held",
+            "reason": "BackupError: remote dataset images require one matching caption",
+        }
+    else:
+        changed_files = [dict(item) for item in known_files]
+        changed_files[1].update({
+            "size": len(b"changed midway"),
+            "sha256": hashlib.sha256(b"changed midway").hexdigest(),
+        })
+        known_second = observation(
+            "datasets/Training_Def_Owhx_Freya", "Training_Def_Owhx_Freya",
+            changed_files, revision_b, "2" * 64,
+        )
+    valid_observation = observation(
+        "datasets/Valid Person", "Valid Person", valid_files,
+        revision_a, "3" * 64,
+    )
+    observations = iter((
+        {
+            "datasets/Training_Def_Owhx_Freya": known_first,
+            "datasets/Valid Person": valid_observation,
+        },
+        {
+            "datasets/Training_Def_Owhx_Freya": known_second,
+            "datasets/Valid Person": valid_observation,
+        },
+    ))
+    monkeypatch.setattr(
+        unified_module, "observe_remote_datasets", lambda **kwargs: next(observations)
+    )
+    (tmp_path / "ComfyUI" / "models" / "loras").mkdir(parents=True)
+    config_path = _config(tmp_path, 0, 1)
+    config = yaml.safe_load(config_path.read_text())
+    config["dataset_storage"] = {
+        "enabled": True, "remote_prefix": "datasets",
+        "catalog_path": "training-automation/dataset-catalog.json",
+        "base_arch": "flux2_klein_9b",
+        "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+        "minimum_free_bytes": 0,
+    }
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    result = run_unified_workflow(
+        config_path, env={"HF_TOKEN": "secret"}, client=client,
+        dry_run=True, sleep=lambda _: None, clock=lambda: 100,
+        startup_sync=lambda **kwargs: [],
+    )
+    assert result["status"] == "ready"
+    assert result["pending"] == ["0004-valid-person"]
+    assert all(item != "0003-freya" for item in result["pending"])
+    remote_hold = next(
+        item for item in result["remote_datasets"]["held"]
+        if item["remote_folder"] == "datasets/Training_Def_Owhx_Freya"
+    )
+    assert remote_hold["canonical_folder"] == "0003-freya"
+    assert remote_hold["fingerprint"] == known_snapshot.fingerprint
+    assert any(item["status"] == "remote-held" for item in result["held"])
+    ledger = json.loads(client.remote["training-automation/workflow-ledger.json"])
+    assert ledger["datasets"]["0003-freya"]["status"] == "changed"

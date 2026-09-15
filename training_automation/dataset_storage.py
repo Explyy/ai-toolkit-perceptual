@@ -556,24 +556,43 @@ def sync_remote_datasets(
     )
     installed = []
     held = []
+
+    def hold(
+        remote_folder: str, reason: Any,
+        known: tuple[Mapping[str, Any], Mapping[str, Any]] | None,
+    ) -> None:
+        failure = {"remote_folder": remote_folder, "reason": str(reason)}
+        if known is not None:
+            record, _ = known
+            failure.update({
+                "canonical_folder": record["canonical_folder"],
+                "dataset_id": int(record["id"]),
+                "fingerprint": record["fingerprint"],
+            })
+        held.append(failure)
+
     for remote_folder in sorted(set(first) | set(second)):
         known: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None
+        try:
+            known = dataset_store.source_record(remote_folder)
+        except Exception as exc:
+            hold(remote_folder, f"{type(exc).__name__}: {exc}", known)
+            continue
         before = first.get(remote_folder)
         candidate = second.get(remote_folder)
         if not before or not candidate:
-            held.append({"remote_folder": remote_folder, "reason": "remote upload is not stable across both observations"})
+            hold(remote_folder, "remote upload is not stable across both observations", known)
             continue
         if candidate.get("status") != "valid":
-            held.append({"remote_folder": remote_folder, "reason": candidate.get("reason")})
+            hold(remote_folder, candidate.get("reason"), known)
             continue
         if (
             before.get("status") != "valid"
             or before.get("observation_fingerprint") != candidate.get("observation_fingerprint")
         ):
-            held.append({"remote_folder": remote_folder, "reason": "remote upload changed during the quiet interval"})
+            hold(remote_folder, "remote upload changed during the quiet interval", known)
             continue
         try:
-            known = dataset_store.source_record(remote_folder)
             if known is not None:
                 record, source = known
                 candidate = {
@@ -649,18 +668,7 @@ def sync_remote_datasets(
                 "catalog_revision": catalog_revision,
             })
         except Exception as exc:
-            failure = {
-                "remote_folder": remote_folder,
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
-            if known is not None:
-                record, _ = known
-                failure.update({
-                    "canonical_folder": record["canonical_folder"],
-                    "dataset_id": int(record["id"]),
-                    "fingerprint": record["fingerprint"],
-                })
-            held.append(failure)
+            hold(remote_folder, f"{type(exc).__name__}: {exc}", known)
     return {"schema_version": 1, "installed": installed, "held": held}
 
 
