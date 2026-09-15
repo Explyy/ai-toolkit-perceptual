@@ -13,6 +13,7 @@ from .state import atomic_write_json, read_json
 
 
 STATE_SCHEMA = 2
+PATH_METADATA_BATCH_SIZE = 100
 
 
 class BackupError(RuntimeError):
@@ -88,21 +89,25 @@ class HuggingFaceBackupClient:
     def path_metadata(
         self, repo_id: str, repo_type: str, paths: list[str], revision: str
     ) -> Mapping[str, Mapping[str, Any]]:
-        entries = self._api.get_paths_info(
-            repo_id=repo_id, repo_type=repo_type, paths=paths, revision=revision
-        )
         result: dict[str, dict[str, Any]] = {}
-        for entry in entries:
-            lfs = getattr(entry, "lfs", None)
-            lfs_sha = None
-            if isinstance(lfs, dict):
-                lfs_sha = lfs.get("sha256") or lfs.get("oid")
-            elif lfs is not None:
-                lfs_sha = getattr(lfs, "sha256", None) or getattr(lfs, "oid", None)
-            result[str(entry.path)] = {
-                "size": getattr(entry, "size", None),
-                "sha256": lfs_sha,
-            }
+        for start in range(0, len(paths), PATH_METADATA_BATCH_SIZE):
+            entries = self._api.get_paths_info(
+                repo_id=repo_id,
+                repo_type=repo_type,
+                paths=paths[start:start + PATH_METADATA_BATCH_SIZE],
+                revision=revision,
+            )
+            for entry in entries:
+                lfs = getattr(entry, "lfs", None)
+                lfs_sha = None
+                if isinstance(lfs, dict):
+                    lfs_sha = lfs.get("sha256") or lfs.get("oid")
+                elif lfs is not None:
+                    lfs_sha = getattr(lfs, "sha256", None) or getattr(lfs, "oid", None)
+                result[str(entry.path)] = {
+                    "size": getattr(entry, "size", None),
+                    "sha256": lfs_sha,
+                }
         return result
 
     def read_remote_file(self, repo_id: str, repo_type: str, path: str) -> tuple[bytes | None, str]:

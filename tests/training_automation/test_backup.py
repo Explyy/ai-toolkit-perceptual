@@ -1,16 +1,118 @@
 import json
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from training_automation.backup import BackupConfigurationError, BackupError, CheckpointBackup
+from training_automation.backup import (
+    BackupConfigurationError,
+    BackupError,
+    CheckpointBackup,
+    HuggingFaceBackupClient,
+    LocalArtifact,
+    verify_remote_artifacts,
+)
 from training_automation.catalog import CatalogStore, restore_generation, restore_training
 FAKE_SPEC = importlib.util.spec_from_file_location("training_automation_test_fakes", Path(__file__).with_name("fakes.py"))
 FAKE_MODULE = importlib.util.module_from_spec(FAKE_SPEC)
 assert FAKE_SPEC.loader is not None
 FAKE_SPEC.loader.exec_module(FAKE_MODULE)
 FakeHubClient = FAKE_MODULE.FakeHubClient
+
+
+class PathsInfoApi:
+    def __init__(self, *, fail_call: int | None = None, omit: str | None = None):
+        self.calls = []
+        self.fail_call = fail_call
+        self.omit = omit
+
+    def get_paths_info(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == self.fail_call:
+            raise RuntimeError("Hub metadata request failed")
+        return [
+            SimpleNamespace(
+                path=path,
+                size=len(path.encode()),
+                lfs={"sha256": f"sha-{path}"},
+            )
+            for path in kwargs["paths"]
+            if path != self.omit
+        ]
+
+
+def metadata_client(api: PathsInfoApi) -> HuggingFaceBackupClient:
+    client = HuggingFaceBackupClient.__new__(HuggingFaceBackupClient)
+    client._api = api
+    return client
+
+
+def test_hugging_face_metadata_batches_large_requests_at_one_revision():
+    api = PathsInfoApi()
+    client = metadata_client(api)
+    unique_paths = [f"archive/evidence/sample-{index:03}.png" for index in range(205)]
+    requested = unique_paths + [unique_paths[0]]
+
+    metadata = client.path_metadata(
+        "owner/private", "dataset", requested, "immutable-revision"
+    )
+
+    assert [len(call["paths"]) for call in api.calls] == [100, 100, 6]
+    assert all(
+        (call["repo_id"], call["repo_type"], call["revision"])
+        == ("owner/private", "dataset", "immutable-revision")
+        for call in api.calls
+    )
+    assert set(metadata) == set(unique_paths)
+    assert metadata[unique_paths[-1]] == {
+        "size": len(unique_paths[-1].encode()),
+        "sha256": f"sha-{unique_paths[-1]}",
+    }
+
+
+def test_hugging_face_metadata_empty_request_avoids_api_call():
+    api = PathsInfoApi()
+    assert metadata_client(api).path_metadata(
+        "owner/private", "dataset", [], "immutable-revision"
+    ) == {}
+    assert api.calls == []
+
+
+def test_hugging_face_metadata_later_batch_error_propagates():
+    api = PathsInfoApi(fail_call=2)
+    paths = [f"archive/evidence/{index:03}.png" for index in range(101)]
+    with pytest.raises(RuntimeError, match="Hub metadata request failed"):
+        metadata_client(api).path_metadata(
+            "owner/private", "dataset", paths, "immutable-revision"
+        )
+    assert [len(call["paths"]) for call in api.calls] == [100, 1]
+
+
+def test_batched_metadata_missing_entry_fails_remote_verification(tmp_path):
+    paths = [f"archive/evidence/{index:03}.png" for index in range(101)]
+    missing_path = paths[-1]
+    api = PathsInfoApi(omit=missing_path)
+    artifacts = [
+        LocalArtifact(
+            local_path=str(tmp_path / f"unused-{index}"),
+            remote_path=path,
+            size=len(path.encode()),
+            sha256=f"sha-{path}",
+        )
+        for index, path in enumerate(paths)
+    ]
+
+    with pytest.raises(BackupError, match=f"size verification failed for {missing_path}"):
+        verify_remote_artifacts(
+            metadata_client(api),
+            repo_id="owner/private",
+            repo_type="dataset",
+            artifacts=artifacts,
+            revision="immutable-revision",
+            context="archive",
+        )
+    assert [len(call["paths"]) for call in api.calls] == [100, 1]
 
 
 def make_backup(tmp_path: Path, client: FakeHubClient, **kwargs) -> CheckpointBackup:
