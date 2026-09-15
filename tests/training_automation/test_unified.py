@@ -798,3 +798,114 @@ def test_hf_seed_rehydrates_empty_cache_migrates_legacy_and_second_startup_is_id
             "changed_known_source": held,
             "trainer_calls": calls,
         }, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def test_two_workers_download_ten_remote_folders_and_dispatch_each_once(tmp_path):
+    (tmp_path / "datasets").mkdir()
+    (tmp_path / "ComfyUI" / "models" / "loras").mkdir(parents=True)
+    source_root = tmp_path / "remote-payloads"
+    source_root.mkdir()
+
+    class ConcurrentImmutableHub(FakeHubClient):
+        def __init__(self):
+            super().__init__()
+            self.guard = threading.RLock()
+            self.revision_number = 0
+            self.revision = "d" * 40
+            self.snapshots = {}
+
+        def commit_files(self, repo_id, repo_type, artifacts, message, parent_commit=None):
+            with self.guard:
+                if parent_commit is not None and parent_commit != self.revision:
+                    raise RuntimeError("parent conflict")
+                updated = dict(self.remote)
+                for artifact in artifacts:
+                    updated[artifact.remote_path] = Path(artifact.local_path).read_bytes()
+                self.remote = updated
+                self.revision_number += 1
+                self.revision = hashlib.sha1(
+                    f"concurrent-immutable-{self.revision_number}".encode()
+                ).hexdigest()
+                self.snapshots[self.revision] = dict(updated)
+                self.messages.append(message)
+                return self.revision
+
+        def read_remote_file(self, *args):
+            with self.guard:
+                return super().read_remote_file(*args)
+
+        def path_metadata(self, *args):
+            with self.guard:
+                return super().path_metadata(*args)
+
+        def list_repo_files(self, *args):
+            with self.guard:
+                return super().list_repo_files(*args)
+
+        def download_file(self, *args):
+            with self.guard:
+                return super().download_file(*args)
+
+    client = ConcurrentImmutableHub()
+    client.remote["training-backups/catalog.json"] = json.dumps({
+        "schema_version": 2, "models": [],
+    }).encode()
+    client.remote["training-automation/dataset-catalog.json"] = json.dumps({
+        "schema_version": 1, "datasets": [],
+    }).encode()
+    for index in range(10):
+        folder = source_root / f"Person {index:02d} Surname"
+        folder.mkdir()
+        Image.new("RGB", (640, 960), (10 + index, 20, 30)).save(folder / "one.png")
+        (folder / "one.txt").write_text(
+            f"Owhx subject number {index}", encoding="utf-8"
+        )
+        for local in folder.iterdir():
+            client.remote[f"datasets/{folder.name}/{local.name}"] = local.read_bytes()
+    client.snapshots[client.revision] = dict(client.remote)
+
+    config_path = _config(tmp_path, 0, 1)
+    config = yaml.safe_load(config_path.read_text())
+    config["dataset_storage"] = {
+        "enabled": True, "remote_prefix": "datasets",
+        "catalog_path": "training-automation/dataset-catalog.json",
+        "base_arch": "flux2_klein_9b",
+        "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+        "minimum_free_bytes": 0,
+    }
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    published = []
+    published_guard = threading.Lock()
+
+    def publisher(**kwargs):
+        with published_guard:
+            published.append(kwargs["job_id"])
+        return {"status": "available", "revision": client.revision}, []
+
+    def run_worker(worker_id):
+        return run_unified_workflow(
+            config_path,
+            env={
+                "HF_TOKEN": "secret", "TRAINING_WORKER_ID": str(worker_id),
+                "TRAINING_WORKER_COUNT": "2",
+            },
+            client=client, queue_factory=FakeQueue, sleep=lambda _: None,
+            clock=lambda: 100, startup_sync=lambda **kwargs: [], publisher=publisher,
+            latest_sync=lambda **kwargs: {"status": "completed"},
+            archive_factory=FakeArchive,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(run_worker, (0, 1)))
+    assert {item["worker_id"] for item in results} == {0, 1}
+    assert len(published) == 10 and len(set(published)) == 10
+    assert len(list((tmp_path / "datasets").glob("[0-9][0-9][0-9][0-9]-*"))) == 10
+    dataset_catalog = json.loads(
+        client.remote["training-automation/dataset-catalog.json"]
+    )
+    model_catalog = json.loads(client.remote["training-backups/catalog.json"])
+    assert [item["id"] for item in dataset_catalog["datasets"]] == list(range(1, 11))
+    assert [item["id"] for item in model_catalog["models"]] == list(range(1, 11))
+    assert {
+        item["base_model"] for item in model_catalog["models"]
+    } == {"black-forest-labs/FLUX.2-klein-base-9B"}

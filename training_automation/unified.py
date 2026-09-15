@@ -659,6 +659,8 @@ def run_unified_workflow(
     process = recipe["config"]["process"][0]
     dataset_storage = config.get("dataset_storage") or {}
     remote_storage_enabled = bool(dataset_storage.get("enabled", False))
+    catalog_base_arch = str(process["model"]["arch"])
+    catalog_base_model = str(process["model"]["name_or_path"])
     ledger_store = WorkflowLedgerStore(
         client=hub, repo_id=repo_id, repo_type=repo_type,
         remote_path=str(discovery.get("ledger_path", "training-automation/workflow-ledger.json")),
@@ -675,6 +677,8 @@ def run_unified_workflow(
                 raise BackupConfigurationError(
                     "dataset_storage requires canonical base_model and base_arch metadata"
                 )
+            catalog_base_arch = canonical_base_arch
+            catalog_base_model = canonical_base_model
             dataset_catalog_path = str(
                 dataset_storage.get(
                     "catalog_path", "training-automation/dataset-catalog.json"
@@ -823,8 +827,8 @@ def run_unified_workflow(
         runs: list[dict[str, Any]] = []
         for item in candidates:
             model, _ = store.ensure_model({
-                "name": item["name"], "base_arch": process["model"]["arch"],
-                "base_model": process["model"]["name_or_path"],
+                "name": item["name"], "base_arch": catalog_base_arch,
+                "base_model": catalog_base_model,
                 "trigger_word": str(item["trigger_word"]),
                 "destination_kind": "loras",
             })
