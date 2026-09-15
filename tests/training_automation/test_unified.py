@@ -64,7 +64,7 @@ def _dataset(root: Path, name: str):
     (folder / "one.txt").write_text("Owhx subject", encoding="utf-8")
 
 
-def _config(tmp_path: Path, worker_id: int) -> Path:
+def _config(tmp_path: Path, worker_id: int, worker_count: int = 2) -> Path:
     path = tmp_path / f"unified-{worker_id}.yaml"
     path.write_text(yaml.safe_dump({
         "schema_version": 1,
@@ -72,7 +72,7 @@ def _config(tmp_path: Path, worker_id: int) -> Path:
         "loras_root": str(tmp_path / "ComfyUI" / "models" / "loras"),
         "work_root": str(tmp_path / "automation" / f"worker-{worker_id}"),
         "hub": {"repo_id": "owner/private", "repo_type": "dataset", "token_env": "HF_TOKEN"},
-        "worker": {"id": worker_id, "count": 2},
+        "worker": {"id": worker_id, "count": worker_count},
         "sync": {"catalog_prefix": "training-backups", "results_prefix": "training-results"},
         "discovery": {
             "quiet_seconds": 0, "target_exposures": 126,
@@ -140,7 +140,8 @@ def test_two_workers_finish_ten_disjoint_jobs_and_repeated_startup_is_idle(tmp_p
     )
     first = run_unified_workflow(_config(tmp_path, 0), **common)
     second = run_unified_workflow(_config(tmp_path, 1), **common)
-    assert first["status"] == second["status"] == "completed"
+    assert first["status"] in {"completed", "idle"}
+    assert second["status"] in {"completed", "idle"}
     assert len(published) == 10 and len(set(published)) == 10
     idle = run_unified_workflow(_config(tmp_path, 0), dry_run=True, **common)
     assert idle["status"] == "idle" and idle["pending"] == []
@@ -167,10 +168,10 @@ def test_changed_completed_dataset_is_held_not_retrained(tmp_path):
         publisher=lambda **kwargs: ({"status": "available", "revision": client.revision}, []),
         latest_sync=lambda **kwargs: {"status": "completed"}, archive_factory=FakeArchive,
     )
-    completed = run_unified_workflow(_config(tmp_path, 0), **common)
+    completed = run_unified_workflow(_config(tmp_path, 0, 1), **common)
     assert completed["status"] == "completed"
     (datasets / "Ada_Lovelace" / "one.txt").write_text("changed", encoding="utf-8")
-    held = run_unified_workflow(_config(tmp_path, 0), dry_run=True, **common)
+    held = run_unified_workflow(_config(tmp_path, 0, 1), dry_run=True, **common)
     assert held["status"] == "held"
     assert held["held"][0]["folder"] == "Ada_Lovelace"
     ledger = json.loads(client.remote["training-automation/workflow-ledger.json"])

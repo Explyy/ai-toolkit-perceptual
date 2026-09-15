@@ -92,7 +92,7 @@ def test_remote_ledger_quiet_period_assignments_completion_and_changed_hold(tmp_
         snapshots, worker_count=2, quiet_seconds=60, now=160
     )
     assert {item["status"] for item in second["datasets"].values()} == {"ready"}
-    assert all(item["worker"] == assigned_worker(item["fingerprint"], 2)
+    assert all(item["worker"] == assigned_worker(item["fingerprint"], 2, item["folder"])
                for item in second["datasets"].values())
     selected = snapshots[0]
     store.update_status(selected.folder, selected.fingerprint, "completed")

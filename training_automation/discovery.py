@@ -201,10 +201,11 @@ def scan_dataset_root(
     return sorted(snapshots, key=lambda item: (safe_name(item.name), item.folder.casefold()))
 
 
-def assigned_worker(fingerprint: str, worker_count: int) -> int:
+def assigned_worker(fingerprint: str, worker_count: int, folder: str = "") -> int:
     if worker_count <= 0:
         raise BackupError("worker_count must be positive")
-    return int(fingerprint[:16], 16) % worker_count
+    identity = hashlib.sha256(f"{folder}\0{fingerprint}".encode("utf-8")).hexdigest()
+    return int(identity[:16], 16) % worker_count
 
 
 class WorkflowLedgerStore:
@@ -267,7 +268,9 @@ class WorkflowLedgerStore:
                         **snapshot_data,
                         "status": "observing",
                         "first_observed_at": now,
-                        "worker": assigned_worker(snapshot.fingerprint, worker_count),
+                        "worker": assigned_worker(
+                            snapshot.fingerprint, worker_count, snapshot.folder
+                        ),
                     }
                     continue
                 if current.get("fingerprint") != snapshot.fingerprint:
