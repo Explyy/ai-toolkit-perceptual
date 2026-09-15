@@ -667,6 +667,14 @@ def run_unified_workflow(
     with _controller_lock(worker_root / "controller.lock"):
         remote_first: dict[str, dict[str, Any]] = {}
         if remote_storage_enabled:
+            canonical_base_model = str(dataset_storage.get("base_model") or "").strip()
+            canonical_base_arch = str(
+                dataset_storage.get("base_arch") or process["model"]["arch"]
+            ).strip()
+            if not canonical_base_model or not canonical_base_arch:
+                raise BackupConfigurationError(
+                    "dataset_storage requires canonical base_model and base_arch metadata"
+                )
             dataset_catalog_path = str(
                 dataset_storage.get(
                     "catalog_path", "training-automation/dataset-catalog.json"
@@ -728,8 +736,8 @@ def run_unified_workflow(
                         f"{safe_relative_path(str((config.get('sync') or {}).get('catalog_prefix', 'training-backups'))).as_posix()}"
                         "/catalog.json"
                     ),
-                    base_arch=str(process["model"]["arch"]),
-                    base_model=str(process["model"]["name_or_path"]),
+                    base_arch=canonical_base_arch,
+                    base_model=canonical_base_model,
                     exposures=int(discovery.get("target_exposures", 126)),
                     minimum_free_bytes=int(
                         dataset_storage.get("minimum_free_bytes", 1_073_741_824)
@@ -747,6 +755,21 @@ def run_unified_workflow(
                 for item in (remote_dataset_sync or {}).get("installed", [])
             ),
         )
+        for remote_hold in (remote_dataset_sync or {}).get("held", []):
+            canonical = remote_hold.get("canonical_folder")
+            fingerprint = remote_hold.get("fingerprint")
+            local_record = ledger["datasets"].get(canonical)
+            if (
+                canonical and fingerprint and isinstance(local_record, Mapping)
+                and local_record.get("fingerprint") == fingerprint
+                and local_record.get("status") != "completed"
+            ):
+                reason = f"remote dataset held: {remote_hold.get('reason')}"
+                ledger_revision = ledger_store.update_status(
+                    canonical, fingerprint, "changed", details={"reason": reason}
+                )
+                local_record["status"] = "changed"
+                local_record["reason"] = reason
         invalid_assignments = [
             item["folder"] for item in ledger["datasets"].values()
             if item.get("status") not in {"completed", "changed"}
@@ -780,6 +803,11 @@ def run_unified_workflow(
                 if item.get("status") in {"changed", "incomplete", "observing"}
                 and int(item.get("worker", worker_id)) == worker_id
             ]
+            held.extend({
+                "remote_folder": item.get("remote_folder"),
+                "folder": item.get("canonical_folder"),
+                "status": "remote-held", "reason": item.get("reason"),
+            } for item in (remote_dataset_sync or {}).get("held", []))
             summary["held"] = held
             summary["status"] = "ready" if candidates else ("held" if held else "idle")
             summary["dry_run"] = dry_run

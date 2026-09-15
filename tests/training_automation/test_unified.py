@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import sqlite3
 import threading
@@ -9,6 +10,7 @@ import yaml
 import pytest
 from PIL import Image
 
+from training_automation.discovery import scan_dataset_root
 from training_automation.queue import TrainingQueue
 from training_automation.state import atomic_write_json, read_json
 from training_automation.unified import (
@@ -634,3 +636,142 @@ def test_two_workers_with_same_work_root_use_disjoint_mutable_staging(tmp_path):
     }
     assert ledger_staging == {"worker-0", "worker-1"}
     assert catalog_staging == {"worker-0", "worker-1"}
+
+
+def test_hf_seed_rehydrates_empty_cache_migrates_legacy_and_second_startup_is_idle(tmp_path):
+    revision_a = "a" * 40
+    source_root = tmp_path / "remote-source"
+    source_root.mkdir()
+    _dataset(source_root, "Training_Def_Owhx_Freya")
+    source = source_root / "Training_Def_Owhx_Freya"
+    snapshot = scan_dataset_root(source_root)[0]
+
+    class ImmutableHub(FakeHubClient):
+        def __init__(self):
+            super().__init__()
+            self.revision = revision_a
+            self.revision_number = 0
+            self.snapshots = {}
+
+        def commit_files(self, repo_id, repo_type, artifacts, message, parent_commit=None):
+            if parent_commit is not None and parent_commit != self.revision:
+                raise RuntimeError("parent conflict")
+            updated = dict(self.remote)
+            for artifact in artifacts:
+                updated[artifact.remote_path] = Path(artifact.local_path).read_bytes()
+            self.remote = updated
+            self.revision_number += 1
+            self.revision = hashlib.sha1(
+                f"immutable-test-revision-{self.revision_number}".encode()
+            ).hexdigest()
+            self.snapshots[self.revision] = dict(updated)
+            self.messages.append(message)
+            return self.revision
+
+    client = ImmutableHub()
+    source_files = []
+    for relative in snapshot.files:
+        payload = (source / relative).read_bytes()
+        remote_path = f"datasets/Training_Def_Owhx_Freya/{relative}"
+        client.remote[remote_path] = payload
+        source_files.append({
+            "relative_path": relative, "remote_path": remote_path,
+            "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    client.remote["training-backups/catalog.json"] = json.dumps({
+        "schema_version": 2,
+        "models": [{
+            "id": 3, "name": "Freya", "folder": "0003-freya",
+            "base_arch": "flux2_klein_9b",
+            "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+            "trigger_word": "Owhx", "destination_kind": "loras",
+            "checkpoints": [], "selected_checkpoint_id": None, "selection": None,
+        }],
+    }).encode()
+    client.remote["training-automation/dataset-catalog.json"] = json.dumps({
+        "schema_version": 1,
+        "datasets": [{
+            "id": 3, "name": "Freya", "canonical_folder": "0003-freya",
+            "trigger_word": "Owhx", "fingerprint": snapshot.fingerprint,
+            "image_count": snapshot.image_count,
+            "sources": [{
+                "remote_folder": "datasets/Training_Def_Owhx_Freya",
+                "revision": revision_a, "files": source_files,
+            }],
+        }],
+    }).encode()
+    legacy_path = "training-automation/legacy-completed-datasets.json"
+    client.remote[legacy_path] = json.dumps({
+        "schema_version": 1,
+        "datasets": {
+            "Training_Def_Owhx_Freya": {
+                "fingerprint": snapshot.fingerprint, "catalog_id": 3,
+                "catalog_name": "Freya", "trigger_word": "Owhx",
+                "run_id": "historical-completed-run",
+            },
+        },
+    }).encode()
+    client.snapshots[revision_a] = dict(client.remote)
+
+    (tmp_path / "datasets").mkdir()
+    (tmp_path / "ComfyUI" / "models" / "loras").mkdir(parents=True)
+    config_path = _config(tmp_path, 0, 1)
+    config = yaml.safe_load(config_path.read_text())
+    config["dataset_storage"] = {
+        "enabled": True, "remote_prefix": "datasets",
+        "catalog_path": "training-automation/dataset-catalog.json",
+        "base_arch": "flux2_klein_9b",
+        "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+        "minimum_free_bytes": 0,
+    }
+    config["discovery"]["legacy_completed_index"] = {
+        "path": legacy_path, "revision": revision_a,
+    }
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    calls = []
+    class RejectTrainingQueue(FakeQueue):
+        def run(self):
+            calls.append("train")
+            raise AssertionError("completed seeded dataset must not train")
+
+    common = dict(
+        env={"HF_TOKEN": "secret"}, client=client,
+        queue_factory=RejectTrainingQueue, sleep=lambda _: None, clock=lambda: 100,
+        startup_sync=lambda **kwargs: [], dry_run=False,
+    )
+    first = run_unified_workflow(config_path, **common)
+    assert first["status"] == "idle"
+    assert first["remote_datasets"]["installed"][0]["status"] == "installed"
+    assert (tmp_path / "datasets" / "0003-freya" / "one.png").is_file()
+    ledger = json.loads(client.remote["training-automation/workflow-ledger.json"])
+    assert list(ledger["datasets"]) == ["0003-freya"]
+    assert ledger["datasets"]["0003-freya"]["status"] == "completed"
+    assert ledger["datasets"]["0003-freya"]["folder_aliases"] == [
+        "Training_Def_Owhx_Freya"
+    ]
+
+    second = run_unified_workflow(config_path, **common)
+    assert second["status"] == "idle"
+    assert second["remote_datasets"]["installed"][0]["status"] == "already-present"
+    assert calls == []
+
+    pending_ledger = json.loads(client.remote["training-automation/workflow-ledger.json"])
+    pending_ledger["datasets"]["0003-freya"]["status"] = "ready"
+    client.remote["training-automation/workflow-ledger.json"] = json.dumps(
+        pending_ledger
+    ).encode()
+    client.remote["datasets/Training_Def_Owhx_Freya/one.txt"] = b"changed source"
+    client.revision_number += 1
+    client.revision = hashlib.sha1(
+        f"immutable-test-revision-{client.revision_number}".encode()
+    ).hexdigest()
+    client.snapshots[client.revision] = dict(client.remote)
+
+    held = run_unified_workflow(config_path, **common)
+    assert held["status"] == "held" and held["pending"] == []
+    assert held["remote_datasets"]["installed"] == []
+    assert "known remote dataset source changed content" in held["held"][0]["reason"]
+    persisted = json.loads(client.remote["training-automation/workflow-ledger.json"])
+    assert persisted["datasets"]["0003-freya"]["status"] == "changed"
+    assert calls == []

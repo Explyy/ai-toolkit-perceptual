@@ -265,7 +265,11 @@ class WorkflowLedgerStore:
             ledger, parent = self.read()
             datasets = ledger["datasets"]
             for folder, record in (legacy_completed or {}).items():
-                if folder not in datasets:
+                already_migrated = any(
+                    item.get("fingerprint") == record.get("fingerprint")
+                    for item in datasets.values()
+                )
+                if folder not in datasets and not already_migrated:
                     datasets[folder] = dict(record)
             for snapshot in snapshots:
                 current = datasets.get(snapshot.folder)

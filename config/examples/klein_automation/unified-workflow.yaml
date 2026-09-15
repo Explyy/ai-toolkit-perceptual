@@ -25,6 +25,10 @@ dataset_storage:
   enabled: true
   remote_prefix: datasets
   catalog_path: training-automation/dataset-catalog.json
+  # Canonical immutable model identity recorded in both catalogs. This remains
+  # the Hub model name even when the trainer reads weights from a local path.
+  base_arch: flux2_klein_9b
+  base_model: black-forest-labs/FLUX.2-klein-base-9B
   # Leave at least 1 GiB free after staging the immutable dataset snapshot.
   minimum_free_bytes: 1073741824
 

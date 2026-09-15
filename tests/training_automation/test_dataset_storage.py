@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -13,6 +14,7 @@ from training_automation.dataset_storage import (
     upload_dataset_folder,
 )
 from training_automation.discovery import scan_dataset_root
+import training_automation.dataset_storage as dataset_storage
 
 
 FAKE_SPEC = importlib.util.spec_from_file_location(
@@ -163,6 +165,92 @@ def test_malformed_remote_folder_is_held_without_blocking_valid_dataset(tmp_path
     )
     assert result["installed"][0]["dataset_id"] == 3
     assert result["held"][0]["remote_folder"] == "datasets/Incomplete"
+
+
+def test_upload_that_changes_between_distinct_repo_heads_does_not_settle(tmp_path):
+    source = _folder(tmp_path / "source")
+    client = FakeHubClient()
+    _seed(client, source)
+    first = _observe(client, REVISION_A, tmp_path / "observe-a")
+    changed = b"Owhx person, upload still in progress"
+    client.remote["datasets/Training_Def_Owhx_Freya/image-0.txt"] = changed
+    revision_c = "c" * 40
+    client.snapshots[revision_c] = dict(client.remote)
+    second = _observe(client, revision_c, tmp_path / "observe-c")
+
+    result = _sync(client, first, second, tmp_path / "datasets", tmp_path / "cache")
+    assert result["installed"] == []
+    assert "changed during the quiet interval" in result["held"][0]["reason"]
+
+
+def test_known_remote_source_content_change_is_held_without_retraining(tmp_path):
+    source = _folder(tmp_path / "source")
+    client = FakeHubClient()
+    _seed(client, source)
+    client.remote["datasets/Training_Def_Owhx_Freya/image-0.txt"] = b"changed identity"
+    revision_c = "c" * 40
+    client.snapshots[revision_c] = dict(client.remote)
+    observed = _observe(client, revision_c, tmp_path / "observe")
+
+    result = _sync(client, observed, observed, tmp_path / "datasets", tmp_path / "cache")
+    assert result["installed"] == []
+    assert "known remote dataset source changed content" in result["held"][0]["reason"]
+
+
+def test_disk_preflight_holds_before_any_payload_download(tmp_path, monkeypatch):
+    source = _folder(tmp_path / "source")
+    client = FakeHubClient()
+    _seed(client, source)
+    observed = _observe(client, REVISION_B, tmp_path / "observe")
+    downloaded = []
+    original_download = client.download_file
+
+    def recording_download(*args):
+        downloaded.append(args[2])
+        return original_download(*args)
+
+    client.download_file = recording_download
+    monkeypatch.setattr(
+        dataset_storage.shutil, "disk_usage", lambda _: SimpleNamespace(free=1)
+    )
+    result = sync_remote_datasets(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        first=observed, second=observed, dataset_root=tmp_path / "datasets",
+        work_dir=tmp_path / "cache",
+        catalog_path="training-automation/dataset-catalog.json",
+        model_catalog_path="training-backups/catalog.json",
+        base_arch="flux2_klein_9b", base_model=BASE_MODEL,
+        minimum_free_bytes=1,
+    )
+    assert result["installed"] == []
+    assert "insufficient disk space" in result["held"][0]["reason"]
+    assert downloaded == []
+
+
+def test_non_lfs_caption_uses_git_blob_identity_and_corruption_is_held(tmp_path):
+    source = _folder(tmp_path / "source")
+
+    class BlobCaptionClient(FakeHubClient):
+        def path_metadata(self, repo_id, repo_type, paths, revision):
+            result = super().path_metadata(repo_id, repo_type, paths, revision)
+            for path in paths:
+                if path.endswith(".txt"):
+                    result[path]["sha256"] = None
+            return result
+
+        def download_file(self, repo_id, repo_type, path, revision, destination):
+            super().download_file(repo_id, repo_type, path, revision, destination)
+            if path.endswith("image-0.txt"):
+                destination.write_bytes(b"xxxxxxxxxxx")
+
+    client = BlobCaptionClient()
+    _seed(client, source)
+    observed = _observe(client, REVISION_B, tmp_path / "observe")
+    assert observed["datasets/Training_Def_Owhx_Freya"]["status"] == "valid"
+    result = _sync(client, observed, observed, tmp_path / "datasets", tmp_path / "cache")
+    assert result["installed"] == []
+    assert "Git blob verification failed" in result["held"][0]["reason"]
+    assert not (tmp_path / "datasets" / "0003-freya").exists()
 
 
 def test_corrupt_download_never_publishes_canonical_folder(tmp_path):

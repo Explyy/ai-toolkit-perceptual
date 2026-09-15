@@ -555,6 +555,7 @@ def sync_remote_datasets(
     installed = []
     held = []
     for remote_folder in sorted(set(first) | set(second)):
+        known: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None
         before = first.get(remote_folder)
         candidate = second.get(remote_folder)
         if not before or not candidate:
@@ -646,10 +647,18 @@ def sync_remote_datasets(
                 "catalog_revision": catalog_revision,
             })
         except Exception as exc:
-            held.append({
+            failure = {
                 "remote_folder": remote_folder,
                 "reason": f"{type(exc).__name__}: {exc}",
-            })
+            }
+            if known is not None:
+                record, _ = known
+                failure.update({
+                    "canonical_folder": record["canonical_folder"],
+                    "dataset_id": int(record["id"]),
+                    "fingerprint": record["fingerprint"],
+                })
+            held.append(failure)
     return {"schema_version": 1, "installed": installed, "held": held}
 
 
