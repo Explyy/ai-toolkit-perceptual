@@ -45,7 +45,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pytest pyyaml pillow numpy
-      - run: python -m pytest -q tests/training_automation
+      - name: Run deterministic CPU suite and dataset-storage smoke
+        env:
+          TRAINING_DATASET_SMOKE_ARTIFACT: ${{ runner.temp }}/synthetic-training-report/dataset-storage-smoke.json
+        run: python -m pytest -q tests/training_automation
       - name: Render synthetic report review artifact
         env:
           TRAINING_REPORT_ARTIFACT_DIR: ${{ runner.temp }}/synthetic-training-report

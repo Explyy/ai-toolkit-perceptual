@@ -1,6 +1,7 @@
 import importlib.util
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +11,8 @@ import yaml
 import pytest
 from PIL import Image
 
+import training_automation.unified as unified_module
+from training_automation.cli import main as cli_main
 from training_automation.discovery import scan_dataset_root
 from training_automation.queue import TrainingQueue
 from training_automation.state import atomic_write_json, read_json
@@ -638,7 +641,9 @@ def test_two_workers_with_same_work_root_use_disjoint_mutable_staging(tmp_path):
     assert catalog_staging == {"worker-0", "worker-1"}
 
 
-def test_hf_seed_rehydrates_empty_cache_migrates_legacy_and_second_startup_is_idle(tmp_path):
+def test_hf_seed_rehydrates_empty_cache_migrates_legacy_and_second_startup_is_idle(
+    tmp_path, monkeypatch, capsys,
+):
     revision_a = "a" * 40
     source_root = tmp_path / "remote-source"
     source_root.mkdir()
@@ -751,7 +756,10 @@ def test_hf_seed_rehydrates_empty_cache_migrates_legacy_and_second_startup_is_id
         "Training_Def_Owhx_Freya"
     ]
 
-    second = run_unified_workflow(config_path, **common)
+    monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.setattr(unified_module, "HuggingFaceBackupClient", lambda _: client)
+    assert cli_main(["unified", str(config_path), "--dry-run"]) == 0
+    second = json.loads(capsys.readouterr().out)
     assert second["status"] == "idle"
     assert second["remote_datasets"]["installed"][0]["status"] == "already-present"
     assert calls == []
@@ -775,3 +783,14 @@ def test_hf_seed_rehydrates_empty_cache_migrates_legacy_and_second_startup_is_id
     persisted = json.loads(client.remote["training-automation/workflow-ledger.json"])
     assert persisted["datasets"]["0003-freya"]["status"] == "changed"
     assert calls == []
+    artifact = os.environ.get("TRAINING_DATASET_SMOKE_ARTIFACT")
+    if artifact:
+        output = Path(artifact)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({
+            "schema_version": 1,
+            "first_startup": first,
+            "second_startup_cli": second,
+            "changed_known_source": held,
+            "trainer_calls": calls,
+        }, indent=2, sort_keys=True), encoding="utf-8")

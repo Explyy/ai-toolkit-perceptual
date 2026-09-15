@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import training_automation.backup as backup
+import training_automation.dataset_storage as dataset_storage
 import training_automation.results as results
 import training_automation.unified as unified
 
@@ -161,3 +162,90 @@ def test_notebook_refresh_uses_run_id_and_hub_archive_only(tmp_path, monkeypatch
     assert namespace["result"]["model_weights_transferred"] is False
     assert captured["run_id"] == "e372619d-f4dc-4f4b-a2ba-b0df127e24fc"
     assert captured["job_ids"] == []
+
+
+def test_notebook_upload_executes_shared_verified_uploader(tmp_path, monkeypatch):
+    notebook = _notebook()
+    expected_revision = re.search(
+        r'SOURCE_REVISION = "([0-9a-f]{40})"', "\n".join(_code_cells(notebook))
+    ).group(1)
+    checkout = tmp_path / "checkout"
+    upload = tmp_path / "Nome Cognome"
+    upload.mkdir()
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["git", "clone"]:
+            Path(command[-1]).mkdir(parents=True)
+        if "rev-parse" in command:
+            return SimpleNamespace(stdout=expected_revision + "\n")
+        return SimpleNamespace(stdout="")
+
+    class Client:
+        def __init__(self, token):
+            assert token == "test-token"
+
+    captured = {}
+    def uploader(**kwargs):
+        captured.update(kwargs)
+        return {"status": "uploaded", "revision": "a" * 40}
+
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(backup, "HuggingFaceBackupClient", Client)
+    monkeypatch.setattr(dataset_storage, "upload_dataset_folder", uploader)
+    namespace = _execute(notebook, replacements=(
+        ('ACTION = "status"', 'ACTION = "upload"'),
+        ('SOURCE_CHECKOUT = "/tmp/ai-toolkit-perceptual-pinned"', f'SOURCE_CHECKOUT = {str(checkout)!r}'),
+        ('WORK_ROOT = "/storage/automation/unified"', f'WORK_ROOT = {str(tmp_path / "work")!r}'),
+        ('UPLOAD_FOLDER = "/storage/uploads/Nome Cognome"', f'UPLOAD_FOLDER = {str(upload)!r}'),
+    ))
+    assert namespace["result"]["status"] == "uploaded"
+    assert captured["folder"] == upload
+    assert captured["remote_folder_name"] == "Nome Cognome"
+    assert captured["catalog_name"] == "Nome Cognome"
+    assert captured["repo_id"] == "daverave/Personal"
+
+
+def test_notebook_index_runs_same_unified_storage_pipeline_read_only(tmp_path, monkeypatch):
+    notebook = _notebook()
+    expected_revision = re.search(
+        r'SOURCE_REVISION = "([0-9a-f]{40})"', "\n".join(_code_cells(notebook))
+    ).group(1)
+    checkout = tmp_path / "checkout"
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["git", "clone"]:
+            Path(command[-1]).mkdir(parents=True)
+        if "rev-parse" in command:
+            return SimpleNamespace(stdout=expected_revision + "\n")
+        return SimpleNamespace(stdout="")
+
+    class Client:
+        def __init__(self, token):
+            pass
+
+    captured = {}
+    def run(config_path, **kwargs):
+        captured["config"] = __import__("yaml").safe_load(config_path.read_text())
+        captured["kwargs"] = kwargs
+        return {
+            "status": "idle",
+            "remote_datasets": {"installed": [{"canonical_folder": "0007-nome-cognome"}]},
+        }
+
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(backup, "HuggingFaceBackupClient", Client)
+    monkeypatch.setattr(unified, "run_unified_workflow", run)
+    namespace = _execute(notebook, replacements=(
+        ('ACTION = "status"', 'ACTION = "index"'),
+        ('SOURCE_CHECKOUT = "/tmp/ai-toolkit-perceptual-pinned"', f'SOURCE_CHECKOUT = {str(checkout)!r}'),
+        ('WORK_ROOT = "/storage/automation/unified"', f'WORK_ROOT = {str(tmp_path / "work")!r}'),
+    ))
+    assert namespace["result"]["remote_datasets"]["installed"][0][
+        "canonical_folder"
+    ] == "0007-nome-cognome"
+    assert captured["kwargs"]["dry_run"] is True
+    assert captured["config"]["dataset_storage"]["base_model"] == (
+        "black-forest-labs/FLUX.2-klein-base-9B"
+    )
