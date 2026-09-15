@@ -23,6 +23,7 @@ RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/outp
     && python -m training_automation.recipe --unified /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-v2.yaml /app/ai-toolkit \
     && python -m training_automation.unified_supervisor --help >/dev/null \
     && python -m training_automation --help >/dev/null \
+    && python -m training_automation upload-dataset --help >/dev/null \
     && python -c "import sqlite3; c=sqlite3.connect('file:/app/ai-toolkit/aitk_db.db?mode=ro', uri=True); cols=[r[1] for r in c.execute('PRAGMA table_info(Settings)')]; assert cols == ['id','key','value']; c.close()" \
     && python -c "from training_automation.worker import worker_log_path; assert worker_log_path({'TRAINING_RUN_ID':'smoke','TRAINING_SHARD_ID':'a'}) == __import__('pathlib').Path('/storage/automation/smoke/a/worker.log')" \
     && python -m training_automation run /app/ai-toolkit/config/examples/klein_automation/automation.yaml --dry-run >/tmp/training-automation-dry-run.json \

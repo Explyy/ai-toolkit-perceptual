@@ -81,4 +81,5 @@ def test_docker_overlay_adds_one_opt_in_unified_gui_entrypoint_without_changing_
     assert 'worker-${worker_id}/supervisor.log' in command
     assert 'worker-${worker_id}/supervisor-state.json' in command
     assert "test -x /start.sh" in dockerfile
+    assert "python -m training_automation upload-dataset --help" in dockerfile
     assert "HF_TOKEN" not in command
