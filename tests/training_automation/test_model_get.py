@@ -52,6 +52,8 @@ class Opener:
             raise AssertionError(f"unexpected request: {request.full_url}")
         if isinstance(route, Exception):
             raise route
+        if isinstance(route, Response):
+            return route
         if callable(route):
             return route(request)
         return Response(route)
