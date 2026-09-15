@@ -56,5 +56,8 @@ class FakeHubClient:
         return self.remote.get(path), self.revision
 
     def download_file(self, repo_id, repo_type, path, revision, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(self.snapshots[revision][path])
 
+    def list_repo_files(self, repo_id, repo_type, revision):
+        return sorted(self.snapshots[revision])

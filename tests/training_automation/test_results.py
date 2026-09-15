@@ -22,6 +22,7 @@ from training_automation.results import (
     _wrap_text_pixels,
     publish_archived_run_results,
     publish_ranked_results,
+    refresh_archived_run_reports,
     render_contact_sheet,
 )
 
@@ -262,6 +263,7 @@ def test_publisher_creates_verified_top_three_without_changing_selection(tmp_pat
         sample_root=tmp_path / "samples",
         work_dir=tmp_path / "results",
         sleep=lambda _: None,
+        completed_at="2026-09-15T12:00:00+00:00",
     )
 
     assert record["status"] == "available"
@@ -295,6 +297,7 @@ def test_publisher_creates_verified_top_three_without_changing_selection(tmp_pat
     pointer = json.loads(client.remote["training-results/latest/0001-subject.json"])
     assert pointer["status"] == "completed"
     assert pointer["run_id"] == "run-1"
+    assert pointer["completed_at"] == "2026-09-15T12:00:00+00:00"
     assert pointer["evaluation_report_sha256"] == hashlib.sha256(report_path.read_bytes()).hexdigest()
     assert "training-results/run-1/0001-subject/index.json" in client.remote
     assert "training-results/run-1/0001-subject/evaluation-gallery.html" in client.remote
@@ -445,3 +448,113 @@ def test_archived_run_backfill_discovers_every_job_without_manual_choice(
 
     assert called == ["job-a", "job-b"]
     assert [item["job_id"] for item in records] == called
+
+
+def test_older_or_unknown_completion_never_replaces_newer_latest_pointer(tmp_path):
+    samples = _write_samples(tmp_path / "samples")
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(_report(samples)), encoding="utf-8")
+    client, _ = _catalog_and_client(_report(samples))
+
+    newest, _ = publish_ranked_results(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        run_id="run-new", job_id="subject-job", report_path=report_path,
+        sample_root=tmp_path / "samples", work_dir=tmp_path / "new",
+        completed_at="2026-09-15T12:00:00+00:00", sleep=lambda _: None,
+    )
+    assert newest["latest_pointer"] == "training-results/latest/0001-subject.json"
+    pointer_path = "training-results/latest/0001-subject.json"
+    newest_pointer = client.remote[pointer_path]
+
+    older, _ = publish_ranked_results(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        run_id="run-old", job_id="subject-job", report_path=report_path,
+        sample_root=tmp_path / "samples", work_dir=tmp_path / "old",
+        completed_at="2025-09-15T12:00:00+00:00", sleep=lambda _: None,
+    )
+    assert older["latest_pointer"] is None
+    assert client.remote[pointer_path] == newest_pointer
+
+    unknown, _ = publish_ranked_results(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        run_id="run-unknown", job_id="subject-job", report_path=report_path,
+        sample_root=tmp_path / "samples", work_dir=tmp_path / "unknown",
+        sleep=lambda _: None,
+    )
+    assert unknown["latest_pointer"] is None
+    assert client.remote[pointer_path] == newest_pointer
+
+
+def _install_archive(client, report, sample_root, *, corrupt=False):
+    run_id = "run-archive"
+    shard = "worker-a"
+    job_id = "subject-job"
+    root = f"training-archives/{run_id}/{shard}/evidence"
+    entries = []
+    payloads = {f"jobs/{job_id}/evaluation.json": json.dumps(report).encode()}
+    for checkpoint in report["checkpoints"]:
+        for sample in checkpoint["samples"]:
+            name = Path(sample["path"]).name
+            payloads[f"jobs/{job_id}/samples/{name}"] = (sample_root / name).read_bytes()
+    for index, (relative, payload) in enumerate(sorted(payloads.items())):
+        remote = f"{root}/{relative}"
+        client.remote[remote] = payload + (b"corrupt" if corrupt and index == 0 else b"")
+        entries.append({
+            "remote_path": remote,
+            "relative_path": relative,
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    completion_path = f"training-archives/{run_id}/{shard}/completion.json"
+    client.remote[completion_path] = json.dumps({
+        "schema_version": 1,
+        "run_id": run_id,
+        "shard_id": shard,
+        "status": "completed",
+        "evidence_revision": "r0",
+        "evidence": entries,
+        "completion": {"jobs": [{"job_id": job_id}]},
+    }).encode()
+    client.snapshots["r0"] = dict(client.remote)
+
+
+def test_refreshes_historical_reports_from_verified_hub_archive_without_weights(tmp_path):
+    samples = _write_samples(tmp_path / "samples", steps=(100, 200, 300))
+    report = _report(samples)
+    client, _ = _catalog_and_client(report)
+    _install_archive(client, report, tmp_path / "samples")
+
+    result = refresh_archived_run_reports(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        run_id="run-archive", source_revision="r0",
+        work_dir=tmp_path / "refresh", job_ids=("subject-job",),
+    )
+
+    assert result["status"] == "completed"
+    assert result["model_weights_transferred"] is False
+    assert [item["job_id"] for item in result["jobs"]] == ["subject-job"]
+    assert result["jobs"][0]["archive_evidence_revision"] == "r0"
+    assert any("/reports-v2/" in path for path in client.remote)
+    assert not any(
+        "/reports-v2/" in path and "/weights/" in path for path in client.remote
+    )
+
+
+def test_archive_refresh_rejects_size_equal_hash_mismatch(tmp_path):
+    samples = _write_samples(tmp_path / "samples", steps=(100, 200, 300))
+    report = _report(samples)
+    client, _ = _catalog_and_client(report)
+    _install_archive(client, report, tmp_path / "samples")
+    evidence_path = next(
+        path for path in client.remote if "/evidence/jobs/" in path
+    )
+    payload = client.remote[evidence_path]
+    client.remote[evidence_path] = bytes([payload[0] ^ 1]) + payload[1:]
+    client.snapshots["r0"] = dict(client.remote)
+
+    with pytest.raises(BackupError, match="hash verification failed"):
+        refresh_archived_run_reports(
+            client=client, repo_id="owner/private", repo_type="dataset",
+            run_id="run-archive", source_revision="r0",
+            work_dir=tmp_path / "refresh",
+        )

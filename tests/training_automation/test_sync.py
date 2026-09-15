@@ -7,6 +7,7 @@ import pytest
 
 from training_automation.backup import BackupError
 from training_automation.sync import sync_latest_loras, sync_ranked_loras
+from training_automation.unified import _sync_startup
 
 
 FAKE_SPEC = importlib.util.spec_from_file_location(
@@ -148,3 +149,26 @@ def test_latest_sync_skips_models_without_pointer_unless_explicitly_requested(tm
             source_revision=REVISION, loras_root=tmp_path / "loras",
             work_dir=tmp_path / "work-2", model_ids=(1,),
         )
+
+
+def test_startup_sync_uses_explicit_historical_run_when_latest_pointer_is_missing(tmp_path):
+    client, _, _ = _client()
+    client.remote.pop("training-results/latest/0001-ada-lovelace.json")
+    client.snapshots[REVISION] = dict(client.remote)
+    records = _sync_startup(
+        client=client,
+        config={
+            "sync": {
+                "catalog_prefix": "training-backups",
+                "results_prefix": "training-results",
+                "legacy_runs": [{"run_id": "run-one", "model_ids": [1]}],
+            }
+        },
+        repo_id="owner/private", repo_type="dataset",
+        loras_root=tmp_path / "loras", work_root=tmp_path / "work",
+        dry_run=False, ranks=(1,), model_ids=(1,),
+    )
+    assert records[0]["skipped"] == [{
+        "model_id": 1, "reason": "latest pointer unavailable"
+    }]
+    assert records[1]["files"][0]["model_id"] == 1

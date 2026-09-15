@@ -52,6 +52,10 @@ class ResultsClient(Protocol):
         self, repo_id: str, repo_type: str, path: str, revision: str, destination: Path
     ) -> None: ...
 
+    def list_repo_files(
+        self, repo_id: str, repo_type: str, revision: str
+    ) -> Sequence[str]: ...
+
 
 def _component(value: Any, field: str) -> str:
     text = str(value or "")
@@ -85,6 +89,18 @@ def _number(value: Any) -> str:
     except (TypeError, ValueError):
         return str(value)
     return f"{number:.6f}" if math.isfinite(number) else "unavailable"
+
+
+def _completion_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BackupError("result completion timestamp is not valid ISO-8601") from exc
+    if parsed.tzinfo is None:
+        raise BackupError("result completion timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def _scalable_font(size: int) -> ImageFont.ImageFont:
@@ -779,9 +795,11 @@ def publish_ranked_results(
                 resolved_completed_at = completed_at
                 pointer_artifact = None
                 if shortlist:
+                    candidate_time = _completion_time(resolved_completed_at)
                     prior_pointer, _ = client.read_remote_file(
                         repo_id, repo_type, str(pointer_path)
                     )
+                    prior = None
                     if prior_pointer is not None:
                         try:
                             prior = json.loads(prior_pointer)
@@ -793,25 +811,37 @@ def publish_ranked_results(
                             and prior.get("evaluation_report_sha256") == report_sha256
                         ):
                             resolved_completed_at = str(prior.get("completed_at") or resolved_completed_at or "")
-                    if not resolved_completed_at:
-                        resolved_completed_at = datetime.now(timezone.utc).isoformat()
-                    pointer = {
-                        "schema_version": 1,
-                        "status": "completed",
-                        "run_id": run_id,
-                        "job_id": job_id,
-                        "completed_at": resolved_completed_at,
-                        "evaluation_report_sha256": report_sha256,
-                        "index_path": str(remote_root / "index.json"),
-                        "model": index["model"],
-                    }
-                    pointer_local = work_dir / "latest-result-pointer.json"
-                    atomic_write_json(pointer_local, pointer)
-                    pointer_artifact = LocalArtifact(
-                        str(pointer_local), str(pointer_path), pointer_local.stat().st_size,
-                        sha256_file(pointer_local), role="result-pointer",
-                        relative_path=f"latest/{model_folder.name}.json",
-                    )
+                            candidate_time = _completion_time(resolved_completed_at)
+                    promote = candidate_time is not None
+                    if prior is not None and not (
+                        prior.get("run_id") == run_id
+                        and prior.get("job_id") == job_id
+                        and prior.get("evaluation_report_sha256") == report_sha256
+                    ):
+                        prior_time = _completion_time(prior.get("completed_at"))
+                        promote = (
+                            candidate_time is not None
+                            and prior_time is not None
+                            and candidate_time > prior_time
+                        )
+                    if promote:
+                        pointer = {
+                            "schema_version": 1,
+                            "status": "completed",
+                            "run_id": run_id,
+                            "job_id": job_id,
+                            "completed_at": resolved_completed_at,
+                            "evaluation_report_sha256": report_sha256,
+                            "index_path": str(remote_root / "index.json"),
+                            "model": index["model"],
+                        }
+                        pointer_local = work_dir / "latest-result-pointer.json"
+                        atomic_write_json(pointer_local, pointer)
+                        pointer_artifact = LocalArtifact(
+                            str(pointer_local), str(pointer_path), pointer_local.stat().st_size,
+                            sha256_file(pointer_local), role="result-pointer",
+                            relative_path=f"latest/{model_folder.name}.json",
+                        )
                 uploads = [*local_uploads, *weight_uploads]
                 if pointer_artifact is not None:
                     uploads.append(pointer_artifact)
@@ -1009,3 +1039,162 @@ def publish_refreshed_report(
         revision=revision, context="refreshed report",
     )
     return {**manifest, "revision": revision, "remote_root": str(remote_root)}
+
+
+def refresh_archived_run_reports(
+    *,
+    client: ResultsClient,
+    repo_id: str,
+    repo_type: str,
+    run_id: str,
+    work_dir: Path,
+    job_ids: Sequence[str] = (),
+    source_revision: str | None = None,
+    archive_prefix: str = "training-archives",
+    catalog_prefix: str = "training-backups",
+    results_prefix: str = "training-results",
+) -> dict[str, Any]:
+    """Rebuild additive reports from hash-verified immutable Hub archive evidence."""
+    run_id = _component(run_id, "run_id")
+    requested = {_component(value, "job_id") for value in job_ids}
+    if not client.repo_is_private(repo_id, repo_type):
+        raise BackupError("refusing archive report refresh from a non-private repository")
+    if source_revision is None:
+        catalog_path = f"{safe_relative_path(catalog_prefix).as_posix()}/catalog.json"
+        catalog_payload, source_revision = client.read_remote_file(
+            repo_id, repo_type, catalog_path
+        )
+        if catalog_payload is None or not source_revision:
+            raise BackupError("cannot pin archive refresh to a catalog repository revision")
+    source_revision = str(source_revision)
+    archive_root = (
+        PurePosixPath(safe_relative_path(archive_prefix).as_posix()) / run_id
+    )
+    completion_paths = sorted(
+        path for path in client.list_repo_files(
+            repo_id, repo_type, source_revision
+        )
+        if PurePosixPath(path).parent.parent == archive_root
+        and PurePosixPath(path).name == "completion.json"
+    )
+    if not completion_paths:
+        raise BackupError(f"no immutable archive completion exists for run {run_id}")
+    operation_root = (work_dir.resolve() / run_id / source_revision).resolve()
+    records = []
+    found_jobs: set[str] = set()
+    for completion_path in completion_paths:
+        shard = _component(PurePosixPath(completion_path).parent.name, "archive shard")
+        completion_local = operation_root / shard / "completion.json"
+        completion_local.parent.mkdir(parents=True, exist_ok=True)
+        client.download_file(
+            repo_id, repo_type, completion_path, source_revision, completion_local
+        )
+        completion = _load_object(completion_local, "archive completion")
+        if (
+            completion.get("schema_version") != 1
+            or completion.get("status") != "completed"
+            or completion.get("run_id") != run_id
+            or completion.get("shard_id") != shard
+            or not completion.get("evidence_revision")
+        ):
+            raise BackupError(f"archive completion identity is invalid: {completion_path}")
+        completion_jobs = {
+            _component(item.get("job_id"), "archived job_id")
+            for item in ((completion.get("completion") or {}).get("jobs") or [])
+            if isinstance(item, Mapping)
+        }
+        if not completion_jobs:
+            raise BackupError(f"archive completion has no job identities: {completion_path}")
+        selected_jobs = completion_jobs & requested if requested else completion_jobs
+        if found_jobs & selected_jobs:
+            raise BackupError("an archived job is claimed by multiple completion manifests")
+        evidence_revision = str(completion["evidence_revision"])
+        evidence_by_relative: dict[str, Mapping[str, Any]] = {}
+        for item in completion.get("evidence") or []:
+            if not isinstance(item, Mapping):
+                raise BackupError("archive completion evidence entry must be a mapping")
+            relative = safe_relative_path(str(item.get("relative_path") or "")).as_posix()
+            remote_path = safe_relative_path(str(item.get("remote_path") or "")).as_posix()
+            expected_remote = str(
+                archive_root / shard / "evidence" / PurePosixPath(relative)
+            )
+            if remote_path != expected_remote:
+                raise BackupError(f"archive evidence remote path is outside its completion: {relative}")
+            if relative in evidence_by_relative:
+                raise BackupError(f"archive completion repeats evidence path: {relative}")
+            if not isinstance(item.get("size"), int) or int(item["size"]) < 0:
+                raise BackupError(f"archive evidence has invalid size: {relative}")
+            sha = str(item.get("sha256") or "")
+            if not re.fullmatch(r"[0-9a-f]{64}", sha):
+                raise BackupError(f"archive evidence has invalid SHA-256: {relative}")
+            evidence_by_relative[relative] = {
+                "remote_path": remote_path, "size": int(item["size"]), "sha256": sha,
+            }
+        for job_id in sorted(selected_jobs):
+            prefix = f"jobs/{job_id}/"
+            if any(
+                relative.startswith(f"jobs/{job_id}/samples/")
+                and len(PurePosixPath(relative).parts) != 4
+                for relative in evidence_by_relative
+            ):
+                raise BackupError(f"archive sample evidence is not a direct file: {job_id}")
+            selected = {
+                relative: item for relative, item in evidence_by_relative.items()
+                if relative == f"jobs/{job_id}/evaluation.json"
+                or (
+                    relative.startswith(f"jobs/{job_id}/samples/")
+                    and len(PurePosixPath(relative).parts) == 4
+                )
+            }
+            report_relative = f"jobs/{job_id}/evaluation.json"
+            sample_entries = {
+                relative: item for relative, item in selected.items()
+                if relative.startswith(f"jobs/{job_id}/samples/")
+            }
+            if report_relative not in selected or not sample_entries:
+                raise BackupError(f"archive job lacks evaluation or sample evidence: {job_id}")
+            job_root = operation_root / shard / "jobs" / job_id
+            sample_root = job_root / "samples"
+            for relative, item in sorted(selected.items()):
+                suffix = safe_relative_path(relative.removeprefix(prefix))
+                destination = (job_root / suffix).resolve()
+                if job_root.resolve() not in destination.parents:
+                    raise BackupError("archive evidence destination escapes reconstructed job")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                client.download_file(
+                    repo_id, repo_type, str(item["remote_path"]),
+                    evidence_revision, destination,
+                )
+                if (
+                    destination.stat().st_size != int(item["size"])
+                    or sha256_file(destination) != str(item["sha256"])
+                ):
+                    raise BackupError(f"archive evidence hash verification failed: {relative}")
+            report_path = job_root / "evaluation.json"
+            if report_job_id(report_path) != job_id:
+                raise BackupError(f"archive report identity does not match completion: {job_id}")
+            refreshed = publish_refreshed_report(
+                client=client, repo_id=repo_id, repo_type=repo_type,
+                run_id=run_id, report_path=report_path, sample_root=sample_root,
+                work_dir=operation_root / shard / "rendered" / job_id,
+                catalog_prefix=catalog_prefix, results_prefix=results_prefix,
+            )
+            records.append({
+                **refreshed, "job_id": job_id, "archive_shard": shard,
+                "archive_completion_path": completion_path,
+                "archive_completion_revision": source_revision,
+                "archive_evidence_revision": evidence_revision,
+            })
+            found_jobs.add(job_id)
+    missing = requested - found_jobs
+    if missing:
+        raise BackupError(f"requested jobs are absent from completed archive: {sorted(missing)}")
+    return {
+        "schema_version": 1,
+        "status": "completed",
+        "archive_format": "training-archive-completion-v1",
+        "run_id": run_id,
+        "source_revision": source_revision,
+        "jobs": records,
+        "model_weights_transferred": False,
+    }

@@ -7,6 +7,10 @@ dataset_root: /storage/datasets
 comfyui_root: /storage/ComfyUI
 storage_root: /storage
 work_root: /storage/automation/unified
+# The opt-in controller initializes this GUI setting only when it is absent and
+# the native /app/ai-toolkit/datasets folder contains no unseen files.
+gui_database: /app/ai-toolkit/aitk_db.db
+initialize_gui_dataset_root: true
 
 hub:
   repo_id_env: HF_REPO_ID
@@ -14,7 +18,8 @@ hub:
   token_env: HF_TOKEN
 
 worker:
-  # Two instances of the same template use ids 0 and 1 with the same count.
+  # TRAINING_WORKER_ID/COUNT take priority. Two instances of the same template
+  # use ids 0 and 1 with count 2; one instance uses the defaults below.
   id: 0
   count: 1
 

@@ -138,6 +138,11 @@ class HuggingFaceBackupClient:
         with Path(local).open("rb") as source, destination.open("wb") as target:
             shutil.copyfileobj(source, target, length=1024 * 1024)
 
+    def list_repo_files(self, repo_id: str, repo_type: str, revision: str) -> list[str]:
+        return list(self._api.list_repo_files(
+            repo_id=repo_id, repo_type=repo_type, revision=revision,
+        ))
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()

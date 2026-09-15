@@ -16,6 +16,7 @@ fi
 
 mkdir -p "$(dirname "$log_path")"
 cd /app/ai-toolkit
+python -m training_automation prepare-unified "$config_path" >>"$log_path" 2>&1
 python -m training_automation.unified_supervisor "$config_path" >>"$log_path" 2>&1 &
 echo "Unified automation started; durable status: ${TRAINING_UNIFIED_STATUS:-/storage/automation/unified/supervisor-state.json}"
 exec "$gui_start"

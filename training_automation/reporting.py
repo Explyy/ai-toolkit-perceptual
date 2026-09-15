@@ -284,7 +284,12 @@ def _common_preview_prompt(shortlist: Sequence[Mapping[str, Any]]) -> int | None
 def cosine_axis_ticks(left: int, right: int) -> tuple[tuple[str, int], ...]:
     if right <= left:
         raise ValueError("cosine axis requires positive width")
-    return (("-1", left), ("0", left + (right - left) // 2), ("+1", right))
+    inset = min(18, (right - left) // 6)
+    return (
+        ("-1", left + inset),
+        ("0", left + (right - left) // 2),
+        ("+1", right - inset),
+    )
 
 
 def render_top_comparison(

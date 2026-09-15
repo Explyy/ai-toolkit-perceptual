@@ -14,6 +14,7 @@ from .results import (
     publish_archived_run_results,
     publish_refreshed_report,
     publish_ranked_results,
+    refresh_archived_run_reports,
     report_job_id,
 )
 from .sync import sync_latest_loras, sync_ranked_loras
@@ -30,6 +31,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     unified.add_argument("config", type=Path)
     unified.add_argument("--dry-run", action="store_true")
+    prepare_unified = commands.add_parser(
+        "prepare-unified", help="validate and initialize the opt-in GUI storage bridge"
+    )
+    prepare_unified.add_argument("config", type=Path)
     commands.add_parser(
         "parallel-run",
         help="run the private pinned parallel shard bootstrap and success-only self-delete",
@@ -57,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     publish_results.add_argument("--job-id")
     publish_results.add_argument("--work-dir", type=Path, required=True)
     publish_results.add_argument("--results-prefix", default="training-results")
+    publish_results.add_argument("--completed-at")
     publish_run_results = commands.add_parser(
         "publish-run-results",
         help="publish every job from a reconstructed immutable evidence archive",
@@ -75,6 +81,17 @@ def main(argv: list[str] | None = None) -> int:
     refresh_report.add_argument("--run-id", required=True)
     refresh_report.add_argument("--work-dir", type=Path, required=True)
     refresh_report.add_argument("--results-prefix", default="training-results")
+    refresh_run = commands.add_parser(
+        "refresh-archived-run",
+        help="download verified immutable Hub evidence and publish additive reports",
+    )
+    _connection_args(refresh_run)
+    refresh_run.add_argument("--run-id", required=True)
+    refresh_run.add_argument("--source-revision")
+    refresh_run.add_argument("--job-id", action="append", default=[])
+    refresh_run.add_argument("--work-dir", type=Path, required=True)
+    refresh_run.add_argument("--archive-prefix", default="training-archives")
+    refresh_run.add_argument("--results-prefix", default="training-results")
     sync = commands.add_parser(
         "sync-loras", help="sync verified automatic LoRA ranks from one immutable Hub revision"
     )
@@ -128,6 +145,10 @@ def main(argv: list[str] | None = None) -> int:
         from .unified import run_unified_workflow
 
         print(json.dumps(run_unified_workflow(args.config, dry_run=args.dry_run), indent=2))
+    elif args.command == "prepare-unified":
+        from .unified import prepare_unified_environment
+
+        print(json.dumps(prepare_unified_environment(args.config), indent=2))
     elif args.command == "parallel-run":
         from .bootstrap import run_parallel_bootstrap
 
@@ -164,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             work_dir=args.work_dir,
             catalog_prefix=args.remote_prefix,
             results_prefix=args.results_prefix,
+            completed_at=args.completed_at,
         )
         print(json.dumps({
             **record,
@@ -191,6 +213,20 @@ def main(argv: list[str] | None = None) -> int:
             report_path=args.report,
             sample_root=args.samples_root,
             work_dir=args.work_dir,
+            catalog_prefix=args.remote_prefix,
+            results_prefix=args.results_prefix,
+        ), indent=2))
+    elif args.command == "refresh-archived-run":
+        store = _store(args)
+        print(json.dumps(refresh_archived_run_reports(
+            client=store.client,
+            repo_id=store.repo_id,
+            repo_type=store.repo_type,
+            run_id=args.run_id,
+            source_revision=args.source_revision,
+            job_ids=tuple(args.job_id),
+            work_dir=args.work_dir,
+            archive_prefix=args.archive_prefix,
             catalog_prefix=args.remote_prefix,
             results_prefix=args.results_prefix,
         ), indent=2))

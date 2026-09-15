@@ -329,6 +329,7 @@ def sync_latest_loras(
     catalog_prefix: str = "training-backups",
     results_prefix: str = "training-results",
     dry_run: bool = False,
+    skip_missing_requested: bool = False,
 ) -> dict[str, Any]:
     """Sync per-model latest pointers from one immutable repository revision."""
     catalog = _json_at_revision(
@@ -357,7 +358,7 @@ def sync_latest_loras(
         )
         current, _ = client.read_remote_file(repo_id, repo_type, pointer_path)
         if current is None:
-            if requested:
+            if requested and not skip_missing_requested:
                 raise BackupError(f"latest result pointer is missing: {folder.name}")
             skipped.append({"model_id": model_id, "reason": "latest pointer unavailable"})
             continue
