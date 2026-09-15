@@ -46,17 +46,18 @@ class CheckpointReport:
 
 
 def _font(size: int) -> ImageFont.ImageFont:
+    for candidate in (
+        "DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
-        for candidate in (
-            "DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ):
-            try:
-                return ImageFont.truetype(candidate, size=size)
-            except OSError:
-                continue
+        pass
     raise BackupError(f"evaluation report requires a scalable font at {size}px")
 
 
@@ -68,6 +69,14 @@ def _number(value: Any) -> str:
     except (TypeError, ValueError):
         return str(value)
     return f"{number:.4f}" if math.isfinite(number) else "non disponibile"
+
+
+def _percent(value: Any) -> str:
+    try:
+        number = float(value) * 100
+    except (TypeError, ValueError):
+        return "non disponibile"
+    return f"{number:.1f}%" if math.isfinite(number) else "non disponibile"
 
 
 def _width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
@@ -126,7 +135,14 @@ def _pose_line(sample: Mapping[str, Any]) -> str:
     pose = sample.get("pose_body_landmarks") or {}
     status = str(pose.get("status", "unavailable"))
     if status != "available":
-        return f"Posa: {status}"
+        labels = {
+            "occluded": "coperta",
+            "missing": "non rilevata",
+            "ambiguous": "ambigua",
+            "unavailable": "non disponibile",
+            "degenerate": "non valida",
+        }
+        return f"Posa: {labels.get(status, status)}"
     ratios = ((pose.get("values") or {}).get("ratios") or {})
     shoulder = ratios.get("shoulder_to_hip_width")
     if shoulder is None:
@@ -144,7 +160,7 @@ def _metric_lines(sample: Mapping[str, Any]) -> list[str]:
     )
     return [
         f"Prompt {sample.get('prompt_index')} · seed {sample.get('seed')}",
-        f"Coseno volto grezzo: {face} · Clipping: {_number(metrics.get('clipping_fraction_proxy'))}",
+        f"Somiglianza volto: {face} · Pixel saturi: {_percent(metrics.get('clipping_fraction_proxy'))}",
         _pose_line(sample),
     ]
 
@@ -226,9 +242,9 @@ def render_checkpoint_pages(
         draw.text((PAGE_MARGIN, 28), heading, fill=COLORS["text"], font=title_font)
         draw.text(
             (PAGE_MARGIN, 86),
-            "Coseno medio grezzo "
+            "Somiglianza volto media "
             f"{_number(aggregate.get('mean_face_cosine_similarity'))} · "
-            f"Clipping medio {_number(aggregate.get('mean_clipping_fraction_proxy'))} · "
+            f"Pixel saturi medi {_percent(aggregate.get('mean_clipping_fraction_proxy'))} · "
             f"pagina {page_index}/{math.ceil(len(samples) / SAMPLES_PER_PAGE)}",
             fill=COLORS["muted"],
             font=body_font,
@@ -263,6 +279,12 @@ def _common_preview_prompt(shortlist: Sequence[Mapping[str, Any]]) -> int | None
     sets = [set(item.get("prompt_indices") or []) for item in shortlist]
     common = set.intersection(*sets) if sets else set()
     return min(common) if common else None
+
+
+def cosine_axis_ticks(left: int, right: int) -> tuple[tuple[str, int], ...]:
+    if right <= left:
+        raise ValueError("cosine axis requires positive width")
+    return (("-1", left), ("0", left + (right - left) // 2), ("+1", right))
 
 
 def render_top_comparison(
@@ -302,7 +324,7 @@ def render_top_comparison(
     draw.text((42, 30), heading, fill=COLORS["text"], font=title)
     draw.text(
         (42, 88),
-        "Confronto automatico · coseno volto grezzo su asse -1…1, non percentuale o probabilità",
+        "Somiglianza volto · coseno da -1 a +1; più alto = più simile (non è una probabilità)",
         fill=COLORS["muted"],
         font=small,
     )
@@ -319,7 +341,7 @@ def render_top_comparison(
             font=body,
         )
         canvas.paste(media, (x + (column_width - media.width) // 2, 195))
-        y = 600
+        y = 570
         cosine = float(aggregate["mean_face_cosine_similarity"])
         track_left, track_right = x, x + column_width
         draw.rectangle((track_left, y, track_right, y + 22), fill=COLORS["bar_track"])
@@ -327,10 +349,13 @@ def render_top_comparison(
         value_x = track_left + round((max(-1.0, min(1.0, cosine)) + 1.0) * column_width / 2)
         draw.rectangle((min(zero, value_x), y, max(zero, value_x), y + 22), fill=COLORS["accent"])
         draw.line((zero, y - 5, zero, y + 27), fill=COLORS["text"], width=2)
-        draw.text((x, y + 34), f"Coseno grezzo: {_number(cosine)}", fill=COLORS["accent"], font=small)
+        for label, tick_x in cosine_axis_ticks(track_left, track_right):
+            label_width = _width(draw, label, small)
+            draw.text((tick_x - label_width // 2, y + 30), label, fill=COLORS["muted"], font=small)
+        draw.text((x, y + 64), f"Somiglianza volto: {_number(cosine)}", fill=COLORS["accent"], font=small)
         draw.text(
-            (x, y + 68),
-            f"Clipping: {_number(aggregate.get('mean_clipping_fraction_proxy'))} · "
+            (x, y + 98),
+            f"Pixel saturi: {_percent(aggregate.get('mean_clipping_fraction_proxy'))} · "
             f"copertura: {len(aggregate.get('prompt_indices') or [])}/{len(checkpoint.get('samples') or [])}",
             fill=COLORS["muted"],
             font=small,

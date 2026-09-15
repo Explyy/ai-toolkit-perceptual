@@ -8,6 +8,8 @@ from training_automation.reporting import (
     PAGE_WIDTH,
     SAMPLES_PER_PAGE,
     TITLE_SIZE,
+    _metric_lines,
+    cosine_axis_ticks,
     render_checkpoint_pages,
     render_top_comparison,
 )
@@ -74,3 +76,18 @@ def test_top_overview_compares_same_prompt_with_raw_cosine_axis(tmp_path):
     with Image.open(output) as image:
         image.load()
         assert image.width == 1600 and image.height <= 800
+    assert cosine_axis_ticks(10, 110) == (("-1", 10), ("0", 60), ("+1", 110))
+
+
+def test_visible_metric_labels_are_interpretable_italian_without_fake_scores():
+    lines = _metric_lines({
+        "prompt_index": 1, "seed": 42,
+        "identity": {"status": "available", "cosine_similarity": 0.8123},
+        "metrics": {"clipping_fraction_proxy": 0.025},
+        "pose_body_landmarks": {"status": "occluded"},
+    })
+    assert lines == [
+        "Prompt 1 · seed 42",
+        "Somiglianza volto: 0.8123 · Pixel saturi: 2.5%",
+        "Posa: coperta",
+    ]
