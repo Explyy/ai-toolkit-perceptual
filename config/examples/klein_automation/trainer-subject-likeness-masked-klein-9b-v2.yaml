@@ -1,0 +1,185 @@
+---
+# Provenance: origin/perceptual-port@ab5f146e9a30764a40bf29b0881d3a6dd7186c6f
+# ui/src/app/jobs/new/quickstarts.ts, subject_likeness_masked_flux2_klein9b.
+# Recipe v2 changes only the fixed evaluation cohort; training settings stay pinned.
+job: extension
+config:
+  name: generated-by-parallel-queue
+  process:
+    - type: diffusion_trainer
+      training_folder: /storage/output
+      sqlite_db_path: ./aitk_db.db
+      device: cuda
+      trigger_word: null
+      performance_log_every: 10
+      network:
+        type: lokr
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+        network_kwargs:
+          ignore_if_contains: []
+      save:
+        dtype: bf16
+        save_every: 25
+        max_step_saves_to_keep: 120
+        save_format: diffusers
+        push_to_hub: false
+      datasets:
+        - folder_path: replaced-by-bootstrap
+          mask_path: null
+          mask_min_value: 0.1
+          default_caption: ''
+          caption_ext: txt
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          network_weight: 1
+          resolution: [512, 768, 1024]
+          controls: []
+          shrink_video_to_frames: true
+          num_frames: 1
+          flip_x: false
+          flip_y: false
+          num_repeats: [16, 4, 1]
+          loss_split: sum
+      train:
+        weight_noise:
+          enabled: true
+          mode: relative
+          sigma: 0.0125
+          log_every: 1
+        max_grad_norm: 1
+        batch_size: 4
+        bypass_guidance_embedding: false
+        steps: 1200
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        timestep_type: linear
+        content_or_style: balanced
+        optimizer_params:
+          weight_decay: 0.0001
+        unload_text_encoder: false
+        cache_text_embeddings: true
+        lr: 0.00005
+        ema_config:
+          use_ema: false
+          ema_decay: 0.99
+        skip_first_sample: false
+        force_first_sample: true
+        disable_sampling: false
+        dtype: bf16
+        diff_output_preservation: false
+        diff_output_preservation_multiplier: 1
+        diff_output_preservation_class: person
+        switch_boundary_every: 1
+        loss_type: mse
+        diffusion_loss_weight: 1
+        diffusion_loss_max_t: 1
+        diffusion_loss_min_t: 0
+        custom_timestep_distribution: null
+        custom_timestep_curve: null
+        max_denoising_steps: 999
+        min_denoising_steps: 0
+        loss_split: null
+      logging:
+        log_every: 1
+        use_ui_logger: true
+      model:
+        name_or_path: black-forest-labs/FLUX.2-klein-base-9B
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        arch: flux2_klein_9b
+        low_vram: false
+        model_kwargs:
+          match_target_res: false
+        layer_offloading: false
+        layer_offloading_text_encoder_percent: 1
+        layer_offloading_transformer_percent: 1
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 640
+        height: 960
+        samples:
+          - {seed: 4201, prompt: "single adult subject [trigger], frontal waist-up portrait, shoulders level, both eyes visible, relaxed hands below frame, light denim jacket, quiet city courtyard, clear morning daylight"}
+          - {seed: 4202, prompt: "single adult subject [trigger], strict side-profile portrait facing left, nose chin and ear in one clean silhouette, shoulders perpendicular to camera, knit pullover, beside a tall window, soft lateral light"}
+          - {seed: 4203, prompt: "single adult subject [trigger], three-quarter rear view with torso facing away and head turned over the near shoulder toward camera, lightweight coat, museum corridor, warm ceiling light"}
+          - {seed: 4204, prompt: "single adult subject [trigger], full body contrapposto standing pose, weight on right leg and left knee relaxed, both hands fully visible, boots and feet fully in frame, tailored neutral outfit, daylight studio"}
+          - {seed: 4205, prompt: "single adult subject [trigger], side-on seated on a simple chair with hips facing right and torso rotated toward camera, both hands resting visibly on thighs, full legs and feet included, library reading room, window light"}
+          - {seed: 4206, prompt: "single adult subject [trigger], seated cross-legged on the floor with upright spine, both knees and hands fully visible, loose layered clothing, bright art studio, diffuse skylight"}
+          - {seed: 4207, prompt: "single adult subject [trigger], deep squat with heels down and elbows resting on knees, hands separated and visible, complete body and feet in frame, athletic streetwear, concrete courtyard, overcast light"}
+          - {seed: 4208, prompt: "single adult subject [trigger], kneeling with left knee down and right foot planted, upright torso, hands relaxed and visible, full body framed, practical outdoor clothing, garden path, late-afternoon light"}
+          - {seed: 4209, prompt: "single adult subject [trigger], walking mid-stride toward camera-left, right leg forward with opposite left arm swinging forward, both hands and feet visible, casual travel outfit, station concourse, cool daylight"}
+          - {seed: 4210, prompt: "single adult subject [trigger], forward lunge on left leg while both arms reach overhead, back leg extended, hands and feet fully visible, fitted training layers, rooftop terrace, golden-hour side light"}
+          - {seed: 4211, prompt: "single adult subject [trigger], leaning forward over a table with both palms visibly supporting weight, elbows softly bent and head turned toward camera, full torso and legs included, rolled-sleeve shirt, workshop, directional task light"}
+          - {seed: 4212, prompt: "single adult subject [trigger], climbing stairs with right foot raised onto the next step and head turned back toward camera, one hand near the rail and both feet visible, weatherproof coat, stone stairway, cloudy daylight"}
+        neg: ''
+        seed: 42
+        walk_seed: false
+        guidance_scale: 4
+        sample_steps: 25
+        num_frames: 1
+        fps: 1
+      face_id:
+        enabled: false
+        init_scale: 0.3
+        identity_loss_weight: 0
+        landmark_loss_weight: 0
+        body_proportion_loss_weight: 0
+        body_proportion_loss_min_t: 0.8
+        body_proportion_loss_max_t: 1
+        body_shape_loss_weight: 0
+        body_shape_loss_max_t: 1
+        body_shape_loss_min_t: 0.8
+        identity_loss_min_t: 0
+        identity_loss_max_t: 0.9
+        identity_metrics: false
+        identity_loss_use_average: true
+        identity_loss_min_cos: 0.4
+      depth_consistency:
+        loss_weight: 0.005
+        input_size: 518
+        preview_every: 1
+        mask_source: subject
+        loss_max_t: 1
+        model_id: depth-anything/Depth-Anything-V2-Large-hf
+        loss_min_t: 0
+        grad_checkpoint: true
+        ssi_weight: 0
+        grad_weight: 1
+        grad_scales: 6
+      subject_mask:
+        enabled: true
+        background_loss_weight: 0
+        clothing_loss_weight: 1
+        body_loss_weight: 1
+        save_debug_previews: true
+        cache_resolution: 768
+        segformer_res: 768
+meta:
+  name: "[name]"
+  version: "2.0"
+  evaluation_cohort: "subject-likeness-articulated-v2"
+  evaluation_cases:
+    - {case_id: anchor-frontal-waist, category: face-anchor, seed: 4201}
+    - {case_id: anchor-side-profile, category: face-anchor, seed: 4202}
+    - {case_id: rear-over-shoulder, category: articulated-pose, seed: 4203}
+    - {case_id: full-contrapposto, category: articulated-pose, seed: 4204}
+    - {case_id: seated-torso-turn, category: articulated-pose, seed: 4205}
+    - {case_id: seated-cross-legged, category: articulated-pose, seed: 4206}
+    - {case_id: deep-squat, category: articulated-pose, seed: 4207}
+    - {case_id: kneeling-one-knee, category: articulated-pose, seed: 4208}
+    - {case_id: walking-opposite-swing, category: articulated-pose, seed: 4209}
+    - {case_id: lunge-overhead-reach, category: articulated-pose, seed: 4210}
+    - {case_id: table-supported-lean, category: articulated-pose, seed: 4211}
+    - {case_id: stairs-raised-foot, category: articulated-pose, seed: 4212}

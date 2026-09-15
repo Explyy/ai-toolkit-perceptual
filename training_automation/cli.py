@@ -12,9 +12,11 @@ from .gallery import render_gallery
 from .queue import TrainingQueue
 from .results import (
     publish_archived_run_results,
+    publish_refreshed_report,
     publish_ranked_results,
     report_job_id,
 )
+from .sync import sync_latest_loras, sync_ranked_loras
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,6 +25,11 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="materialize and run the sequential training queue")
     run.add_argument("config", type=Path)
     run.add_argument("--dry-run", action="store_true")
+    unified = commands.add_parser(
+        "unified", help="sync, discover, and run the opt-in GUI-adjacent workflow"
+    )
+    unified.add_argument("config", type=Path)
+    unified.add_argument("--dry-run", action="store_true")
     commands.add_parser(
         "parallel-run",
         help="run the private pinned parallel shard bootstrap and success-only self-delete",
@@ -59,6 +66,27 @@ def main(argv: list[str] | None = None) -> int:
     publish_run_results.add_argument("--run-id", required=True)
     publish_run_results.add_argument("--work-dir", type=Path, required=True)
     publish_run_results.add_argument("--results-prefix", default="training-results")
+    refresh_report = commands.add_parser(
+        "refresh-report", help="publish additive paginated reports from immutable local evidence"
+    )
+    _connection_args(refresh_report)
+    refresh_report.add_argument("report", type=Path)
+    refresh_report.add_argument("--samples-root", type=Path, required=True)
+    refresh_report.add_argument("--run-id", required=True)
+    refresh_report.add_argument("--work-dir", type=Path, required=True)
+    refresh_report.add_argument("--results-prefix", default="training-results")
+    sync = commands.add_parser(
+        "sync-loras", help="sync verified automatic LoRA ranks from one immutable Hub revision"
+    )
+    _connection_args(sync)
+    sync.add_argument("--source-revision", required=True)
+    sync.add_argument("--run-id")
+    sync.add_argument("--loras-root", type=Path, required=True)
+    sync.add_argument("--work-dir", type=Path, required=True)
+    sync.add_argument("--rank", type=int, action="append", default=[])
+    sync.add_argument("--model-id", type=int, action="append", default=[])
+    sync.add_argument("--results-prefix", default="training-results")
+    sync.add_argument("--dry-run", action="store_true")
     select = commands.add_parser("select", help="persist a human checkpoint choice")
     select.add_argument("report", type=Path)
     select.add_argument("step", type=int)
@@ -96,6 +124,10 @@ def main(argv: list[str] | None = None) -> int:
             for item in result.get("jobs", {}).values()
         ):
             return 1
+    elif args.command == "unified":
+        from .unified import run_unified_workflow
+
+        print(json.dumps(run_unified_workflow(args.config, dry_run=args.dry_run), indent=2))
     elif args.command == "parallel-run":
         from .bootstrap import run_parallel_bootstrap
 
@@ -149,6 +181,39 @@ def main(argv: list[str] | None = None) -> int:
             catalog_prefix=args.remote_prefix,
             results_prefix=args.results_prefix,
         ), indent=2))
+    elif args.command == "refresh-report":
+        store = _store(args)
+        print(json.dumps(publish_refreshed_report(
+            client=store.client,
+            repo_id=store.repo_id,
+            repo_type=store.repo_type,
+            run_id=args.run_id,
+            report_path=args.report,
+            sample_root=args.samples_root,
+            work_dir=args.work_dir,
+            catalog_prefix=args.remote_prefix,
+            results_prefix=args.results_prefix,
+        ), indent=2))
+    elif args.command == "sync-loras":
+        store = _store(args)
+        kwargs = dict(
+            client=store.client,
+            repo_id=store.repo_id,
+            repo_type=store.repo_type,
+            source_revision=args.source_revision,
+            loras_root=args.loras_root,
+            work_dir=args.work_dir,
+            ranks=tuple(args.rank or [1]),
+            model_ids=tuple(args.model_id),
+            catalog_prefix=args.remote_prefix,
+            results_prefix=args.results_prefix,
+            dry_run=args.dry_run,
+        )
+        if args.run_id:
+            result = sync_ranked_loras(run_id=args.run_id, **kwargs)
+        else:
+            result = sync_latest_loras(**kwargs)
+        print(json.dumps(result, indent=2))
     elif args.command == "select":
         if args.repo_id or os.environ.get(args.repo_id_env):
             if not args.model:

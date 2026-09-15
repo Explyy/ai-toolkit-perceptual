@@ -7,6 +7,7 @@ import shlex
 import shutil
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -15,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .backup import BackupError, LocalArtifact, sha256_file, verify_remote_artifacts
 from .catalog import CatalogStore, resolve_model, safe_relative_path
 from .gallery import render_gallery
+from .reporting import render_checkpoint_pages, render_top_comparison
 from .state import atomic_write_json
 
 
@@ -555,6 +557,7 @@ def publish_ranked_results(
     results_prefix: str = "training-results",
     max_attempts: int = 4,
     sleep: Callable[[float], None] = time.sleep,
+    completed_at: str | None = None,
 ) -> tuple[dict[str, Any], list[tuple[Path, str]]]:
     """Publish deterministic shortlist evidence and verified weight copies without selection."""
     run_id = _component(run_id, "run_id")
@@ -631,6 +634,9 @@ def publish_ranked_results(
                 local_uploads: list[LocalArtifact] = []
                 evidence_files: list[tuple[Path, str]] = []
                 candidate_records = []
+                checkpoints_by_step = {
+                    int(item["step"]): item for item in report.get("checkpoints") or []
+                }
                 for rank, ((aggregate, checkpoint), weights) in enumerate(
                     zip(shortlist, weight_manifests), 1
                 ):
@@ -640,10 +646,10 @@ def publish_ranked_results(
                         _, name = _safe_sample(sample_root, sample.get("path"))
                         samples.append(_sample_manifest(sample, name))
                     rank_dir = work_dir / f"top-{rank}"
-                    sheet = render_contact_sheet(
+                    rendered = render_checkpoint_pages(
                         checkpoint,
                         sample_root=sample_root,
-                        output_path=rank_dir / "contact-sheet.png",
+                        output_dir=rank_dir,
                         heading=f"{model['folder']} · top-{rank} · step {step}",
                         aggregate=aggregate,
                     )
@@ -667,6 +673,13 @@ def publish_ranked_results(
                         "checkpoint_aggregate": dict(aggregate),
                         "source_weights": weights,
                         "samples": samples,
+                        "report": {
+                            "entry_preview": "contact-sheet.png",
+                            "index": "report-index.json",
+                            "pages": [
+                                f"pages/{path.name}" for path in rendered.page_paths
+                            ],
+                        },
                         "metric_limits": {
                             "identity": "raw cosine similarity, not a percentage or probability",
                             "image_and_pose": "heuristic image-plane proxies, not ground-truth quality or anatomy",
@@ -694,10 +707,13 @@ def publish_ranked_results(
                     }
                     metrics_path = rank_dir / "selection.json"
                     atomic_write_json(metrics_path, metrics)
-                    for local, name in (
-                        (sheet, "contact-sheet.png"),
+                    report_files = [
+                        (rendered.entry_path, "contact-sheet.png"),
+                        (rendered.index_path, "report-index.json"),
                         (metrics_path, "selection.json"),
-                    ):
+                        *[(path, f"pages/{path.name}") for path in rendered.page_paths],
+                    ]
+                    for local, name in report_files:
                         remote = str(remote_root / f"top-{rank}" / name)
                         local_uploads.append(LocalArtifact(
                             str(local), remote, local.stat().st_size, sha256_file(local),
@@ -712,7 +728,16 @@ def publish_ranked_results(
                         "checkpoint_aggregate": dict(aggregate),
                         "remote_folder": str(remote_root / f"top-{rank}"),
                         "weights": weights,
+                        "report": metrics["report"],
                     })
+                overview_path = render_top_comparison(
+                    report=report,
+                    sample_root=sample_root,
+                    shortlist=[item for item, _ in shortlist],
+                    checkpoints=checkpoints_by_step,
+                    output_path=work_dir / "overview.png",
+                    heading=f"{model['folder']} · top checkpoint",
+                )
                 index = {
                     "schema_version": 1,
                     "run_id": run_id,
@@ -732,17 +757,60 @@ def publish_ranked_results(
                     "canonical_selected_checkpoint_id": model.get("selected_checkpoint_id"),
                     "canonical_selection_unchanged": True,
                     "candidates": candidate_records,
+                    "overview": "overview.png",
                 }
                 index_path = work_dir / "index.json"
                 atomic_write_json(index_path, index)
-                for local, name in ((index_path, "index.json"), (gallery_path, "evaluation-gallery.html")):
+                for local, name in (
+                    (index_path, "index.json"),
+                    (gallery_path, "evaluation-gallery.html"),
+                    (overview_path, "overview.png"),
+                ):
                     remote = str(remote_root / name)
                     local_uploads.append(LocalArtifact(
                         str(local), remote, local.stat().st_size, sha256_file(local),
                         role="evidence", relative_path=name,
                     ))
                     evidence_files.append((local, f"results/{model['folder']}/{name}"))
-                uploads = [*local_uploads, *weight_uploads]
+                pointer_path = (
+                    PurePosixPath(safe_relative_path(results_prefix).as_posix())
+                    / "latest" / f"{model_folder.name}.json"
+                )
+                prior_pointer, _ = client.read_remote_file(
+                    repo_id, repo_type, str(pointer_path)
+                )
+                resolved_completed_at = completed_at
+                if prior_pointer is not None:
+                    try:
+                        prior = json.loads(prior_pointer)
+                    except (TypeError, ValueError) as exc:
+                        raise BackupError("existing latest result pointer is invalid JSON") from exc
+                    if (
+                        prior.get("run_id") == run_id
+                        and prior.get("job_id") == job_id
+                        and prior.get("evaluation_report_sha256") == report_sha256
+                    ):
+                        resolved_completed_at = str(prior.get("completed_at") or resolved_completed_at or "")
+                if not resolved_completed_at:
+                    resolved_completed_at = datetime.now(timezone.utc).isoformat()
+                pointer = {
+                    "schema_version": 1,
+                    "status": "completed",
+                    "run_id": run_id,
+                    "job_id": job_id,
+                    "completed_at": resolved_completed_at,
+                    "evaluation_report_sha256": report_sha256,
+                    "index_path": str(remote_root / "index.json"),
+                    "model": index["model"],
+                }
+                pointer_local = work_dir / "latest-result-pointer.json"
+                atomic_write_json(pointer_local, pointer)
+                pointer_artifact = LocalArtifact(
+                    str(pointer_local), str(pointer_path), pointer_local.stat().st_size,
+                    sha256_file(pointer_local), role="result-pointer",
+                    relative_path=f"latest/{model_folder.name}.json",
+                )
+                uploads = [*local_uploads, *weight_uploads, pointer_artifact]
                 revision = client.commit_files(
                     repo_id,
                     repo_type,
@@ -762,6 +830,8 @@ def publish_ranked_results(
                     **index,
                     "revision": revision,
                     "remote_root": str(remote_root),
+                    "latest_pointer": str(pointer_path),
+                    "completed_at": resolved_completed_at,
                 }
                 return record, evidence_files
             except Exception as exc:
@@ -817,3 +887,121 @@ def publish_archived_run_results(
         )
         records.append(record)
     return records
+
+
+def publish_refreshed_report(
+    *,
+    client: ResultsClient,
+    repo_id: str,
+    repo_type: str,
+    run_id: str,
+    report_path: Path,
+    sample_root: Path,
+    work_dir: Path,
+    catalog_prefix: str = "training-backups",
+    results_prefix: str = "training-results",
+) -> dict[str, Any]:
+    """Render and publish additive report-v2 evidence without copying model weights."""
+    run_id = _component(run_id, "run_id")
+    if not client.repo_is_private(repo_id, repo_type):
+        raise BackupError("refusing report refresh to a non-private repository")
+    report = _load_object(report_path, "evaluation report")
+    report_digest = sha256_file(report_path)
+    store = CatalogStore(
+        client=client,
+        repo_id=repo_id,
+        repo_type=repo_type,
+        catalog_path=f"{safe_relative_path(catalog_prefix).as_posix()}/catalog.json",
+        work_dir=work_dir / ".catalog",
+    )
+    catalog, parent = store.read()
+    model = _catalog_identity(catalog, report)
+    folder = safe_relative_path(str(model["folder"]))
+    if len(folder.parts) != 1:
+        raise BackupError("report refresh model folder must be one component")
+    remote_root = (
+        PurePosixPath(safe_relative_path(results_prefix).as_posix())
+        / run_id / folder.name / "reports-v2" / report_digest[:16]
+    )
+    checkpoints = {
+        int(item["step"]): item for item in report.get("checkpoints") or []
+    }
+    if not checkpoints:
+        raise BackupError("report refresh requires checkpoint evidence")
+    shortlist, unavailable_reason = _shortlist_checkpoints(report)
+    uploads: list[LocalArtifact] = []
+    rendered_records = []
+    for step, checkpoint in sorted(checkpoints.items()):
+        aggregate = next(
+            (
+                item for item in (report.get("identity_ranking") or {}).get("items") or []
+                if int(item["step"]) == step
+            ),
+            {"step": step, "prompt_indices": []},
+        )
+        rendered = render_checkpoint_pages(
+            checkpoint,
+            sample_root=sample_root,
+            output_dir=work_dir / "reports-v2" / f"step-{step:09d}",
+            heading=f"{folder.name} · step {step}",
+            aggregate=aggregate,
+        )
+        local_files = [
+            (rendered.entry_path, "contact-sheet.png"),
+            (rendered.index_path, "report-index.json"),
+            *[(path, f"pages/{path.name}") for path in rendered.page_paths],
+        ]
+        for local, relative in local_files:
+            remote = str(remote_root / f"step-{step:09d}" / relative)
+            uploads.append(LocalArtifact(
+                str(local), remote, local.stat().st_size, sha256_file(local),
+                role="refreshed-report", relative_path=f"step-{step:09d}/{relative}",
+            ))
+        rendered_records.append({
+            "step": step,
+            "sample_count": len(checkpoint.get("samples") or []),
+            "pages": len(rendered.page_paths),
+            "remote_root": str(remote_root / f"step-{step:09d}"),
+        })
+    overview = render_top_comparison(
+        report=report,
+        sample_root=sample_root,
+        shortlist=[item for item, _ in shortlist],
+        checkpoints=checkpoints,
+        output_path=work_dir / "reports-v2" / "overview.png",
+        heading=f"{folder.name} · top checkpoint",
+    )
+    uploads.append(LocalArtifact(
+        str(overview), str(remote_root / "overview.png"), overview.stat().st_size,
+        sha256_file(overview), role="refreshed-report", relative_path="overview.png",
+    ))
+    manifest = {
+        "schema_version": 2,
+        "kind": "additive-report-refresh",
+        "run_id": run_id,
+        "model": {key: model.get(key) for key in ("id", "name", "folder")},
+        "source_evaluation_sha256": report_digest,
+        "source_evidence_unchanged": True,
+        "model_weights_transferred": False,
+        "shortlist_status": "available" if shortlist else "unavailable",
+        "shortlist_reason": unavailable_reason,
+        "overview": "overview.png",
+        "checkpoints": rendered_records,
+    }
+    manifest_path = work_dir / "reports-v2" / "report-manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    uploads.append(LocalArtifact(
+        str(manifest_path), str(remote_root / "report-manifest.json"),
+        manifest_path.stat().st_size, sha256_file(manifest_path),
+        role="refreshed-report", relative_path="report-manifest.json",
+    ))
+    revision = client.commit_files(
+        repo_id, repo_type, uploads,
+        f"Publish additive report v2 for {run_id}/{folder.name}",
+        parent_commit=parent,
+    )
+    verify_remote_artifacts(
+        client, repo_id=repo_id, repo_type=repo_type, artifacts=uploads,
+        revision=revision, context="refreshed report",
+    )
+    return {**manifest, "revision": revision, "remote_root": str(remote_root)}

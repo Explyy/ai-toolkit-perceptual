@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from training_automation.recipe import validate_parallel_recipe
+import yaml
+
+from training_automation.recipe import validate_parallel_recipe, validate_unified_recipe
 
 
 def test_selected_masked_klein_recipe_contract_against_fixture(tmp_path):
@@ -34,3 +36,15 @@ def test_selected_masked_klein_recipe_contract_against_fixture(tmp_path):
     )
     recipe = Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml"
     validate_parallel_recipe(recipe, repo)
+
+    unified = Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-v2.yaml"
+    validate_unified_recipe(unified, repo)
+    document = yaml.safe_load(unified.read_text())
+    process = document["config"]["process"][0]
+    prompts = process["sample"]["samples"]
+    cases = document["meta"]["evaluation_cases"]
+    assert len(prompts) == len(cases) == 12
+    assert len({item["seed"] for item in prompts}) == 12
+    assert all("single adult subject [trigger]" in item["prompt"] for item in prompts)
+    assert any("deep squat" in item["prompt"] for item in prompts)
+    assert any("opposite left arm" in item["prompt"] for item in prompts)

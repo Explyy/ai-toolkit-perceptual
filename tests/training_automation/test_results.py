@@ -271,6 +271,8 @@ def test_publisher_creates_verified_top_three_without_changing_selection(tmp_pat
     for rank, step in enumerate((200, 100, 300), 1):
         root = f"training-results/run-1/0001-subject/top-{rank}"
         assert f"{root}/contact-sheet.png" in client.remote
+        assert f"{root}/report-index.json" in client.remote
+        assert f"{root}/pages/page-01.png" in client.remote
         assert f"{root}/selection.json" in client.remote
         copied = client.remote[f"{root}/weights/model-{step}.safetensors"]
         assert copied == f"immutable-weight-{step}".encode()
@@ -278,6 +280,12 @@ def test_publisher_creates_verified_top_three_without_changing_selection(tmp_pat
         assert manifest["rank"] == rank
         assert manifest["catalog_checkpoint_id"] == f"checkpoint-{step}"
         assert len(manifest["samples"]) == 3
+        assert manifest["report"]["pages"] == ["pages/page-01.png"]
+    assert "training-results/run-1/0001-subject/overview.png" in client.remote
+    pointer = json.loads(client.remote["training-results/latest/0001-subject.json"])
+    assert pointer["status"] == "completed"
+    assert pointer["run_id"] == "run-1"
+    assert pointer["evaluation_report_sha256"] == hashlib.sha256(report_path.read_bytes()).hexdigest()
         assert (
             manifest["samples"][0]["pose_body_landmarks"]["values"]
             ["joint_angles"]["left_elbow_degrees"]

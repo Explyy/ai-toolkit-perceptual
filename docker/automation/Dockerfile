@@ -11,13 +11,16 @@ COPY docker/automation/install_overlay.py /tmp/install_training_automation_overl
 COPY docker/automation/install_evaluation_models.py /tmp/install_evaluation_models.py
 COPY docker/automation/smoke_gpu_isolation.py /tmp/smoke_gpu_isolation.py
 COPY docker/automation/run_parallel_training.sh /run-parallel-training
+COPY docker/automation/run_unified_training.sh /run-unified-training
 RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/output \
     && python /tmp/install_training_automation_overlay.py --root /app/ai-toolkit \
     && python /tmp/install_evaluation_models.py \
-    && chmod 0755 /run-parallel-training \
+    && chmod 0755 /run-parallel-training /run-unified-training \
     && python -m compileall -q /app/ai-toolkit/training_automation \
     && python -m compileall -q /app/ai-toolkit/jobs/process/BaseSDTrainProcess.py \
     && python -m training_automation.recipe /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml /app/ai-toolkit \
+    && python -m training_automation.recipe --unified /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-v2.yaml /app/ai-toolkit \
+    && python -m training_automation.unified_supervisor --help >/dev/null \
     && python -m training_automation --help >/dev/null \
     && python -c "from training_automation.worker import worker_log_path; assert worker_log_path({'TRAINING_RUN_ID':'smoke','TRAINING_SHARD_ID':'a'}) == __import__('pathlib').Path('/storage/automation/smoke/a/worker.log')" \
     && python -m training_automation run /app/ai-toolkit/config/examples/klein_automation/automation.yaml --dry-run >/tmp/training-automation-dry-run.json \

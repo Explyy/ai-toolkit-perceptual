@@ -171,7 +171,9 @@ def _identity_metric(image: np.ndarray, backend: FaceBackend | None, reference: 
     return {"status": "available", "cosine_similarity": float(np.dot(vector, reference["embedding"])), "reason": None}
 
 
-def _sample_expectations(job_config_path: Path) -> tuple[dict[int, dict[str, Any]], int]:
+def _sample_expectations(
+    job_config_path: Path,
+) -> tuple[dict[int, dict[str, Any]], int, dict[str, Any]]:
     with job_config_path.open("r", encoding="utf-8") as handle:
         document = yaml.safe_load(handle)
     process = document["config"]["process"][0]
@@ -181,13 +183,23 @@ def _sample_expectations(job_config_path: Path) -> tuple[dict[int, dict[str, Any
         raw = [{"prompt": prompt} for prompt in sample.get("prompts", [])]
     base_seed = int(sample.get("seed", 42))
     walk = bool(sample.get("walk_seed", False))
+    meta = document.get("meta") or {}
+    cases = meta.get("evaluation_cases") or []
+    if cases and len(cases) != len(raw):
+        raise ValueError("evaluation case metadata does not match configured sample count")
     expected = {}
     for index, item in enumerate(raw):
+        case = cases[index] if cases else {}
         expected[index] = {
             "prompt": item.get("prompt"),
-            "seed": int(item.get("seed", base_seed + index if walk else base_seed)),
+            "seed": int(case.get("seed", item.get("seed", base_seed + index if walk else base_seed))),
+            "case_id": case.get("case_id", f"legacy-{index:02d}"),
+            "category": case.get("category", "legacy"),
         }
-    return expected, int(process.get("train", {}).get("steps", 0))
+    return expected, int(process.get("train", {}).get("steps", 0)), {
+        "id": str(meta.get("evaluation_cohort", "subject-likeness-legacy-v1")),
+        "version": str(meta.get("version", "1.0")),
+    }
 
 
 def rank_checkpoints(checkpoints: list[dict[str, Any]], expected_signature: set[tuple[int, int]] | None = None) -> tuple[list[dict[str, Any]], str | None]:
@@ -313,7 +325,7 @@ def _evaluate_job(
     reference_images: list[Path],
     config: Mapping[str, Any],
 ) -> Path:
-    expected, final_step = _sample_expectations(job_config_path)
+    expected, final_step, evaluation_cohort = _sample_expectations(job_config_path)
     with job_config_path.open("r", encoding="utf-8") as handle:
         job_name = yaml.safe_load(handle)["config"]["name"]
     face = _load_backend(config.get("face_backend"), config.get("face_backend_options", {}))
@@ -341,6 +353,8 @@ def _evaluate_job(
                 "prompt_index": index,
                 "prompt": expectation["prompt"],
                 "seed": expectation["seed"],
+                "case_id": expectation.get("case_id"),
+                "category": expectation.get("category"),
                 "metrics": _image_metrics(image),
                 "identity": _identity_metric(image, face, reference),
                 "pose_body_landmarks": landmarks,
@@ -433,6 +447,7 @@ def _evaluate_job(
     report = {
         "schema_version": REPORT_SCHEMA,
         "job_config": str(job_config_path),
+        "evaluation_cohort": evaluation_cohort,
         "final_step": final_step,
         "reference_identity_status": {key: value for key, value in reference.items() if key != "embedding"},
         "reference_provenance": str(config.get("reference_provenance", "unspecified")),

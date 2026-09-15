@@ -15,7 +15,7 @@ def _at(value: dict[str, Any], *path: str) -> Any:
     return current
 
 
-def validate_parallel_recipe(recipe_path: Path, repo_root: Path) -> None:
+def _validate_recipe(recipe_path: Path, repo_root: Path, *, prompt_count: int) -> dict[str, Any]:
     document = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
     process = document["config"]["process"][0]
     expected = {
@@ -46,8 +46,8 @@ def validate_parallel_recipe(recipe_path: Path, repo_root: Path) -> None:
             actual = _at(process, *path)
         if actual != wanted:
             raise BackupError(f"parallel recipe drift at {'.'.join(path)}: {actual!r} != {wanted!r}")
-    if len(process["sample"]["samples"]) != 23:
-        raise BackupError("parallel recipe requires exactly 23 evaluation prompts")
+    if len(process["sample"]["samples"]) != prompt_count:
+        raise BackupError(f"recipe requires exactly {prompt_count} evaluation prompts")
     config_source = (repo_root / "toolkit" / "config_modules.py").read_text(encoding="utf-8")
     trainer_source = (
         repo_root / "extensions_built_in" / "sd_trainer" / "SDTrainer.py"
@@ -84,16 +84,44 @@ def validate_parallel_recipe(recipe_path: Path, repo_root: Path) -> None:
     ]
     if missing:
         raise BackupError(f"pinned trainer image lacks selected recipe support: {missing}")
+    return document
+
+
+def validate_parallel_recipe(recipe_path: Path, repo_root: Path) -> None:
+    _validate_recipe(recipe_path, repo_root, prompt_count=23)
+
+
+def validate_unified_recipe(recipe_path: Path, repo_root: Path) -> None:
+    document = _validate_recipe(recipe_path, repo_root, prompt_count=12)
+    meta = document.get("meta") or {}
+    cases = meta.get("evaluation_cases")
+    if meta.get("evaluation_cohort") != "subject-likeness-articulated-v2":
+        raise BackupError("unified recipe requires the articulated v2 evaluation cohort")
+    if not isinstance(cases, list) or len(cases) != 12:
+        raise BackupError("unified recipe requires metadata for all 12 evaluation cases")
+    ids = [item.get("case_id") for item in cases]
+    seeds = [item.get("seed") for item in cases]
+    prompts = document["config"]["process"][0]["sample"]["samples"]
+    if len(ids) != len(set(ids)) or len(seeds) != len(set(seeds)):
+        raise BackupError("unified evaluation case ids and seeds must be unique")
+    if any(prompt.get("seed") != case.get("seed") for prompt, case in zip(prompts, cases)):
+        raise BackupError("unified evaluation sample seeds differ from cohort metadata")
+    if any("[trigger]" not in str(prompt.get("prompt", "")) for prompt in prompts):
+        raise BackupError("every unified evaluation prompt must contain [trigger]")
 
 
 def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--unified", action="store_true")
     parser.add_argument("recipe", type=Path)
     parser.add_argument("repo_root", type=Path)
     args = parser.parse_args()
-    validate_parallel_recipe(args.recipe, args.repo_root)
+    if args.unified:
+        validate_unified_recipe(args.recipe, args.repo_root)
+    else:
+        validate_parallel_recipe(args.recipe, args.repo_root)
     return 0
 
 

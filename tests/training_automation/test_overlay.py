@@ -60,3 +60,19 @@ def test_docker_overlay_keeps_gui_default_and_adds_opt_in_parallel_command():
     assert not any(line.startswith("ENTRYPOINT ") for line in instructions)
     assert "python -m training_automation.worker" in command
     assert "InsightFaceCPUBackend" in dockerfile
+
+
+def test_docker_overlay_adds_one_opt_in_unified_gui_entrypoint_without_changing_default():
+    root = Path(__file__).parents[2]
+    dockerfile = (root / "docker/automation/Dockerfile").read_text()
+    command = (root / "docker/automation/run_unified_training.sh").read_text()
+    instructions = [
+        line.strip() for line in dockerfile.splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    assert "COPY docker/automation/run_unified_training.sh /run-unified-training" in dockerfile
+    assert not any(line.startswith("CMD ") for line in instructions)
+    assert not any(line.startswith("ENTRYPOINT ") for line in instructions)
+    assert "training_automation.unified_supervisor" in command
+    assert 'exec "$gui_start"' in command
+    assert "HF_TOKEN" not in command

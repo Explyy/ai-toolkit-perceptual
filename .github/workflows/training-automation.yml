@@ -11,6 +11,7 @@ on:
       - "docker/automation/**"
       - "config/examples/klein_automation/**"
       - "docs/training-automation.md"
+      - "notebooks/**"
       - "jobs/process/BaseSDTrainProcess.py"
       - ".github/workflows/training-automation.yml"
   pull_request:
@@ -20,6 +21,7 @@ on:
       - "docker/automation/**"
       - "config/examples/klein_automation/**"
       - "docs/training-automation.md"
+      - "notebooks/**"
       - "jobs/process/BaseSDTrainProcess.py"
       - ".github/workflows/training-automation.yml"
   workflow_dispatch:
@@ -44,6 +46,15 @@ jobs:
           python-version: "3.12"
       - run: pip install pytest pyyaml pillow numpy
       - run: python -m pytest -q tests/training_automation
+      - name: Render synthetic report review artifact
+        env:
+          TRAINING_REPORT_ARTIFACT_DIR: ${{ runner.temp }}/synthetic-training-report
+        run: python tests/training_automation/render_synthetic_reports.py
+      - name: Upload synthetic report review artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-training-report-${{ github.sha }}
+          path: ${{ runner.temp }}/synthetic-training-report
 
   docker:
     if: github.event_name == 'workflow_dispatch'

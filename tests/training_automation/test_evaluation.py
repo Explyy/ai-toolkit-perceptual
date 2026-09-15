@@ -44,6 +44,9 @@ def test_associates_only_checkpoint_steps_including_final_and_ranks(tmp_path):
         reference_images=[], config={},
     )
     report = json.loads(report_path.read_text())
+    assert report["evaluation_cohort"] == {
+        "id": "subject-likeness-legacy-v1", "version": "1.0"
+    }
     assert [item["step"] for item in report["checkpoints"]] == [100, 200]
     assert report["checkpoints"][1]["final"] is True
     assert report["ranking"]["status"] == "available"
@@ -53,6 +56,28 @@ def test_associates_only_checkpoint_steps_including_final_and_ranks(tmp_path):
     assert sample["identity"]["status"] == "unavailable"
     assert sample["identity"]["cosine_similarity"] is None
     assert sample["pose_body_landmarks"]["status"] == "unavailable"
+
+
+def test_v2_case_identity_and_seed_are_recorded_from_recipe_metadata(tmp_path):
+    config_path, output = setup_job(tmp_path)
+    document = yaml.safe_load(config_path.read_text())
+    document["meta"] = {
+        "version": "2.0", "evaluation_cohort": "subject-likeness-articulated-v2",
+        "evaluation_cases": [
+            {"case_id": "anchor-front", "category": "face-anchor", "seed": 4201},
+            {"case_id": "deep-squat", "category": "articulated-pose", "seed": 4202},
+        ],
+    }
+    config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    report = json.loads(evaluation.evaluate_job(
+        job_config_path=config_path, output_dir=output,
+        reference_images=[], config={},
+    ).read_text())
+    assert report["evaluation_cohort"]["id"] == "subject-likeness-articulated-v2"
+    sample = report["checkpoints"][0]["samples"][0]
+    assert sample["case_id"] == "anchor-front"
+    assert sample["category"] == "face-anchor"
+    assert sample["seed"] == 4201
 
 
 def test_incomplete_prompt_seed_set_disables_ranking(tmp_path):
