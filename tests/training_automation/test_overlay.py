@@ -74,6 +74,8 @@ def test_docker_overlay_adds_one_opt_in_unified_gui_entrypoint_without_changing_
     assert not any(line.startswith("CMD ") for line in instructions)
     assert not any(line.startswith("ENTRYPOINT ") for line in instructions)
     assert "training_automation.unified_supervisor" in command
+    assert "training_automation prepare-unified" in command
+    assert command.index("prepare-unified") < command.index("unified_supervisor") < command.index('exec "$gui_start"')
     assert 'exec "$gui_start"' in command
     assert 'TRAINING_GUI_START:-/start.sh' in command
     assert "test -x /start.sh" in dockerfile

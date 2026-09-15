@@ -76,7 +76,9 @@ def test_top_overview_compares_same_prompt_with_raw_cosine_axis(tmp_path):
     with Image.open(output) as image:
         image.load()
         assert image.width == 1600 and image.height <= 800
-    assert cosine_axis_ticks(10, 110) == (("-1", 28), ("0", 60), ("+1", 92))
+    assert cosine_axis_ticks(10, 110) == (("-1", 26), ("0", 60), ("+1", 94))
+    assert 10 < cosine_axis_ticks(10, 110)[0][1]
+    assert cosine_axis_ticks(10, 110)[-1][1] < 110
 
 
 def test_visible_metric_labels_are_interpretable_italian_without_fake_scores():
