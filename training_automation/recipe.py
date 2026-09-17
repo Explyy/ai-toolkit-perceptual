@@ -17,6 +17,13 @@ def _at(value: dict[str, Any], *path: str) -> Any:
 
 EVALUATION_COHORT = "subject-likeness-core-v3"
 EVALUATION_PROMPT_COUNT = 6
+# The fields a declared refinement phase is allowed to change. Pinning them to
+# the values of the full run would make a refinement recipe fail the very
+# validator that is supposed to protect it, so they are checked as a phase
+# instead of compared to the base recipe.
+REFINEMENT_FIELDS = (("train", "steps"), ("train", "lr"), ("datasets", "num_repeats"))
+BASE_LEARNING_RATE = 0.00005
+BASE_RESOLUTION_REPEATS = [16, 4, 1]
 
 
 def _validate_cohort(document: dict[str, Any], *, prompt_count: int) -> None:
@@ -51,7 +58,73 @@ def _validate_cohort(document: dict[str, Any], *, prompt_count: int) -> None:
             )
 
 
-def _validate_recipe(recipe_path: Path, repo_root: Path, *, prompt_count: int) -> dict[str, Any]:
+def _validate_refinement_phase(process: dict[str, Any]) -> None:
+    """Check the deviations a refinement recipe is allowed to carry.
+
+    The refinement pass concentrates the same exposure budget on the highest
+    resolution and the low-noise band; it is not a licence to retrain with a
+    different budget or a larger step.
+    """
+    train = process["train"]
+    dataset = process["datasets"][0]
+    # A refinement pass must concentrate the budget on one band instead of the
+    # uniform default, and there are exactly two ways to do it: the cubic
+    # sampling of content_or_style: style, which favours the low-noise band, or
+    # the centre-dense timestep array of timestep_type: sigmoid, which favours
+    # the band where face geometry resolves. A recipe that does neither is a
+    # plain rerun at a different resolution and is refused.
+    band = (train.get("content_or_style"), train.get("timestep_type"))
+    if band not in {("style", "linear"), ("balanced", "sigmoid")}:
+        raise BackupError(
+            "a refinement recipe must concentrate one noise band: either "
+            "content_or_style: style with timestep_type: linear, or "
+            "content_or_style: balanced with timestep_type: sigmoid; "
+            f"got content_or_style={train.get('content_or_style')!r} "
+            f"timestep_type={train.get('timestep_type')!r}"
+        )
+    lr = train.get("lr")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not 0 < lr < BASE_LEARNING_RATE:
+        raise BackupError(
+            f"a refinement recipe requires a positive learning rate below {BASE_LEARNING_RATE}: {lr!r}"
+        )
+    repeats = dataset.get("num_repeats")
+    resolution = dataset.get("resolution")
+    if not isinstance(repeats, list) or sorted(repeats) != sorted(BASE_RESOLUTION_REPEATS):
+        raise BackupError(
+            f"a refinement recipe must reorder the {BASE_RESOLUTION_REPEATS} exposure budget, "
+            f"not replace it: {repeats!r}"
+        )
+    if repeats == BASE_RESOLUTION_REPEATS:
+        raise BackupError("a refinement recipe that keeps the base repeat order refines nothing")
+    if not isinstance(resolution, list) or len(resolution) != len(repeats):
+        raise BackupError(
+            "a refinement recipe needs one num_repeats entry per configured resolution: "
+            f"{repeats!r} over {resolution!r}"
+        )
+    if resolution != sorted(resolution):
+        raise BackupError(f"a refinement recipe requires ascending resolutions: {resolution!r}")
+    if repeats != sorted(repeats):
+        # Comparing only the ends would accept [1, 16, 4], which concentrates the
+        # budget at 768px. The weight has to grow with the resolution.
+        raise BackupError(
+            f"a refinement recipe must weight every higher resolution more than the one "
+            f"below it, so num_repeats must ascend: {repeats!r}"
+        )
+    steps = train.get("steps")
+    cadence = (process.get("sample") or {}).get("sample_every")
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+        raise BackupError(f"a refinement recipe requires a positive train.steps: {steps!r}")
+    if not isinstance(cadence, int) or cadence <= 0 or steps % cadence:
+        # The archive gate requires the configured samples at the final step, and
+        # that verdict arrives only after the paid run.
+        raise BackupError(
+            f"a refinement recipe must end on its own {cadence!r}-step sampling cadence: {steps!r}"
+        )
+
+
+def _validate_recipe(
+    recipe_path: Path, repo_root: Path, *, prompt_count: int, refinement: bool = False
+) -> dict[str, Any]:
     document = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
     process = document["config"]["process"][0]
     expected = {
@@ -81,6 +154,10 @@ def _validate_recipe(recipe_path: Path, repo_root: Path, *, prompt_count: int) -
         ("sample", "seed"): 42,
         ("sample", "walk_seed"): False,
     }
+    if refinement:
+        for path in REFINEMENT_FIELDS:
+            expected.pop(path, None)
+        _validate_refinement_phase(process)
     for path, wanted in expected.items():
         if path[0] == "datasets":
             actual = process["datasets"][0][path[1]]
@@ -147,15 +224,31 @@ def validate_unified_recipe(recipe_path: Path, repo_root: Path) -> None:
     _validate_recipe(recipe_path, repo_root, prompt_count=EVALUATION_PROMPT_COUNT)
 
 
+def validate_refinement_recipe(recipe_path: Path, repo_root: Path) -> None:
+    """Validate the recipe of a declared refinement phase.
+
+    Same cohort, same regularization, same exposure budget and same pinned image
+    support as the full run; only the phase fields deviate.
+    """
+    _validate_recipe(
+        recipe_path, repo_root, prompt_count=EVALUATION_PROMPT_COUNT, refinement=True
+    )
+
+
 def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--unified", action="store_true")
+    parser.add_argument("--refinement", action="store_true")
     parser.add_argument("recipe", type=Path)
     parser.add_argument("repo_root", type=Path)
     args = parser.parse_args()
-    if args.unified:
+    if args.unified and args.refinement:
+        parser.error("choose either --unified or --refinement")
+    if args.refinement:
+        validate_refinement_recipe(args.recipe, args.repo_root)
+    elif args.unified:
         validate_unified_recipe(args.recipe, args.repo_root)
     else:
         validate_parallel_recipe(args.recipe, args.repo_root)

@@ -17,7 +17,13 @@ from .backup import EVIDENCE_CONTRACT, BackupError, HuggingFaceBackupClient
 from .catalog import CatalogStore, resolve_model, safe_relative_path
 from .evaluation import preflight_evaluation_backends
 from .lifecycle import SimplePodClient, verify_instance_identity, wait_for_binding
-from .queue import TrainingQueue
+from .queue import (
+    EXTENSION_OPTIONAL_FIELDS,
+    EXTENSION_REQUIRED_FIELDS,
+    QueueConfigurationError,
+    TrainingQueue,
+    normalized_phase,
+)
 from .results import publish_ranked_results
 from .staging import COMMIT_RE, PinnedDatasetStager
 from .state import atomic_write_json, read_json
@@ -64,7 +70,42 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
-def _validate_training_schedule(item: Mapping[str, Any]) -> None:
+def _declared_phase_fields(item: Mapping[str, Any]) -> set[str]:
+    """The phase fields this dataset declares, as far as they can be read.
+
+    This only decides whether the schedule may carry a reordered exposure
+    budget. The authoritative validation of the declaration stays in
+    ``_validate_extension``, which runs on the same dataset right after and
+    refuses a malformed phase, so an unreadable declaration relaxes nothing that
+    survives the manifest check.
+    """
+    raw = item.get("extend_from")
+    if not isinstance(raw, Mapping):
+        return set()
+    phase = raw.get("phase")
+    if not isinstance(phase, Mapping):
+        return set()
+    changes = phase.get("changes")
+    if not isinstance(changes, (list, tuple)):
+        return set()
+    return {str(field) for field in changes}
+
+
+def _is_reordering(value: Any, reference: list[int]) -> bool:
+    """True when ``value`` holds exactly the same items as ``reference``."""
+    if not isinstance(value, list) or len(value) != len(reference):
+        return False
+    remaining = list(reference)
+    for item in value:
+        if item not in remaining:
+            return False
+        remaining.remove(item)
+    return not remaining
+
+
+def _validate_training_schedule(
+    item: Mapping[str, Any], *, declared_fields: set[str] | frozenset[str] = frozenset()
+) -> None:
     has_steps = "training_steps" in item
     has_accounting = "training_accounting" in item
     if has_steps != has_accounting:
@@ -84,7 +125,18 @@ def _validate_training_schedule(item: Mapping[str, Any]) -> None:
     batches = _positive_int(accounting["loader_batches_per_epoch"], "loader_batches_per_epoch")
     epochs = _positive_int(accounting["loader_epochs"], "loader_epochs")
     exposures = _positive_int(accounting["original_image_exposures"], "original_image_exposures")
-    if accounting["resolution_repeats"] != RESOLUTION_REPEATS:
+    if "datasets.*.num_repeats" in declared_fields:
+        # A declared refinement phase may move the exposure budget toward the
+        # highest resolution, but not change the budget: the same repeats in a
+        # different order keep sum(repeats) identical, so the exposures identity
+        # checked below is unaffected. A dataset without that declaration stays
+        # pinned to the exact list.
+        if not _is_reordering(accounting["resolution_repeats"], RESOLUTION_REPEATS):
+            raise BackupError(
+                f"a declared phase may reorder {RESOLUTION_REPEATS}, not change it: "
+                f"{accounting['resolution_repeats']!r}"
+            )
+    elif accounting["resolution_repeats"] != RESOLUTION_REPEATS:
         raise BackupError(f"resolution_repeats must equal {RESOLUTION_REPEATS}")
     if accounting["batch_size"] != TRAIN_BATCH_SIZE:
         raise BackupError(f"batch_size must equal {TRAIN_BATCH_SIZE}")
@@ -108,13 +160,21 @@ def _validate_extension(item: Mapping[str, Any]) -> None:
         return
     if not isinstance(raw, Mapping):
         raise BackupError("extend_from must be a mapping")
-    required = {"model", "dataset_fingerprint", "base_training_steps"}
-    optional = {"checkpoint_id", "reason"}
-    unknown = set(raw) - required - optional
+    # The queue owns what an extension may declare; the manifest reuses that set
+    # instead of keeping a second copy that can fall behind it, which is how a
+    # declared refinement phase used to be refused here by name before the queue
+    # could ever see it.
+    required = EXTENSION_REQUIRED_FIELDS
+    unknown = set(raw) - required - EXTENSION_OPTIONAL_FIELDS
     if unknown:
         raise BackupError(f"extend_from has unsupported fields: {sorted(unknown)}")
     if not required.issubset(raw):
         raise BackupError(f"extend_from requires {sorted(required)}")
+    if raw.get("phase") is not None:
+        try:
+            normalized_phase(raw["phase"])
+        except QueueConfigurationError as exc:
+            raise BackupError(str(exc)) from exc
     if not str(raw["model"]).strip():
         raise BackupError("extend_from.model must name an existing catalog model")
     if not re.fullmatch(r"[0-9a-f]{64}", str(raw["dataset_fingerprint"])):
@@ -185,7 +245,7 @@ def validate_manifest(
     if any(value <= 0 for value in catalog_ids) or len(catalog_ids) != len(set(catalog_ids)):
         raise BackupError("expected catalog ids must be positive and globally unique across shards")
     for item in normalized:
-        _validate_training_schedule(item)
+        _validate_training_schedule(item, declared_fields=_declared_phase_fields(item))
         _validate_extension(item)
         if int(item.get("expected_catalog_id", 0)) <= 0:
             raise BackupError("each dataset requires its pre-reserved expected_catalog_id")

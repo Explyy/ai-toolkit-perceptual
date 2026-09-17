@@ -585,12 +585,19 @@ class CheckpointBackup:
         output_dir = evidence.get("output_dir")
         if not output_dir:
             raise BackupConfigurationError("checkpoint evidence requires an explicit output_dir")
+        # Lineage of a declared refinement phase. It is an additive optional
+        # field written only by a job that declares one: EVIDENCE_CONTRACT stays
+        # 1 because nothing an earlier version wrote becomes unreadable, and an
+        # older image reading a newer queue configuration refuses the declaration
+        # by name instead of training something it cannot describe.
+        refinement_phase = (process.get("checkpoint_backup") or {}).get("refinement_phase")
         return {
             "job_config_path": job_config_path,
             "output_dir": Path(str(output_dir)),
             "reference_images": [Path(str(item)) for item in evidence.get("reference_images", [])],
             "evaluation": dict(evidence.get("evaluation") or {}),
             "during_training": bool(evidence.get("during_training", True)),
+            "refinement_phase": dict(refinement_phase) if refinement_phase else None,
         }
 
     def _evidence_evaluator(self, settings: Mapping[str, Any]):
@@ -646,6 +653,8 @@ class CheckpointBackup:
             return None
         evaluator = self._evidence_evaluator(settings)
         record = evaluator.evaluate(step=int(entry["step"]), final=bool(entry["final"]))
+        if settings.get("refinement_phase"):
+            record["refinement_phase"] = dict(settings["refinement_phase"])
         if record["sample_run_status"] == "missing":
             if not strict:
                 return None

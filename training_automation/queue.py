@@ -25,7 +25,19 @@ QUEUE_STATE_SCHEMA = 2
 DATASET_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 DATASET_CAPTION_SUFFIXES = {".txt"}
 EXTENSION_REQUIRED_FIELDS = {"model", "dataset_fingerprint", "base_training_steps"}
-EXTENSION_OPTIONAL_FIELDS = {"checkpoint_id", "reason"}
+EXTENSION_OPTIONAL_FIELDS = {"checkpoint_id", "reason", "phase"}
+# A declared refinement phase is the only way a continuation may change the
+# training shape instead of just its duration, and it may name only these
+# fields. '*' stands for exactly one path segment, so datasets.*.num_repeats
+# covers every configured dataset without covering anything else.
+EXTENSION_PHASE_FIELDS = (
+    "train.timestep_type",
+    "train.content_or_style",
+    "train.lr",
+    "datasets.*.num_repeats",
+    "datasets.*.resolution",
+)
+EXTENSION_PHASE_FIELD_KEYS = {"name", "changes"}
 # Fields that may legitimately differ between the base run and its extension:
 # local staging paths, the automation block, the duration itself, and the
 # sampling/saving cadence, which never enters the trained weights.
@@ -151,23 +163,129 @@ def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
     return {prefix: value}
 
 
-def recipe_differences(base_process: Mapping[str, Any], new_process: Mapping[str, Any]) -> list[str]:
-    """Return the training-relevant fields that differ between two job configs."""
+_MISSING = object()
+
+
+def _matches_field(key: str, pattern: str) -> bool:
+    """Match a flattened config key against one declared phase field.
+
+    Segments are compared one by one and '*' stands for exactly one segment, so
+    ``datasets.*.num_repeats`` covers ``datasets.0.num_repeats.2`` while
+    ``train.lr`` never covers a differently named neighbour such as
+    ``train.lr_scheduler``.
+    """
+    pattern_parts = pattern.split(".")
+    key_parts = key.split(".")
+    if len(key_parts) < len(pattern_parts):
+        return False
+    return all(
+        part == "*" or part == key_parts[index] for index, part in enumerate(pattern_parts)
+    )
+
+
+def _training_differences(
+    base_process: Mapping[str, Any], new_process: Mapping[str, Any]
+) -> list[tuple[str, Any, Any]]:
     base = _flatten(dict(base_process))
     current = _flatten(dict(new_process))
-    missing = object()
-    differences = []
+    differences: list[tuple[str, Any, Any]] = []
     for key in sorted(set(base) | set(current)):
         if any(key == item or key.startswith(f"{item}.") for item in EXTENSION_IGNORED_FIELDS):
             continue
-        before = base.get(key, missing)
-        after = current.get(key, missing)
+        before = base.get(key, _MISSING)
+        after = current.get(key, _MISSING)
         if before != after:
-            differences.append(
-                f"{key}: base={'<absent>' if before is missing else before!r} "
-                f"extension={'<absent>' if after is missing else after!r}"
-            )
+            differences.append((key, before, after))
     return differences
+
+
+def recipe_differences(
+    base_process: Mapping[str, Any],
+    new_process: Mapping[str, Any],
+    *,
+    declared_fields: Sequence[str] = (),
+) -> list[str]:
+    """Return the training-relevant fields that differ between two job configs.
+
+    ``declared_fields`` names the fields of a declared refinement phase: those
+    are reported by ``phase_deviations`` instead of refusing the continuation.
+    Without a declaration the result is exactly the historical one.
+    """
+    differences = []
+    for key, before, after in _training_differences(base_process, new_process):
+        if any(_matches_field(key, item) for item in declared_fields):
+            continue
+        differences.append(
+            f"{key}: base={'<absent>' if before is _MISSING else before!r} "
+            f"extension={'<absent>' if after is _MISSING else after!r}"
+        )
+    return differences
+
+
+def phase_deviations(
+    base_process: Mapping[str, Any],
+    new_process: Mapping[str, Any],
+    declared_fields: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Return the differences a declared refinement phase actually produced.
+
+    The declaration states intent; this states what the base and the refined
+    configuration really hold, so the lineage recorded with the run is the
+    observed deviation and not only the promise. A field that is absent on one
+    side simply has no entry for that side.
+    """
+    deviations: list[dict[str, Any]] = []
+    for key, before, after in _training_differences(base_process, new_process):
+        if not any(_matches_field(key, item) for item in declared_fields):
+            continue
+        entry: dict[str, Any] = {"field": key}
+        if before is not _MISSING:
+            entry["base"] = before
+        if after is not _MISSING:
+            entry["extension"] = after
+        deviations.append(entry)
+    return deviations
+
+
+def normalized_phase(raw: Any) -> dict[str, Any]:
+    """Validate the declaration of a refinement phase.
+
+    The declaration is deliberately narrow: a phase names itself and the exact
+    training-shape fields it intends to change, chosen from a fixed set. Every
+    other field of the base recipe still has to match.
+
+    This is the single validation of a phase in the project: the deployment
+    manifest calls it too, so a manifest and a queue configuration cannot drift
+    apart on what a phase is allowed to declare.
+    """
+    if not isinstance(raw, Mapping):
+        raise QueueConfigurationError("extend_from.phase must be a mapping")
+    unknown = set(raw) - EXTENSION_PHASE_FIELD_KEYS
+    if unknown:
+        raise QueueConfigurationError(f"extend_from.phase has unsupported fields: {sorted(unknown)}")
+    missing = EXTENSION_PHASE_FIELD_KEYS - set(raw)
+    if missing:
+        raise QueueConfigurationError(f"extend_from.phase requires {sorted(missing)}")
+    name = str(raw["name"]).strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name):
+        raise QueueConfigurationError(
+            "extend_from.phase.name must be a short lowercase slug of letters, digits and dashes"
+        )
+    changes = raw["changes"]
+    if not isinstance(changes, (list, tuple)) or not changes:
+        raise QueueConfigurationError(
+            "extend_from.phase.changes must list at least one field this phase changes"
+        )
+    declared = [str(item) for item in changes]
+    if len(set(declared)) != len(declared):
+        raise QueueConfigurationError("extend_from.phase.changes must not repeat a field")
+    unsupported = sorted(set(declared) - set(EXTENSION_PHASE_FIELDS))
+    if unsupported:
+        raise QueueConfigurationError(
+            f"extend_from.phase.changes may only name {list(EXTENSION_PHASE_FIELDS)}; "
+            f"unsupported: {unsupported}"
+        )
+    return {"name": name, "changes": sorted(declared)}
 
 
 def _normalized_extension(raw: Any) -> dict[str, Any]:
@@ -199,6 +317,8 @@ def _normalized_extension(raw: Any) -> dict[str, Any]:
         normalized["checkpoint_id"] = str(raw["checkpoint_id"])
     if raw.get("reason"):
         normalized["reason"] = str(raw["reason"])
+    if raw.get("phase") is not None:
+        normalized["phase"] = normalized_phase(raw["phase"])
     return normalized
 
 
@@ -403,6 +523,14 @@ class TrainingQueue:
                 backup.setdefault(
                     "state_path", str(output_root / job_id / ".automation" / "backup-state.json")
                 )
+                if extension is not None and extension.get("phase") is not None:
+                    # Lineage: the per-checkpoint evidence published for this run
+                    # carries the declared phase, so a reader of the catalog can
+                    # tell a refined model from a plain continuation. The key is
+                    # written only for a declared phase and lives in the
+                    # automation block, which is already exempt from the recipe
+                    # comparison, so no other job changes by a single byte.
+                    backup["refinement_phase"] = copy.deepcopy(extension["phase"])
                 evidence = copy.deepcopy(self.config.get("checkpoint_evidence") or {})
                 evaluation_config = copy.deepcopy(self.config.get("evaluation") or {})
                 if (
@@ -544,9 +672,11 @@ class TrainingQueue:
     def prepare_extension(self, job: QueueJob) -> dict[str, Any]:
         """Continue an existing model instead of retraining it from zero.
 
-        Only the duration may change. Dataset bytes, catalog identity and the
-        training-relevant recipe fields are verified against the immutable
-        evidence of the base checkpoint; an incompatible base is refused.
+        Only the duration may change, unless the continuation declares a
+        refinement phase and names the training-shape fields it changes. Dataset
+        bytes, catalog identity and every other training-relevant recipe field
+        are verified against the immutable evidence of the base checkpoint; an
+        incompatible base is refused.
         """
         from .backup import HuggingFaceBackupClient
         from .catalog import CatalogStore, resolve_model, restore_training, safe_relative_path
@@ -560,6 +690,8 @@ class TrainingQueue:
                 f"extension of {job.job_id} must run past its base checkpoint "
                 f"({requested_steps} <= {declaration['base_training_steps']})"
             )
+        if declaration.get("phase") is not None:
+            self._assert_phase_evidence_reachable(job, process, declaration)
         if job.dataset_folder is None:
             raise QueueConfigurationError(f"extension of {job.job_id} has no resolved dataset folder")
         actual_fingerprint = dataset_content_fingerprint(job.dataset_folder)
@@ -600,17 +732,28 @@ class TrainingQueue:
             )
         checkpoint = self._extension_checkpoint(model, declaration)
         base_process = self._base_process(client, connection, checkpoint, job)
-        differences = recipe_differences(base_process, process)
+        phase = declaration.get("phase")
+        declared_fields = tuple(phase["changes"]) if phase is not None else ()
+        differences = recipe_differences(base_process, process, declared_fields=declared_fields)
         if differences:
             shown = differences[:EXTENSION_REPORTED_DIFFERENCES]
             more = len(differences) - len(shown)
+            allowance = (
+                "only the duration may change"
+                if phase is None
+                else f"only the duration and the declared {phase['name']} phase fields "
+                f"{list(declared_fields)} may change"
+            )
             raise QueueConfigurationError(
                 f"refusing extension of {job.job_id}: the base checkpoint was trained with a "
-                "different recipe; only the duration may change, while sampling prompts, save "
+                f"different recipe; {allowance}, while sampling prompts, save "
                 "and sample cadence and local paths are already exempt. Differences: "
                 + "; ".join(shown)
                 + (f"; and {more} more" if more else "")
             )
+        deviations = (
+            phase_deviations(base_process, process, declared_fields) if phase is not None else []
+        )
         staging = self.state_path.parent / "extensions" / job.job_id / "base"
         staging.mkdir(parents=True, exist_ok=True)
         restore_training(
@@ -684,10 +827,68 @@ class TrainingQueue:
             "dataset_fingerprint": actual_fingerprint,
             "resolved_training_steps": requested_steps,
             "installed": installed,
-            "recipe_comparison": "training-relevant fields identical to the base configuration",
+            "recipe_comparison": (
+                "training-relevant fields identical to the base configuration"
+                if phase is None
+                else "training-relevant fields identical to the base configuration except the "
+                f"fields declared by the {phase['name']} refinement phase"
+            ),
         }
+        if phase is not None:
+            record["refinement_phase"] = {**phase, "deviations": deviations}
         atomic_write_json(target_root / ".automation" / "extension.json", record)
         return record
+
+    @staticmethod
+    def _assert_phase_evidence_reachable(
+        job: QueueJob, process: Mapping[str, Any], declaration: Mapping[str, Any]
+    ) -> None:
+        """Refuse a refinement whose completion evidence could never be produced.
+
+        The archive gate requires the configured sample set at every scheduled
+        step past the base checkpoint and at the final step. That verdict only
+        arrives when the whole paid run is already over, so a refinement that
+        changes the training shape has its schedule checked here, before the
+        first GPU hour, instead of failing after all of them.
+        """
+        sample = process.get("sample") or {}
+        samples = sample.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise QueueConfigurationError(
+                f"refusing refinement of {job.job_id}: the recipe configures no evaluation sample, "
+                "so this run could never produce its completion evidence"
+            )
+        # The archive gate accepts only these cadences, so the pre-flight uses
+        # its constant instead of a looser copy of it. bootstrap imports this
+        # module, so the import stays local to this call.
+        from .bootstrap import SUPPORTED_SAMPLE_CADENCES
+
+        sample_every = sample.get("sample_every")
+        save_every = (process.get("save") or {}).get("save_every")
+        if (
+            isinstance(sample_every, bool)
+            or not isinstance(sample_every, int)
+            or sample_every not in SUPPORTED_SAMPLE_CADENCES
+            or save_every != sample_every
+        ):
+            raise QueueConfigurationError(
+                f"refusing refinement of {job.job_id}: sample.sample_every and save.save_every "
+                f"must be the same cadence, one of {sorted(SUPPORTED_SAMPLE_CADENCES)} "
+                f"({sample_every!r} and {save_every!r})"
+            )
+        requested_steps = int(process["train"]["steps"])
+        if requested_steps % sample_every:
+            raise QueueConfigurationError(
+                f"refusing refinement of {job.job_id}: the final step {requested_steps} is not on "
+                f"the {sample_every}-step sampling cadence, so the final checkpoint would have no "
+                "scheduled evaluation and the run could never be archived"
+            )
+        base_steps = int(declaration["base_training_steps"])
+        if base_steps >= requested_steps:
+            raise QueueConfigurationError(
+                f"refusing refinement of {job.job_id}: base step {base_steps} is not below the "
+                f"final step {requested_steps}"
+            )
 
     @staticmethod
     def _extension_checkpoint(

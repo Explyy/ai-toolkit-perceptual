@@ -27,6 +27,8 @@ RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/outp
     && python -m compileall -q /app/ai-toolkit/jobs/process/BaseSDTrainProcess.py \
     && python -m training_automation.recipe /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml /app/ai-toolkit \
     && python -m training_automation.recipe --unified /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-v2.yaml /app/ai-toolkit \
+    && python -m training_automation.recipe --refinement /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-refinement.yaml /app/ai-toolkit \
+    && python -m training_automation.recipe --refinement /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-refinement-sigmoid.yaml /app/ai-toolkit \
     && python -m training_automation.unified_supervisor --help >/dev/null \
     && python -m training_automation --help >/dev/null \
     && python -m training_automation upload-dataset --help >/dev/null \

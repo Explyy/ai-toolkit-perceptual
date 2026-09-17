@@ -156,7 +156,8 @@ error, instead of silently retraining or silently continuing:
   and the sampling and saving cadence are exempt; the sampling prompts are
   exempt too, because they never enter the trained weights. Any other difference
   — learning rate, network, weight noise, dataset repeats, masking, preservation
-  — is reported by name with both values and refuses the extension.
+  — is reported by name with both values and refuses the extension, unless the
+  continuation declares a refinement phase that names that field (see below).
 
 Because `bound_norm` is part of the weight-noise configuration, extending one of
 the six models trained before it was introduced requires pinning
@@ -173,6 +174,108 @@ base weight can be installed under the extended job's name, or if the base
 checkpoint has no `optimizer.pt`, the extension is refused rather than started
 from zero. Local retention never deletes the restored base file, because those
 bytes are not in this job's own verified backup state.
+
+### Declared refinement phase
+
+A continuation that only needs more of the same is a duration change. A second,
+short pass that deliberately concentrates capacity elsewhere is a **refinement
+phase**: it is declared, it names the fields it changes, and it may change
+nothing else.
+
+```yaml
+extend_from:
+  model: 'Exact catalog name or numeric id'
+  dataset_fingerprint: '<64 hex content hash of the images and captions>'
+  base_training_steps: 1200
+  phase:
+    name: low-noise-1024
+    changes:
+      - train.content_or_style
+      - train.lr
+      - datasets.*.num_repeats
+```
+
+`changes` may only name these five fields, and `*` stands for exactly one path
+segment, so `datasets.*.num_repeats` covers every configured dataset and nothing
+else:
+
+- `train.timestep_type`
+- `train.content_or_style`
+- `train.lr`
+- `datasets.*.num_repeats`
+- `datasets.*.resolution`
+
+A field outside that set, a field that differs without being declared, and a
+declaration that is not a `name` plus a non-empty `changes` list are all refused
+before the first paid step, with the differing fields reported by name and with
+both values. Without `phase` the continuation keeps exactly the duration-only
+behavior described above: the declaration enters the job id derivation like the
+rest of `extend_from`, so a refined run is again a separate run identity and
+existing job ids do not move.
+
+Why a refinement phase exists, measured on the current recipe: it trains 76% of
+its exposures at 512px (`num_repeats: [16, 4, 1]` over `[512, 768, 1024]`) with
+the default `content_or_style: balanced`, which spends a uniform 20% of the
+budget in each noise band. Fine facial detail is learned in the low-noise band,
+but at 512px a face inside a full-figure crop has too few pixels to carry it, so
+the two settings compound. `content_or_style: style` switches the trainer to the
+cubic sampling of `jobs/process/BaseSDTrainProcess.py`, which places 58.5% of the
+steps below timestep 200; `timestep_type: linear` selects the timestep schedule
+and does not disable that branch. Combined with the repeats reversed toward
+1024px, that is the refinement pass. The `[16, 4, 1]` bias is documented in the
+upstream quickstarts as a speed choice, not a quality one.
+
+`config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-refinement.yaml`
+is that recipe: recipe v2 with `content_or_style: style`, `num_repeats:
+[1, 4, 16]`, `lr: 0.00002` and `steps: 1500`, which is 300 steps past a
+1200-step base. Every other training-relevant field is byte-identical to v2, so
+the queue accepts it against a v2-trained base with the declaration above. Use it
+as the `trainer_yaml` of the refinement queue configuration and validate it with
+its own validator, which checks the same cohort, regularization and pinned-image
+support as the full run and, for the phase fields, that the pass reuses the same
+exposure budget in ascending order, so every higher resolution is weighted more
+than the one below it, with a positive learning rate below the base one:
+
+```bash
+python -m training_automation.recipe --refinement \
+  /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-refinement.yaml \
+  /app/ai-toolkit
+```
+
+Because the archive gate requires the configured sample set at every scheduled
+step past the base checkpoint and at the final step, and that verdict only
+arrives when the paid run is already over, a declared phase also has its schedule
+checked before the first GPU hour: the recipe must configure at least one
+evaluation sample, `sample.sample_every` and `save.save_every` must be the same
+cadence and one the archive gate itself supports (100 or 200), and the final step
+must sit on that cadence. A refinement whose
+completion evidence could never be produced is refused instead of started.
+
+The lineage stays auditable in three places: the declaration is in the queue
+state under `extend_from`, `<output>/<job>/.automation/extension.json` records
+the declared phase together with the deviations actually observed against the
+base configuration, and every checkpoint this run publishes carries
+`refinement_phase` in its `evaluation.json` on the Hub, so a reader of the
+catalog can tell a refined model from a plain continuation and see with which
+fields. The per-checkpoint evidence contract stays at 1: the field is additive
+and optional, nothing written by an earlier version becomes unreadable, and an
+older image reading a newer queue configuration refuses the unknown
+`extend_from.phase` by name instead of training something it cannot describe.
+
+A phase is declared the same way in a queue configuration and in a private
+deployment manifest: the manifest validates `extend_from` against the field set
+the queue itself owns and validates the declaration with the queue's own
+validator, so the two cannot drift apart on what a phase may declare, and the
+whole mapping is copied into the generated queue configuration.
+
+One manifest rule follows from the phase. A dataset's
+`training_accounting.resolution_repeats` is normally pinned to `[16, 4, 1]`
+exactly; a dataset whose phase declares `datasets.*.num_repeats` may instead
+carry those same repeats in a different order, and nothing else. The budget
+itself does not move — `[1, 4, 16]` and `[16, 4, 1]` both sum to 21 — so the
+`original_image_exposures` identity is untouched, and a dataset that declares no
+phase, or a phase that does not name `datasets.*.num_repeats`, is still refused
+with the exact list.
 
 ## Evaluation limits
 
