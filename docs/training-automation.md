@@ -4,7 +4,7 @@ This opt-in pipeline materializes one AI Toolkit job per dataset, runs jobs sequ
 
 ## Configure and run
 
-Copy `config/examples/klein_automation` to persistent storage and edit only explicit placeholders. The trainer template contains 23 deterministic prompt/seed pairs; add, remove, or replace `sample.samples` for a custom count. Each dataset entry supplies its folder, trigger, reference images, catalog name, and generation destination kind.
+Copy `config/examples/klein_automation` to persistent storage and edit only explicit placeholders. Both masked Klein templates contain six deterministic prompt/seed pairs — two full figures in an articulated scene, two medium shots and two close-ups on the face — and save and sample every 100 steps; add, remove, or replace `sample.samples` for a custom count. Each dataset entry supplies its folder, trigger, reference images, catalog name, and generation destination kind.
 
 Set credentials in the pod environment, never in YAML:
 
@@ -17,9 +17,59 @@ python -m training_automation run /storage/config/klein/automation.yaml
 
 `repo_type` accepts `model` or `dataset`. The repository must already exist and report `private: true`; missing credentials, an inaccessible repository, or a public repository stops before training. The queue config remains schema 1. Queue state is schema 2 and migrates schema-1 entries by preserving completed training. Backup state is schema 2 and binds receipts to `repo_id`, `repo_type`, and `remote_prefix`. A schema-1 backup state with receipts is rejected because its destination cannot be proven; preserve it and choose a new `state_path`. All state writes use atomic replacement.
 
-Stable job IDs include the template bytes, resolved dataset folder, trigger, references, effective `trainer_dataset` overrides, and optional `dataset_revision`. Increment `dataset_revision` when files or captions change without changing their folder. A process found in a training or evaluation `running` phase after restart returns to that phase's pending state. A queue lock refuses a second launcher. Successful training is recorded before evaluation starts, so retrying a failed evaluation never relaunches the GPU job. A failed training or evaluation makes the CLI exit nonzero.
+Stable job IDs include the template bytes, resolved dataset folder, trigger, references, effective `trainer_dataset` overrides, and optional `dataset_revision`. Increment `dataset_revision` when files or captions change without changing their folder. A process found in a training or evaluation `running` phase after restart returns to that phase's pending state. A queue lock refuses a second launcher. Successful training is recorded before evaluation starts, so retrying a failed evaluation never relaunches the GPU job. A failed training, checkpoint-evidence, evaluation or publication step makes the CLI exit nonzero.
 
 The checkpoint hook runs after the model and available `optimizer.pt`, `config.yaml`, and learnable state are fully saved, but before retention. It writes a local pending manifest before upload, retries, verifies remote sizes at the returned commit and LFS SHA-256 when the Hub exposes it, then updates the catalog with a parent-commit guard. A failed upload, verification, or catalog update stops training; retention also independently refuses to delete bytes missing from verified state. Backup never waits for evaluation and never deletes local or remote data. Optimizer state reflects what AI Toolkit actually saves; it does not promise exact RNG or dataloader replay.
+
+### Evidence for every checkpoint
+
+A checkpoint whose images live only on the pod disk is worth nothing once the
+machine is released: on 2026-09-17 LaProfumosa finished at 749 steps and lost
+every sample that way, keeping only weights, optimizer and manifest. Each
+checkpoint folder therefore also receives its own images and its own evaluation
+record, next to `weights/`, `resume/` and `manifest.json`:
+
+```text
+training-backups/models/<numeric-name>/checkpoints/<checkpoint-id>/
+├── manifest.json
+├── weights/ ...
+├── resume/ ...
+├── evaluation.json
+└── samples/<original sample filenames>
+```
+
+`evaluation.json` records the cohort, the step, the sample run status, every
+sample with its prompt, seed, case id, identity, image and pose metrics, and one
+checkpoint score: mean face cosine over the images of that checkpoint with
+exactly one valid face, plus mean clipping proxy. It also carries the remote
+path, size and SHA-256 of every uploaded image, so the checkpoint can be
+reviewed and compared without regenerating anything.
+
+The trainer saves a checkpoint and only afterwards samples that same step, so
+the images of step N do not exist when step N is protected. Evidence is
+published in a second pass: every checkpoint backup flushes the checkpoints
+whose sample run has completed in the meantime, and the queue runs one strict
+pass after the training process exits, which covers the last checkpoint. The
+worst case is therefore one cadence of exposure on the newest checkpoint, not a
+whole shard. A failure during training is recorded in the backup state and
+retried by the next checkpoint; it never stops a paid run. The strict pass does
+stop the job, because a checkpoint without evidence is not a delivered
+checkpoint, and the shard completion gate refuses to self-delete while any
+receipt written under this evidence contract lacks verified evidence. Every
+receipt this version creates carries that contract marker; a receipt written
+before the contract existed cannot be completed retroactively, so it is
+tolerated and listed by step in the completion evidence as uncovered, never
+counted as covered. The backup state schema stays at 2 on purpose: the marker is
+an additive optional field, while a schema bump would make the state guard
+refuse every existing state that already holds receipts, including one being
+written by a pod that is training right now. Nothing already published is deleted
+or overwritten, and the remote associations the evaluation code already verifies
+stay unchanged: evidence adds files, it does not add catalog checkpoints.
+
+Set `checkpoint_evidence.during_training: false` in the queue configuration to
+keep the identity and pose models out of the live trainer process. The strict
+pass after training still produces the same complete evidence; only the
+protection against losing the machine mid-run is traded away.
 
 ## Catalog and restore
 
@@ -64,6 +114,66 @@ python -m training_automation index-existing existing/path/model.safetensors \
 
 This explicit command downloads the remote artifact into temporary storage only to compute its SHA-256, then commits catalog metadata pointing to the original path.
 
+## Extending an existing training
+
+A model that only needs a longer run — more epochs on the same photographs with
+the same recipe — continues from its last verified catalog checkpoint instead of
+restarting from zero. Declare it on the dataset entry of the queue configuration
+or of the private deployment manifest:
+
+```yaml
+extend_from:
+  model: 'Exact catalog name or numeric id'
+  dataset_fingerprint: '<64 hex content hash of the images and captions>'
+  base_training_steps: 749
+  checkpoint_id: 'optional exact catalog checkpoint id'
+  reason: 'optional note'
+```
+
+Obtain the content hash from the dataset folder that will actually be trained:
+
+```bash
+python -m training_automation dataset-fingerprint /storage/datasets/RUN/SHARD/subject
+```
+
+The extension is a separate, explicit run identity: `extend_from` enters the job
+id derivation, so the extended run has its own job id, its own checkpoint ids and
+its own remote folders. It appends checkpoints to the same catalog model and
+never rewrites or invalidates an existing entry. Jobs without `extend_from` keep
+exactly the job ids they already had.
+
+Before any paid step the queue refuses an incompatible base with a specific
+error, instead of silently retraining or silently continuing:
+
+- the recomputed dataset content hash must equal the declared one;
+- the new duration must run past the base step;
+- the chosen checkpoint must sit exactly at `base_training_steps` and must carry
+  trainer resume state, so a weights-only imported entry is rejected;
+- the catalog model's trigger word and base architecture must match the job;
+- the base run's own `config.yaml`, downloaded and hash-verified from the
+  immutable checkpoint revision, must match the new configuration on every
+  training-relevant field. Only local paths, the automation block, the duration
+  and the sampling and saving cadence are exempt; the sampling prompts are
+  exempt too, because they never enter the trained weights. Any other difference
+  — learning rate, network, weight noise, dataset repeats, masking, preservation
+  — is reported by name with both values and refuses the extension.
+
+Because `bound_norm` is part of the weight-noise configuration, extending one of
+the six models trained before it was introduced requires pinning
+`TRAINING_RECIPE_PATH` to a recipe whose weight-noise block matches that base
+run. Adding the new regularization to an existing run is a recipe change, not a
+duration change, and is refused by design.
+
+The verified base weight and `optimizer.pt` are then installed into the extended
+job's save root, with the weight renamed to the extended job's name so the
+trainer actually finds and resumes it; the base `config.yaml` is kept in staging
+as evidence and is not installed. The step recorded in the weight metadata makes
+the trainer continue from it, and the schedule runs to the new duration. If no
+base weight can be installed under the extended job's name, or if the base
+checkpoint has no `optimizer.pt`, the extension is refused rather than started
+from zero. Local retention never deletes the restored base file, because those
+bytes are not in this job's own verified backup state.
+
 ## Evaluation limits
 
 Evaluate an existing sample directory without launching training:
@@ -99,6 +209,17 @@ python -m training_automation gallery \
   --samples-root /storage/archive/jobs/SUBJECT_JOB/samples \
   --output /storage/gallery/SUBJECT_JOB.html
 ```
+
+Publication happens at the end of **each job**, not at the finalization of the
+shard: as soon as a job's evaluation completes, its ranked grids, top three and
+latest pointer are published and recorded in the queue state together with the
+local evidence manifest `published-evidence.json`. Interrupting a queue halfway
+no longer costs the publication of the jobs that already finished. The shard
+finalization reuses that exact publication for the archive instead of repeating
+it, and only publishes a job that has none. Enable it with a `results` block
+carrying `enabled`, `run_id` and `work_dir`; the parallel bootstrap writes that
+block automatically, while the unified workflow keeps publishing its single job
+itself.
 
 The automatic publisher uses the report's existing shortlist only after rechecking complete comparable prompt/seed sets, available aggregate rankings, and unique verified checkpoint associations. It never makes a human selection or changes `selected_checkpoint_id`. For each available candidate, up to three, it downloads the checkpoint weight at the exact catalog revision, verifies the catalog size and SHA-256, and uploads a verified copy with its raster contact sheet and machine-readable evidence:
 
@@ -230,9 +351,9 @@ The separate version-1 dataset catalog at `training-automation/dataset-catalog.j
 
 Historical top-one results with no trustworthy completion timestamp are seeded separately through `sync.legacy_runs`, with an explicit run ID and model IDs. A configured revision is used exactly; when omitted, startup pins the same immutable current catalog revision used for that sync operation. Future publications use per-model latest pointers backed by persisted completion chronology. Neither path sorts UUIDs or guesses which historical run is newest.
 
-The unified recipe [trainer-subject-likeness-masked-klein-9b-v2.yaml](../config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-v2.yaml) preserves the masked Subject Likeness, Klein 9B, LoKr, and weight-noise settings and enables Differential Output Preservation from step zero with multiplier `1` and class `woman`. The pinned trainer replaces the dataset trigger with this class for the preservation target; it still requires a nonempty trigger, a network, and `train_text_encoder: false`. DOP adds computation and is an explicit regularization choice, not a guarantee of improved quality. Its fixed `subject-likeness-articulated-v2` evaluation cohort contains 12 distinct seeds and cases: two easier face anchors plus rear over-shoulder, contrapposto, rotated seated, cross-legged, squat, one-knee kneeling, mid-stride walking, overhead lunge, table-supported lean, and stair poses. Prompts say `single adult subject [trigger]`, state visible limb geometry, vary wardrobe/location/light, and do not infer gender from a folder name. Case ID, category, seed, and cohort version are recorded in evaluation evidence. Pose values remain 2D image-plane proxies; they do not prove prompt adherence or anatomical correctness, and v1/v2 cohorts must not be compared as if they were identical.
+The unified recipe [trainer-subject-likeness-masked-klein-9b-v2.yaml](../config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-v2.yaml) preserves the masked Subject Likeness, Klein 9B, LoKr, and weight-noise settings and enables Differential Output Preservation from step zero with multiplier `1` and class `woman`. The pinned trainer replaces the dataset trigger with this class for the preservation target; it still requires a nonempty trigger, a network, and `train_text_encoder: false`. DOP adds computation and is an explicit regularization choice, not a guarantee of improved quality. Both masked recipes now enable `bound_norm` in `weight_noise` and share one fixed `subject-likeness-core-v3` evaluation cohort of six distinct seeds and cases: two full figures in an articulated scene (contrapposto in a sunlit courtyard, mid-stride walking in a station concourse), two medium shots (a three-quarter turn at a window, a bench in a workshop) and two close-ups on the face (frontal and three-quarter). Prompts open with `single adult subject [trigger]`, state visible limb geometry, vary wardrobe/location/light, and do not infer gender from a folder name. Case ID, category, seed, and cohort version are recorded in evaluation evidence. Pose values remain 2D image-plane proxies; they do not prove prompt adherence or anatomical correctness. The earlier legacy, articulated-v2 and core-v3 cohorts must never be compared as if they were the same evidence: the core cohort trades breadth for a shorter, denser cadence, and with six prompts a run whose generated images rarely contain exactly one valid face can leave the identity ranking and the automatic shortlist honestly unavailable.
 
-Differential Output Preservation and cached text embeddings are mutually exclusive: the trainer refuses the combination in `validate_configs` (`Cannot use differential output preservation with caching text embeddings`), and the refusal happens at job construction, before the first step, so no code-level review can observe it. Both masked Klein recipes therefore ship `cache_text_embeddings: false`, `recipe.py` pins that value with the DOP fields so the pair cannot drift apart, and the patched masked Quickstart preset disables the cache whenever it enables preservation. The cost is real: the Qwen3-8B text encoder runs every step instead of serving cached embeddings. This was found on the first real GPU dispatch of image `d8bd669` on 2026-09-17, after the change had passed independent Standards and root Spec review as source.
+Differential Output Preservation and cached text embeddings are mutually exclusive: the trainer refuses the combination in `validate_configs` (`Cannot use differential output preservation with caching text embeddings`), and the refusal happens at job construction, before the first step, so no code-level review can observe it. Both masked Klein recipes therefore ship `cache_text_embeddings: false`, `recipe.py` pins that value with the DOP fields so the pair cannot drift apart, and the patched masked Quickstart preset disables the cache whenever it enables preservation. `recipe.py` also requires the pinned trainer sources to mention `bound_norm`, so an image that does not support that weight-noise field fails the Docker build instead of the first paid step. The cost is real: the Qwen3-8B text encoder runs every step instead of serving cached embeddings. This was found on the first real GPU dispatch of image `d8bd669` on 2026-09-17, after the change had passed independent Standards and root Spec review as source.
 
 The executable [Klein_Unified_Training.ipynb](../notebooks/Klein_Unified_Training.ipynb) is an optional interface to the same Python modules. Its automation source checkout is pinned to a concrete commit and every cell is clean. Training always invokes the validated native `/app/ai-toolkit/run.py`; the temporary checkout supplies the pinned automation package and recipe only. Edit the explicit repository, run ID, dataset, upload, ComfyUI, LoRA, worker, model/rank, historical-model, archive-job, and ordering fields. `ACTION="status"` is the safe Run All default: it reads durable state without cloning code, installing packages, or asking for a token. `upload` validates and atomically publishes one complete dataset folder; `index` and `discover` run the remote discovery/download path without training; `run` uses that same path and then trains only eligible work. `sync` uses latest pointers plus the explicit `RUN_ID` fallback for the original six models. `refresh` reconstructs the selected run directly from immutable private-Hub completion evidence, so deleted pod paths are unnecessary. Every action prints returned state; no cell simulates success or chooses an agent. The token comes from `HF_TOKEN` or a masked `getpass` prompt and is never stored in the notebook.
 
@@ -244,7 +365,7 @@ The `Training automation` GitHub Actions workflow runs CPU-only tests on this ba
 
 ## Parallel private deployment
 
-The opt-in `/run-parallel-training` command runs one explicitly assigned shard and replaces the inherited GUI command for that container. Set the SimplePod template `argOptions` field to exactly `/run-parallel-training`, as one argument without shell metacharacters. The public provider API no longer honours that field: `POST` and `PUT` on `/instances/templates` answer `200` and store `null`, so a template maintained through the API silently starts the inherited GUI instead of the worker, which is what emptied the 2026-09-15 launch. Set `argOptions` through the provider UI, or dispatch the worker from the per-instance `startScript`, which the API does persist. The same original template can be switched temporarily for the two disposable launches and restored to `/run-unified-training` afterward; no second template or execution-mode wrapper is required. It writes the complete child output to both the console and `<storage>/automation/<run>/<shard>/worker.log`. A failed child is held in the same container for diagnosis instead of exiting into a provider restart loop; manual cleanup remains required. The overlay does not set a new `CMD` or `ENTRYPOINT`, so normal launches continue to run the original GUI. The selected queue recipe is [trainer-subject-likeness-masked-klein-9b.yaml](../config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml), copied from `subject_likeness_masked_flux2_klein9b` at `origin/perceptual-port@ab5f146e9a30764a40bf29b0881d3a6dd7186c6f`. It retains batch size 4, AdamW8bit at `5e-5`, LoKr 32, relative weight noise `0.0125`, resolution repeats `[16,4,1]`, masked depth loss `0.005`, and subject weights `background=0`, `clothing=1`, `body=1`; DOP is enabled from the beginning with multiplier `1` and class `woman`. Fresh manifests supply each dataset's seven-epoch step count and accounting explicitly. The template's 1200-step value remains only the backward-compatible legacy fallback. Its 23 generic, clothed identity prompts are sampled every 200 steps with seed 42.
+The opt-in `/run-parallel-training` command runs one explicitly assigned shard and replaces the inherited GUI command for that container. Set the SimplePod template `argOptions` field to exactly `/run-parallel-training`, as one argument without shell metacharacters. The public provider API no longer honours that field: `POST` and `PUT` on `/instances/templates` answer `200` and store `null`, so a template maintained through the API silently starts the inherited GUI instead of the worker, which is what emptied the 2026-09-15 launch. Set `argOptions` through the provider UI, or dispatch the worker from the per-instance `startScript`, which the API does persist. The same original template can be switched temporarily for the two disposable launches and restored to `/run-unified-training` afterward; no second template or execution-mode wrapper is required. It writes the complete child output to both the console and `<storage>/automation/<run>/<shard>/worker.log`. A failed child is held in the same container for diagnosis instead of exiting into a provider restart loop; manual cleanup remains required. The overlay does not set a new `CMD` or `ENTRYPOINT`, so normal launches continue to run the original GUI. The selected queue recipe is [trainer-subject-likeness-masked-klein-9b.yaml](../config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml), copied from `subject_likeness_masked_flux2_klein9b` at `origin/perceptual-port@ab5f146e9a30764a40bf29b0881d3a6dd7186c6f`. It retains batch size 4, AdamW8bit at `5e-5`, LoKr 32, relative weight noise `0.0125` with `bound_norm: true`, resolution repeats `[16,4,1]`, masked depth loss `0.005`, and subject weights `background=0`, `clothing=1`, `body=1`; DOP is enabled from the beginning with multiplier `1` and class `woman`. Fresh manifests supply each dataset's seven-epoch step count and accounting explicitly. The template's 1200-step value remains only the backward-compatible legacy fallback. Its six seed-pinned `subject-likeness-core-v3` prompts are saved and sampled every 100 steps.
 
 Keep the real deployment manifest private. Start from [parallel-manifest.example.json](../config/examples/klein_automation/parallel-manifest.example.json), replace every placeholder, upload it to the private dataset repository, and pin `HF_MANIFEST_REVISION` to the commit containing that manifest. `dataset_revision` separately pins the source dataset tree. Every staged file carries its source path, size, SHA-256, and safe relative destination. The pod stages only entries matching its shard and refuses missing files, hash failures, traversal, symlink traversal, and conflicting local bytes.
 
@@ -267,7 +388,7 @@ The native Klein loader needs `flux-2-klein-base-9b.safetensors`; Diffusers tran
 
 The image contains InsightFace Buffalo L from the versioned upstream v0.7 release and the pinned Ultralytics pose weight. Their source URLs, sizes, hashes, and model paths are recorded in `/opt/training-automation-models/SOURCES.json`. The full remote image build runs `python docker/automation/install_evaluation_models.py`. To add only the pose weight to an existing reviewed pod without re-downloading Buffalo L, transfer that same script and run `python install_evaluation_models.py --pose-only`; it merges the pose record into the existing source manifest and does not install or replace Python packages. The parallel manifest configures both backends and bootstrap loads them before training. Buffalo pretrained weights are restricted to noncommercial research unless separately licensed.
 
-The private manifest may give a dataset `training_steps` plus immutable `training_accounting`. Both fields must appear together. Accounting records the exact source-image count, actual un-padded loader batches per epoch, loader epochs, resolution repeats `[16,4,1]`, batch size `4`, source-image exposures, and `partial_bucket_batches: un-padded`; bootstrap verifies `steps = batches × epochs` and `exposures = 21 × epochs`. These values are injected after job identity derivation, so existing job IDs remain stable, and a changed duration is accepted only while the recorded training phase is pending. The run-level `checkpoint_policy` in the example saves and samples every 200 steps and retains the last five local step saves. Bootstrap also accepts an explicit 100-step policy for immutable legacy manifests and materializes matching save and sample cadences. A manifest without this policy uses the shipped 200-step recipe default. A legacy dataset without the seven-epoch schedule keeps the template's 1200-step duration.
+The private manifest may give a dataset `training_steps` plus immutable `training_accounting`. Both fields must appear together. Accounting records the exact source-image count, actual un-padded loader batches per epoch, loader epochs, resolution repeats `[16,4,1]`, batch size `4`, source-image exposures, and `partial_bucket_batches: un-padded`; bootstrap verifies `steps = batches × epochs` and `exposures = 21 × epochs`. These values are injected after job identity derivation, so existing job IDs remain stable, and a changed duration is accepted only while the recorded training phase is pending. The run-level `checkpoint_policy` in the example saves and samples every 100 steps and retains the last five local step saves. Bootstrap accepts a 100-step or a 200-step policy and materializes matching save and sample cadences. A manifest without this policy uses the shipped 100-step recipe default. A legacy dataset without the seven-epoch schedule keeps the template's 1200-step duration.
 
 References listed in this manifest are training-set images. Reports and completion evidence label them `reference_provenance: training-set`; their cosine scores measure likeness to training examples and do not establish held-out quality or generalization.
 
@@ -275,7 +396,7 @@ References listed in this manifest are training-set images. Reports and completi
 
 Create each SimplePod instance once through management and never retry an uncertain creation request. Set an exact notes marker such as `training-run:<run_id>;shard:a`, then upload one private binding based on [parallel-binding.example.json](../config/examples/klein_automation/parallel-binding.example.json). Bootstrap polls only the configured binding path for a bounded time. It calls `GET /instances/{id}` and requires exact equality for numeric `id`, `hashId`, and `notes`; it never finds a pod by name or list search. This follows the [official SimplePod API](https://api.simplepod.ai/docs_ai.html), which documents `X-AUTH-TOKEN`, `GET /instances/{id}`, and `DELETE /instances/{id}`.
 
-Successful training alone does not trigger deletion. Every assigned job must have completed training and evaluation, every checkpoint scheduled by the job's configured 100- or 200-step cadence plus its final checkpoint must have the complete configured prompt set uniquely associated with a verified catalog receipt, and all archived bytes must pass size plus SHA-256 verification. Before archiving, bootstrap automatically publishes each job's gallery and deterministic top-candidate folders described above and records their immutable revision in completion evidence. It persists one completion timestamp before publishing so the new result can safely advance the per-model latest pointer. When `TRAINING_LORAS_ROOT` names an existing shared LoRA directory, bootstrap also downloads and verifies ranks 1, 2, and 3 from the just-published immutable revision before archive or deletion; conflicts or an incomplete sync hold the instance, and the sync receipt is archived. Without that environment variable, legacy behavior remains unchanged. Archive metadata is fetched from the same immutable Hub revision in batches of at most 100 paths so large sample sets do not exceed the Hub request limit; any failed batch or missing entry fails the complete verification. When Hub metadata lacks a hash, verification downloads the exact immutable revision and hashes those bytes. Configured face and pose backends must load and run, and training-set reference identity must meet its coverage gate. Missing or ambiguous people or faces in generated images are honest evaluated quality outcomes and may make a ranking unavailable without fabricating a score. A second commit publishes `training-runs/<run>/<shard>/completion.json` with the evidence commit and hashes. Bootstrap then re-fetches and re-verifies the same instance identity before issuing one `DELETE /instances/{id}`.
+Successful training alone does not trigger deletion. Every assigned job must have completed training and evaluation, every checkpoint scheduled by the job's configured 100- or 200-step cadence plus its final checkpoint must have the complete configured prompt set uniquely associated with a verified catalog receipt, every receipt written under the current evidence contract must carry its own verified per-checkpoint evidence, and all archived bytes must pass size plus SHA-256 verification. An extended job is scheduled only for the steps past its base checkpoint, so the gate requires exactly those; that reduction is authorized only by a completed extension record whose base step agrees with the declaration, and an ordinary job still requires its whole schedule. The completion evidence records the resumed step and the exact scheduled steps it checked. Before archiving, bootstrap reuses the gallery and deterministic top-candidate folders each job already published and records their immutable revision in completion evidence; it publishes only a job that has none. It persists one completion timestamp before publishing so the new result can safely advance the per-model latest pointer. When `TRAINING_LORAS_ROOT` names an existing shared LoRA directory, bootstrap also downloads and verifies ranks 1, 2, and 3 from the just-published immutable revision before archive or deletion; conflicts or an incomplete sync hold the instance, and the sync receipt is archived. Without that environment variable, legacy behavior remains unchanged. Archive metadata is fetched from the same immutable Hub revision in batches of at most 100 paths so large sample sets do not exceed the Hub request limit; any failed batch or missing entry fails the complete verification. When Hub metadata lacks a hash, verification downloads the exact immutable revision and hashes those bytes. Configured face and pose backends must load and run, and training-set reference identity must meet its coverage gate. Missing or ambiguous people or faces in generated images are honest evaluated quality outcomes and may make a ranking unavailable without fabricating a score. A second commit publishes `training-runs/<run>/<shard>/completion.json` with the evidence commit and hashes. Bootstrap then re-fetches and re-verifies the same instance identity before issuing one `DELETE /instances/{id}`.
 
 Any binding, disk, staging, model download, training, backup, evaluation, identity, result export, archive, verification, or delete error writes `bootstrap-state.json` with `status: failed` on persistent storage. The dedicated supervisor automatically retries at most three times only when the persisted queue already proves that every assigned job completed both training and evaluation. It records each attempt and backoff in `worker-recovery-state.json`; a supervisor restart consumes rather than resets that budget. This archive-only path rechecks the immutable manifest, exact run/shard paths, Hub destination, model source markers, completion evidence, and bound instance; it bypasses dataset/model staging, backend preflight, and `TrainingQueue.run`. It then republishes deterministic result artifacts if needed, archives them, and requests deletion only after all verification succeeds. Incomplete queues and all other prior failures remain held for diagnosis rather than restarting training. A persisted prior delete request is treated as uncertain and is never reset or issued again automatically.
 

@@ -17,6 +17,12 @@ from .state import atomic_write_json
 
 
 REPORT_SCHEMA = 1
+CHECKPOINT_EVIDENCE_SCHEMA = 1
+CHECKPOINT_SCORE_METHOD = (
+    "mean face cosine similarity over this checkpoint's own images with exactly one "
+    "valid face, plus mean clipping fraction proxy; single-checkpoint evidence, not a "
+    "cross-checkpoint ranking"
+)
 SAMPLE_RE = re.compile(r"^(?P<time>\d+)__(?P<step>\d+)_(?P<index>\d+)\.(?:png|jpe?g|webp)$", re.I)
 
 
@@ -477,6 +483,166 @@ def _evaluate_job(
     report_path = output_dir / ".automation" / "evaluation.json"
     atomic_write_json(report_path, report)
     return report_path
+
+
+class CheckpointEvidenceEvaluator:
+    """Score one checkpoint's own samples while the trainer is still running.
+
+    The job report produced by :func:`evaluate_job` compares every checkpoint of a
+    finished job. This evaluator answers a narrower question with the same fixed
+    models and the same sample association rules: what is the evidence for one
+    checkpoint, right now, so that the checkpoint can be uploaded as a
+    self-sufficient unit instead of waiting for the end of the shard.
+    """
+
+    def __init__(
+        self,
+        *,
+        job_config_path: Path,
+        output_dir: Path,
+        reference_images: list[Path],
+        config: Mapping[str, Any],
+    ):
+        self.job_config_path = Path(job_config_path)
+        self.output_dir = Path(output_dir)
+        self.config = dict(config or {})
+        self.reference_images = [Path(item) for item in reference_images]
+        self._expected, self._final_step, self._cohort = _sample_expectations(self.job_config_path)
+        self._loaded = False
+        self._face: Any | None = None
+        self._landmark: Any | None = None
+        self._reference: dict[str, Any] = {}
+
+    @property
+    def final_step(self) -> int:
+        return self._final_step
+
+    @property
+    def expected_sample_count(self) -> int:
+        return len(self._expected)
+
+    def _ensure_backends(self) -> None:
+        if self._loaded:
+            return
+        self._face = _load_backend(
+            self.config.get("face_backend"), self.config.get("face_backend_options", {})
+        )
+        self._landmark = _load_backend(
+            self.config.get("landmark_backend"), self.config.get("landmark_backend_options", {})
+        )
+        self._reference = _reference_identity(
+            self.reference_images, self._face, self.config.get("reference_identity_filter")
+        )
+        self._loaded = True
+
+    def _files_for_step(self, step: int) -> list[dict[str, Any]]:
+        samples_dir = self.output_dir / "samples"
+        if not samples_dir.is_dir():
+            return []
+        found = []
+        for path in sorted(samples_dir.glob("*")):
+            match = SAMPLE_RE.match(path.name)
+            if not match or int(match.group("step")) != int(step):
+                continue
+            found.append({
+                "path": path,
+                "timestamp_ms": int(match.group("time")),
+                "prompt_index": int(match.group("index")),
+            })
+        return found
+
+    def evaluate(self, *, step: int, final: bool) -> dict[str, Any]:
+        """Return the evidence record for one checkpoint step."""
+        with preserve_cuda_visibility():
+            return self._evaluate(step=int(step), final=bool(final))
+
+    def _evaluate(self, *, step: int, final: bool) -> dict[str, Any]:
+        expected_indices = set(self._expected)
+        raw = self._files_for_step(step)
+        record: dict[str, Any] = {
+            "schema_version": CHECKPOINT_EVIDENCE_SCHEMA,
+            "job_config": str(self.job_config_path),
+            "evaluation_cohort": self._cohort,
+            "step": int(step),
+            "final": bool(final),
+            "final_step": self._final_step,
+            "expected_sample_count": len(expected_indices),
+            "reference_provenance": str(self.config.get("reference_provenance", "unspecified")),
+            "metric_limits": (
+                "raw face cosine similarity is not a percentage or probability; clipping, "
+                "sharpness and image-plane pose values are evidence proxies, not quality or "
+                "anatomical ground truth"
+            ),
+        }
+        if not raw:
+            record.update({
+                "sample_run_status": "missing",
+                "discarded_duplicate_or_partial_samples": 0,
+                "samples": [],
+                "reference_identity_status": {"status": "unavailable", "reason": "not evaluated"},
+                "face_backend": _backend_provenance(None, self.config.get("face_backend")),
+                "pose_backend": _backend_provenance(None, self.config.get("landmark_backend")),
+                "score": {
+                    "status": "unavailable",
+                    "reason": "no sample image exists for this step yet",
+                    "mean_face_cosine_similarity": None,
+                    "face_sample_count": 0,
+                    "mean_clipping_fraction_proxy": None,
+                    "method": CHECKPOINT_SCORE_METHOD,
+                },
+            })
+            return record
+        self._ensure_backends()
+        scored = []
+        for item in raw:
+            path = item["path"]
+            index = item["prompt_index"]
+            expectation = self._expected.get(index, {"prompt": None, "seed": None})
+            image = np.asarray(Image.open(path).convert("RGB"))
+            landmarks = (
+                self._landmark.metrics(image)
+                if self._landmark is not None
+                else {"status": "unavailable", "values": None, "reason": "landmark backend not configured"}
+            )
+            scored.append({
+                "path": str(path),
+                "file": path.name,
+                "timestamp_ms": item["timestamp_ms"],
+                "prompt_index": index,
+                "prompt": expectation["prompt"],
+                "seed": expectation["seed"],
+                "case_id": expectation.get("case_id"),
+                "category": expectation.get("category"),
+                "metrics": _image_metrics(image),
+                "identity": _identity_metric(image, self._face, self._reference),
+                "pose_body_landmarks": landmarks,
+            })
+        selected, sample_run_status, discarded = _choose_latest_complete_run(scored, expected_indices)
+        cosines = [
+            sample["identity"]["cosine_similarity"]
+            for sample in selected
+            if sample["identity"]["status"] == "available"
+        ]
+        clipping = [sample["metrics"]["clipping_fraction_proxy"] for sample in selected]
+        record.update({
+            "sample_run_status": sample_run_status,
+            "discarded_duplicate_or_partial_samples": discarded,
+            "samples": selected,
+            "reference_identity_status": {
+                key: value for key, value in self._reference.items() if key != "embedding"
+            },
+            "face_backend": _backend_provenance(self._face, self.config.get("face_backend")),
+            "pose_backend": _backend_provenance(self._landmark, self.config.get("landmark_backend")),
+            "score": {
+                "status": "available" if cosines else "unavailable",
+                "reason": None if cosines else "no generated image has exactly one valid face",
+                "mean_face_cosine_similarity": (sum(cosines) / len(cosines)) if cosines else None,
+                "face_sample_count": len(cosines),
+                "mean_clipping_fraction_proxy": (sum(clipping) / len(clipping)) if clipping else None,
+                "method": CHECKPOINT_SCORE_METHOD,
+            },
+        })
+        return record
 
 
 def evaluate_job(

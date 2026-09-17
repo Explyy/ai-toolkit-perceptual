@@ -24,7 +24,7 @@ config:
           ignore_if_contains: []
       save:
         dtype: bf16
-        save_every: 200
+        save_every: 100
         max_step_saves_to_keep: 120
         save_format: diffusers
         push_to_hub: false
@@ -51,6 +51,7 @@ config:
           enabled: true
           mode: relative
           sigma: 0.0125
+          bound_norm: true
           log_every: 1
         max_grad_norm: 1
         batch_size: 4
@@ -107,33 +108,16 @@ config:
         layer_offloading_transformer_percent: 1
       sample:
         sampler: flowmatch
-        sample_every: 200
+        sample_every: 100
         width: 640
         height: 960
         samples:
-          - {prompt: "neutral clothed portrait photo of [trigger], soft daylight"}
-          - {prompt: "close clothed portrait of [trigger], neutral background"}
-          - {prompt: "three-quarter clothed portrait of [trigger], overcast light"}
-          - {prompt: "full body photo of [trigger] in a plain dark outfit, studio"}
-          - {prompt: "full body photo of [trigger] in a plain light outfit, studio"}
-          - {prompt: "clothed photo of [trigger] standing beside a plain wall"}
-          - {prompt: "clothed photo of [trigger] seated on a simple chair"}
-          - {prompt: "clothed photo of [trigger] walking in soft daylight"}
-          - {prompt: "clothed photo of [trigger] facing camera, hands visible"}
-          - {prompt: "clothed profile photo of [trigger], plain background"}
-          - {prompt: "clothed waist-up photo of [trigger], window light"}
-          - {prompt: "clothed full-length photo of [trigger], even lighting"}
-          - {prompt: "clothed portrait of [trigger] looking slightly left"}
-          - {prompt: "clothed portrait of [trigger] looking slightly right"}
-          - {prompt: "clothed portrait of [trigger], neutral expression"}
-          - {prompt: "clothed portrait of [trigger], gentle smile"}
-          - {prompt: "clothed photo of [trigger] with arms relaxed"}
-          - {prompt: "clothed photo of [trigger] seated at a plain table"}
-          - {prompt: "clothed photo of [trigger] indoors in diffuse light"}
-          - {prompt: "clothed photo of [trigger] outdoors in diffuse light"}
-          - {prompt: "clothed medium shot of [trigger], simple backdrop"}
-          - {prompt: "clothed documentary photo of [trigger], natural light"}
-          - {prompt: "clothed identity reference portrait of [trigger], front view"}
+          - {seed: 4301, prompt: "single adult subject [trigger], full body contrapposto standing pose, weight on the right leg with the left knee relaxed, both arms and hands visible, feet fully in frame, tailored neutral outfit, sunlit courtyard with stone paving and planters, clear daylight"}
+          - {seed: 4302, prompt: "single adult subject [trigger], full body walking mid-stride toward camera-left, right leg forward with the opposite left arm swinging forward, both hands and feet visible, casual travel outfit, station concourse with columns and a departure board, cool daylight"}
+          - {seed: 4303, prompt: "single adult subject [trigger], medium shot from the waist up, torso turned three-quarters with the head toward camera, both forearms visible, knit pullover, beside a tall window in a quiet room, soft lateral light"}
+          - {seed: 4304, prompt: "single adult subject [trigger], medium shot standing at a workshop bench, one hand resting on the bench and the other relaxed at the side, shoulders level, rolled-sleeve shirt, directional task light"}
+          - {seed: 4305, prompt: "single adult subject [trigger], close-up frontal portrait of the face, shoulders level, both eyes visible, neutral expression, plain background, soft even daylight"}
+          - {seed: 4306, prompt: "single adult subject [trigger], close-up three-quarter portrait of the face turned slightly to the left with the gaze toward camera, neutral expression, plain background, soft window light"}
         neg: ''
         seed: 42
         walk_seed: false
@@ -179,4 +163,12 @@ config:
         segformer_res: 768
 meta:
   name: "[name]"
-  version: "1.0"
+  version: "3.0"
+  evaluation_cohort: "subject-likeness-core-v3"
+  evaluation_cases:
+    - {case_id: full-contrapposto, category: full-figure, seed: 4301}
+    - {case_id: full-walking-stride, category: full-figure, seed: 4302}
+    - {case_id: medium-window-turn, category: medium, seed: 4303}
+    - {case_id: medium-bench-lean, category: medium, seed: 4304}
+    - {case_id: face-frontal-closeup, category: face, seed: 4305}
+    - {case_id: face-three-quarter-closeup, category: face, seed: 4306}

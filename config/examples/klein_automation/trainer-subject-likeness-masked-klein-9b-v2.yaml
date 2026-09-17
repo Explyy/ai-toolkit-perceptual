@@ -24,7 +24,7 @@ config:
           ignore_if_contains: []
       save:
         dtype: bf16
-        save_every: 200
+        save_every: 100
         max_step_saves_to_keep: 120
         save_format: diffusers
         push_to_hub: false
@@ -51,6 +51,7 @@ config:
           enabled: true
           mode: relative
           sigma: 0.0125
+          bound_norm: true
           log_every: 1
         max_grad_norm: 1
         batch_size: 4
@@ -107,22 +108,16 @@ config:
         layer_offloading_transformer_percent: 1
       sample:
         sampler: flowmatch
-        sample_every: 200
+        sample_every: 100
         width: 640
         height: 960
         samples:
-          - {seed: 4201, prompt: "single adult subject [trigger], frontal waist-up portrait, shoulders level, both eyes visible, relaxed hands below frame, light denim jacket, quiet city courtyard, clear morning daylight"}
-          - {seed: 4202, prompt: "single adult subject [trigger], strict side-profile portrait facing left, nose chin and ear in one clean silhouette, shoulders perpendicular to camera, knit pullover, beside a tall window, soft lateral light"}
-          - {seed: 4203, prompt: "single adult subject [trigger], three-quarter rear view with torso facing away and head turned over the near shoulder toward camera, lightweight coat, museum corridor, warm ceiling light"}
-          - {seed: 4204, prompt: "single adult subject [trigger], full body contrapposto standing pose, weight on right leg and left knee relaxed, both hands fully visible, boots and feet fully in frame, tailored neutral outfit, daylight studio"}
-          - {seed: 4205, prompt: "single adult subject [trigger], side-on seated on a simple chair with hips facing right and torso rotated toward camera, both hands resting visibly on thighs, full legs and feet included, library reading room, window light"}
-          - {seed: 4206, prompt: "single adult subject [trigger], seated cross-legged on the floor with upright spine, both knees and hands fully visible, loose layered clothing, bright art studio, diffuse skylight"}
-          - {seed: 4207, prompt: "single adult subject [trigger], deep squat with heels down and elbows resting on knees, hands separated and visible, complete body and feet in frame, athletic streetwear, concrete courtyard, overcast light"}
-          - {seed: 4208, prompt: "single adult subject [trigger], kneeling with left knee down and right foot planted, upright torso, hands relaxed and visible, full body framed, practical outdoor clothing, garden path, late-afternoon light"}
-          - {seed: 4209, prompt: "single adult subject [trigger], walking mid-stride toward camera-left, right leg forward with opposite left arm swinging forward, both hands and feet visible, casual travel outfit, station concourse, cool daylight"}
-          - {seed: 4210, prompt: "single adult subject [trigger], forward lunge on left leg while both arms reach overhead, back leg extended, hands and feet fully visible, fitted training layers, rooftop terrace, golden-hour side light"}
-          - {seed: 4211, prompt: "single adult subject [trigger], leaning forward over a table with both palms visibly supporting weight, elbows softly bent and head turned toward camera, full torso and legs included, rolled-sleeve shirt, workshop, directional task light"}
-          - {seed: 4212, prompt: "single adult subject [trigger], climbing stairs with right foot raised onto the next step and head turned back toward camera, one hand near the rail and both feet visible, weatherproof coat, stone stairway, cloudy daylight"}
+          - {seed: 4301, prompt: "single adult subject [trigger], full body contrapposto standing pose, weight on the right leg with the left knee relaxed, both arms and hands visible, feet fully in frame, tailored neutral outfit, sunlit courtyard with stone paving and planters, clear daylight"}
+          - {seed: 4302, prompt: "single adult subject [trigger], full body walking mid-stride toward camera-left, right leg forward with the opposite left arm swinging forward, both hands and feet visible, casual travel outfit, station concourse with columns and a departure board, cool daylight"}
+          - {seed: 4303, prompt: "single adult subject [trigger], medium shot from the waist up, torso turned three-quarters with the head toward camera, both forearms visible, knit pullover, beside a tall window in a quiet room, soft lateral light"}
+          - {seed: 4304, prompt: "single adult subject [trigger], medium shot standing at a workshop bench, one hand resting on the bench and the other relaxed at the side, shoulders level, rolled-sleeve shirt, directional task light"}
+          - {seed: 4305, prompt: "single adult subject [trigger], close-up frontal portrait of the face, shoulders level, both eyes visible, neutral expression, plain background, soft even daylight"}
+          - {seed: 4306, prompt: "single adult subject [trigger], close-up three-quarter portrait of the face turned slightly to the left with the gaze toward camera, neutral expression, plain background, soft window light"}
         neg: ''
         seed: 42
         walk_seed: false
@@ -168,18 +163,12 @@ config:
         segformer_res: 768
 meta:
   name: "[name]"
-  version: "2.0"
-  evaluation_cohort: "subject-likeness-articulated-v2"
+  version: "3.0"
+  evaluation_cohort: "subject-likeness-core-v3"
   evaluation_cases:
-    - {case_id: anchor-frontal-waist, category: face-anchor, seed: 4201}
-    - {case_id: anchor-side-profile, category: face-anchor, seed: 4202}
-    - {case_id: rear-over-shoulder, category: articulated-pose, seed: 4203}
-    - {case_id: full-contrapposto, category: articulated-pose, seed: 4204}
-    - {case_id: seated-torso-turn, category: articulated-pose, seed: 4205}
-    - {case_id: seated-cross-legged, category: articulated-pose, seed: 4206}
-    - {case_id: deep-squat, category: articulated-pose, seed: 4207}
-    - {case_id: kneeling-one-knee, category: articulated-pose, seed: 4208}
-    - {case_id: walking-opposite-swing, category: articulated-pose, seed: 4209}
-    - {case_id: lunge-overhead-reach, category: articulated-pose, seed: 4210}
-    - {case_id: table-supported-lean, category: articulated-pose, seed: 4211}
-    - {case_id: stairs-raised-foot, category: articulated-pose, seed: 4212}
+    - {case_id: full-contrapposto, category: full-figure, seed: 4301}
+    - {case_id: full-walking-stride, category: full-figure, seed: 4302}
+    - {case_id: medium-window-turn, category: medium, seed: 4303}
+    - {case_id: medium-bench-lean, category: medium, seed: 4304}
+    - {case_id: face-frontal-closeup, category: face, seed: 4305}
+    - {case_id: face-three-quarter-closeup, category: face, seed: 4306}

@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping
 import yaml
 
 from .archive import EvidenceArchive
-from .backup import BackupError, HuggingFaceBackupClient
+from .backup import EVIDENCE_CONTRACT, BackupError, HuggingFaceBackupClient
 from .catalog import CatalogStore, resolve_model, safe_relative_path
 from .evaluation import preflight_evaluation_backends
 from .lifecycle import SimplePodClient, verify_instance_identity, wait_for_binding
@@ -102,6 +102,32 @@ def _validate_training_schedule(item: Mapping[str, Any]) -> None:
         raise BackupError("original_image_exposures must equal resolution repeats * loader epochs")
 
 
+def _validate_extension(item: Mapping[str, Any]) -> None:
+    raw = item.get("extend_from")
+    if raw is None:
+        return
+    if not isinstance(raw, Mapping):
+        raise BackupError("extend_from must be a mapping")
+    required = {"model", "dataset_fingerprint", "base_training_steps"}
+    optional = {"checkpoint_id", "reason"}
+    unknown = set(raw) - required - optional
+    if unknown:
+        raise BackupError(f"extend_from has unsupported fields: {sorted(unknown)}")
+    if not required.issubset(raw):
+        raise BackupError(f"extend_from requires {sorted(required)}")
+    if not str(raw["model"]).strip():
+        raise BackupError("extend_from.model must name an existing catalog model")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(raw["dataset_fingerprint"])):
+        raise BackupError(
+            "extend_from.dataset_fingerprint must be the 64-character dataset content hash"
+        )
+    base_steps = _positive_int(raw["base_training_steps"], "extend_from.base_training_steps")
+    if "training_steps" not in item:
+        raise BackupError("an extended dataset must declare its new training_steps")
+    if _positive_int(item["training_steps"], "training_steps") <= base_steps:
+        raise BackupError("an extension must run past its base checkpoint step")
+
+
 def _validate_checkpoint_policy(manifest: Mapping[str, Any]) -> None:
     raw = manifest.get("checkpoint_policy")
     if raw is None:
@@ -160,6 +186,7 @@ def validate_manifest(
         raise BackupError("expected catalog ids must be positive and globally unique across shards")
     for item in normalized:
         _validate_training_schedule(item)
+        _validate_extension(item)
         if int(item.get("expected_catalog_id", 0)) <= 0:
             raise BackupError("each dataset requires its pre-reserved expected_catalog_id")
         if not item.get("catalog_name") or not item.get("trigger_word"):
@@ -412,6 +439,7 @@ def _write_queue_config(
     repo_root: Path,
     repo_id: str,
     repo_type: str,
+    run_id: str,
     shard_id: str,
     recipe_path: Path,
 ) -> Path:
@@ -452,6 +480,7 @@ def _write_queue_config(
             "reference_images": [str(dataset_root / safe_relative_path(path)) for path in item["reference_paths"]],
             **({"training_steps": item["training_steps"]} if "training_steps" in item else {}),
             **({"training_accounting": item["training_accounting"]} if "training_accounting" in item else {}),
+            **({"extend_from": dict(item["extend_from"])} if item.get("extend_from") else {}),
         })
     evaluation = dict(manifest.get("evaluation") or {})
     evaluation.setdefault("enabled", True)
@@ -481,6 +510,20 @@ def _write_queue_config(
             },
         },
         "evaluation": evaluation,
+        # Per-checkpoint evidence during training and per-job publication after
+        # each job, so an interrupted shard keeps what it already finished.
+        "checkpoint_evidence": {"enabled": True},
+        "results": {
+            "enabled": True,
+            "run_id": run_id,
+            "work_dir": str(run_root / "results"),
+            "catalog_prefix": str(
+                (manifest.get("catalog") or {}).get("remote_prefix", "training-backups")
+            ),
+            "results_prefix": str(
+                (manifest.get("results") or {}).get("remote_prefix", "training-results")
+            ),
+        },
         **({"checkpoint_policy": checkpoint_policy} if checkpoint_policy is not None else {}),
         "datasets": datasets,
     }
@@ -526,6 +569,24 @@ def _completion_evidence(
             )
         ):
             raise BackupError(f"job {job.job_id} has incomplete checkpoint backup receipts")
+        # A receipt that carries the evidence contract was created by a version
+        # that also had to publish that checkpoint's own samples and record, so it
+        # must have them. A receipt written before the contract existed cannot be
+        # completed retroactively: it is tolerated and reported as uncovered,
+        # never silently counted as covered.
+        covered = [item for item in receipts if item.get("evidence_contract") is not None]
+        legacy = [item for item in receipts if item.get("evidence_contract") is None]
+        unevidenced = sorted(
+            int(item.get("step", -1))
+            for item in covered
+            if (item.get("evidence") or {}).get("status") != "published"
+            or not (item.get("evidence") or {}).get("verified")
+        )
+        if unevidenced:
+            raise BackupError(
+                f"job {job.job_id} has checkpoints without verified per-checkpoint evidence "
+                f"at steps {unevidenced}"
+            )
         report = json.loads(report_path.read_text(encoding="utf-8"))
         report_checkpoints = report.get("checkpoints")
         if not isinstance(report_checkpoints, list) or not report_checkpoints:
@@ -546,7 +607,32 @@ def _completion_evidence(
         ):
             raise BackupError(f"job {job.job_id} does not retain the required evaluation schedule")
         checkpoints_by_step = {int(item.get("step", -1)): item for item in report_checkpoints}
-        expected_steps = set(range(sample_every, final_step, sample_every)) | {final_step}
+        # An extended run resumes at its base step and is scheduled to produce
+        # only the checkpoints past it; the earlier steps belong to the base run
+        # and have no evidence here. The reduction is authorized only by a
+        # completed extension record that agrees with the declaration, so an
+        # ordinary job keeps base_step 0 and still requires its full set.
+        base_step = 0
+        if job.extend_from is not None:
+            extension = entry.get("extension") or {}
+            if entry.get("extension_status") != "completed" or not extension:
+                raise BackupError(
+                    f"job {job.job_id} declares an extension without a completed extension record"
+                )
+            base_step = int(extension["base_step"])
+            if base_step != int(job.extend_from["base_training_steps"]):
+                raise BackupError(
+                    f"job {job.job_id} extension record is at step {base_step}, its declaration "
+                    f"states {job.extend_from['base_training_steps']}"
+                )
+            if base_step >= final_step:
+                raise BackupError(
+                    f"job {job.job_id} extension base step {base_step} is not below its "
+                    f"final step {final_step}"
+                )
+        expected_steps = {
+            step for step in range(sample_every, final_step, sample_every) if step > base_step
+        } | {final_step}
         if not expected_steps.issubset(checkpoints_by_step):
             raise BackupError(f"job {job.job_id} is missing scheduled checkpoint evaluations")
         for step in sorted(expected_steps):
@@ -601,6 +687,26 @@ def _completion_evidence(
             "job_id": job.job_id,
             "evaluation_report": f"{prefix}/evaluation.json",
             "backup_receipts": len(receipts),
+            "resumed_from_step": base_step,
+            "scheduled_checkpoint_steps": sorted(expected_steps),
+            "checkpoint_evidence_contract": EVIDENCE_CONTRACT,
+            "checkpoint_evidence_uncovered_legacy_steps": sorted(
+                int(item.get("step", -1)) for item in legacy
+            ),
+            "checkpoint_evidence": [
+                {
+                    "step": int(item["step"]),
+                    "final": bool(item.get("final")),
+                    "catalog_checkpoint_id": item.get("catalog_checkpoint_id"),
+                    "evidence_commit_id": (item.get("evidence") or {}).get("commit_id"),
+                    "evaluation_remote_path": (item.get("evidence") or {}).get(
+                        "evaluation_remote_path"
+                    ),
+                    "sample_run_status": (item.get("evidence") or {}).get("sample_run_status"),
+                    "sample_count": (item.get("evidence") or {}).get("sample_count"),
+                }
+                for item in sorted(receipts, key=lambda value: int(value.get("step", 0)))
+            ],
             "sample_files": len(samples),
             "identity_ranking_status": report.get("identity_ranking", {}).get("status"),
             "reference_provenance": report.get("reference_provenance", "unspecified"),
@@ -683,9 +789,41 @@ def _validate_recovery_queue(
     return dict(queue_state)
 
 
+def _reuse_job_publication(
+    *, job_id: str, work_dir: Path, queue_state: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[tuple[Path, str]]] | None:
+    """Return the publication this job already made, when it is still intact."""
+    entry = (queue_state.get("jobs") or {}).get(job_id) or {}
+    manifest_path = work_dir / "published-evidence.json"
+    if entry.get("results_status") != "completed" or not manifest_path.is_file():
+        return None
+    manifest = _load_object(manifest_path, f"published evidence for {job_id}")
+    record = manifest.get("record")
+    entries = manifest.get("files")
+    if (
+        manifest.get("job_id") != job_id
+        or not isinstance(record, Mapping)
+        or not isinstance(entries, list)
+        or not entries
+    ):
+        raise BackupError(f"job {job_id} has an unusable per-job publication manifest")
+    evidence_files: list[tuple[Path, str]] = []
+    for item in entries:
+        if not isinstance(item, list) or len(item) != 2:
+            raise BackupError(f"job {job_id} publication manifest has an invalid file entry")
+        local = Path(str(item[0]))
+        if not local.is_file():
+            raise BackupError(
+                f"job {job_id} published evidence is missing on disk: {local}"
+            )
+        evidence_files.append((local, str(item[1])))
+    return {**dict(record), "publication": "reused-from-job"}, evidence_files
+
+
 def _publish_job_results(
     *,
     queue: TrainingQueue,
+    queue_state: Mapping[str, Any],
     files: list[tuple[Path, str]],
     completion: dict[str, Any],
     client: HuggingFaceBackupClient,
@@ -700,18 +838,25 @@ def _publish_job_results(
     completion_by_job = {item["job_id"]: item for item in completion["jobs"]}
     for job in queue.materialize():
         output = job.output_root / job.job_id
-        record, evidence_files = publish_ranked_results(
-            client=client,
-            repo_id=repo_id,
-            repo_type=repo_type,
-            run_id=run_id,
-            job_id=job.job_id,
-            report_path=output / ".automation" / "evaluation.json",
-            sample_root=output / "samples",
-            work_dir=run_root / "results" / job.job_id,
-            catalog_prefix=catalog_prefix,
-            completed_at=completed_at,
+        work_dir = run_root / "results" / job.job_id
+        reused = _reuse_job_publication(
+            job_id=job.job_id, work_dir=work_dir, queue_state=queue_state
         )
+        if reused is not None:
+            record, evidence_files = reused
+        else:
+            record, evidence_files = publish_ranked_results(
+                client=client,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                run_id=run_id,
+                job_id=job.job_id,
+                report_path=output / ".automation" / "evaluation.json",
+                sample_root=output / "samples",
+                work_dir=work_dir,
+                catalog_prefix=catalog_prefix,
+                completed_at=completed_at,
+            )
         files.extend(evidence_files)
         completion_by_job[job.job_id]["automatic_result_export"] = record
         if loras_root is not None:
@@ -796,6 +941,7 @@ def _finalize_completed_run(
         raise BackupError(f"TRAINING_LORAS_ROOT is not an existing directory: {loras_root}")
     _publish_job_results(
         queue=queue,
+        queue_state=queue_state,
         files=files,
         completion=completion,
         client=client,
@@ -1043,6 +1189,7 @@ def run_parallel_bootstrap(
             repo_root=Path(values.get("TRAINING_REPO_ROOT", "/app/ai-toolkit")),
             repo_id=repo_id,
             repo_type=repo_type,
+            run_id=run_id,
             shard_id=shard_id,
             recipe_path=recipe,
         )

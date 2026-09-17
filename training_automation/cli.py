@@ -10,7 +10,7 @@ from .catalog import CatalogStore, restore_generation, restore_training
 from .evaluation import evaluate_job, persist_selection
 from .dataset_storage import upload_dataset_folder
 from .gallery import render_gallery
-from .queue import TrainingQueue
+from .queue import TrainingQueue, dataset_content_fingerprint
 from .results import (
     publish_archived_run_results,
     publish_refreshed_report,
@@ -40,6 +40,11 @@ def main(argv: list[str] | None = None) -> int:
         "parallel-run",
         help="run the private pinned parallel shard bootstrap and success-only self-delete",
     )
+    fingerprint = commands.add_parser(
+        "dataset-fingerprint",
+        help="print the dataset content hash an extension must declare in extend_from",
+    )
+    fingerprint.add_argument("folder", type=Path)
     evaluate = commands.add_parser("evaluate", help="evaluate existing checkpoint samples without training")
     evaluate.add_argument("job_config", type=Path)
     evaluate.add_argument("output_dir", type=Path)
@@ -150,7 +155,9 @@ def main(argv: list[str] | None = None) -> int:
         result = TrainingQueue(args.config).run(dry_run=args.dry_run)
         print(json.dumps(result, indent=2))
         if not args.dry_run and any(
-            item.get("status") in {"failed", "evaluation_failed"}
+            item.get("status") in {
+                "failed", "evidence_failed", "evaluation_failed", "publish_failed",
+            }
             for item in result.get("jobs", {}).values()
         ):
             return 1
@@ -166,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
         from .bootstrap import run_parallel_bootstrap
 
         print(json.dumps(run_parallel_bootstrap(), indent=2))
+    elif args.command == "dataset-fingerprint":
+        print(dataset_content_fingerprint(args.folder))
     elif args.command == "evaluate":
         import yaml
 
