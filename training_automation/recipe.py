@@ -29,6 +29,7 @@ def _validate_recipe(recipe_path: Path, repo_root: Path, *, prompt_count: int) -
         ("train", "diff_output_preservation"): True,
         ("train", "diff_output_preservation_multiplier"): 1,
         ("train", "diff_output_preservation_class"): "woman",
+        ("train", "cache_text_embeddings"): False,
         ("network", "type"): "lokr",
         ("network", "linear"): 32,
         ("datasets", "num_repeats"): [16, 4, 1],

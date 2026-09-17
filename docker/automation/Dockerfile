@@ -18,7 +18,7 @@ RUN mkdir -p /storage/automation /storage/config /storage/datasets /storage/outp
     && python /tmp/install_woman_preset.py --root /app/ai-toolkit \
     && cd /app/ai-toolkit/ui \
     && npm run build \
-    && grep -R -q -F "Differential Output Preservation is enabled with class woman." .next \
+    && grep -R -q -F "Differential Output Preservation is enabled with class woman, and text embedding caching is disabled so the trainer accepts it." .next \
     && cd /app/ai-toolkit \
     && python /tmp/install_evaluation_models.py \
     && chmod 0755 /run-parallel-training /run-unified-training \

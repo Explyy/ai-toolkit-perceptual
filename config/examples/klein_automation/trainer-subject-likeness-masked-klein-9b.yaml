@@ -67,7 +67,7 @@ config:
         optimizer_params:
           weight_decay: 0.0001
         unload_text_encoder: false
-        cache_text_embeddings: true
+        cache_text_embeddings: false
         lr: 0.00005
         ema_config:
           use_ema: false

@@ -11,7 +11,12 @@ OLD_ENABLED = "diff_output_preservation: false,"
 NEW_ENABLED = "diff_output_preservation: opts.subjectMask,"
 OLD_CLASS = "diff_output_preservation_class: 'person',"
 NEW_CLASS = "diff_output_preservation_class: opts.subjectMask ? 'woman' : 'person',"
-NEW_DESCRIPTION = "'what they caption. Differential Output Preservation is enabled with class woman.',"
+OLD_CACHE = "cache_text_embeddings: true,"
+NEW_CACHE = "cache_text_embeddings: !opts.subjectMask,"
+NEW_DESCRIPTION = (
+    "'what they caption. Differential Output Preservation is enabled with class woman, "
+    "and text embedding caching is disabled so the trainer accepts it.',"
+)
 
 
 def patch_woman_preset(source: str) -> str:
@@ -20,16 +25,23 @@ def patch_woman_preset(source: str) -> str:
     start = source.index(FUNCTION_START)
     end = source.index(FUNCTION_END, start)
     subject = source[start:end]
-    if NEW_ENABLED in subject and NEW_CLASS in subject:
+    if NEW_ENABLED in subject and NEW_CLASS in subject and NEW_CACHE in subject:
         if NEW_DESCRIPTION not in subject:
             raise RuntimeError("UI quickstart contains an incomplete woman-preset overlay")
         return source
-    if subject.count(OLD_ENABLED) != 1 or subject.count(OLD_CLASS) != 1:
-        raise RuntimeError("unsupported UI quickstarts: DOP field anchors changed")
+    if (
+        subject.count(OLD_ENABLED) != 1
+        or subject.count(OLD_CLASS) != 1
+        or subject.count(OLD_CACHE) != 1
+    ):
+        raise RuntimeError("unsupported UI quickstarts: DOP or text embedding cache anchors changed")
     if subject.count("id: 'subject_likeness_masked_flux2_klein9b'") != 1:
         raise RuntimeError("unsupported UI quickstarts: masked preset identity changed")
     patched = subject.replace(OLD_ENABLED, NEW_ENABLED, 1)
     patched = patched.replace(OLD_CLASS, NEW_CLASS, 1)
+    # Differential Output Preservation and cached text embeddings are mutually
+    # exclusive in the trainer, so the masked preset turns the cache off.
+    patched = patched.replace(OLD_CACHE, NEW_CACHE, 1)
     description = re.compile(r"(?P<prefix>description:\s*)(?P<quote>['\"])(?P<body>.*?)(?P=quote),", re.DOTALL)
     match = description.search(patched)
     if match is None:
