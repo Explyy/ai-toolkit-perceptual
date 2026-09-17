@@ -877,12 +877,14 @@ class TrainingQueue:
                 f"({sample_every!r} and {save_every!r})"
             )
         requested_steps = int(process["train"]["steps"])
-        if requested_steps % sample_every:
-            raise QueueConfigurationError(
-                f"refusing refinement of {job.job_id}: the final step {requested_steps} is not on "
-                f"the {sample_every}-step sampling cadence, so the final checkpoint would have no "
-                "scheduled evaluation and the run could never be archived"
-            )
+        # The final step deliberately does NOT have to sit on the cadence. The
+        # archive gate builds its expected set as the cadence multiples below the
+        # final step UNION the final step itself (bootstrap.py:693-694), so a
+        # non-round final always gets its own scheduled checkpoint. Requiring a
+        # round final here would be stricter than the gate it mirrors and would
+        # refuse every dataset in this project, whose loader step counts are
+        # multiples of its batches-per-epoch (1712, 1267, 1057, 1855) and are
+        # never multiples of 100.
         base_steps = int(declaration["base_training_steps"])
         if base_steps >= requested_steps:
             raise QueueConfigurationError(
