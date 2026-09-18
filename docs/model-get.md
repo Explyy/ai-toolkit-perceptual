@@ -1,6 +1,6 @@
 # Scaricare un modello dal terminale
 
-`model-get` scarica un solo file modello da Hugging Face o Civitai, mantiene il nome originale e verifica i byte prima di pubblicarli nella cartella scelta.
+`model-get` scarica un solo file modello da Hugging Face o Civitai, mantiene il nome originale e verifica i byte prima di pubblicarli nella cartella scelta. Accetta anche i link ufficiali `civitai.red` e `www.civitai.red`, risolvendoli tramite l'API canonica di Civitai.
 
 ```bash
 cd /workspace/ComfyUI/models/loras
@@ -36,6 +36,6 @@ export HF_TOKEN="..."
 export CIVITAI_API_TOKEN="..."
 ```
 
-Hugging Face usa anche il token già salvato in `HF_HOME/token` o `~/.cache/huggingface/token`. Il comando non stampa né salva i token.
+Hugging Face usa anche il token già salvato in `HF_HOME/token` o `~/.cache/huggingface/token`. Il token Civitai è inviato solo agli host ufficiali `civitai.com`, `www.civitai.com`, `civitai.red` e `www.civitai.red`; il comando non stampa né salva i token.
 
 La copia persistente può trovarsi in `/workspace/bin/model-get` oppure `/storage/bin/model-get`, secondo il volume montato. Usare quel percorso completo sulle nuove istanze: l'eventuale alias in `/usr/local/bin/model-get` appartiene alla singola istanza e può non sopravvivere alla sua sostituzione.

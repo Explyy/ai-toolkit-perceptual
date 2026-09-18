@@ -19,7 +19,12 @@ from typing import BinaryIO, Iterable, Mapping, TextIO
 
 
 MODEL_SUFFIXES = {".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin"}
-PROVIDER_HOSTS = {"huggingface.co": "hf", "www.huggingface.co": "hf", "civitai.com": "civitai", "www.civitai.com": "civitai"}
+CIVITAI_HOSTS = {"civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"}
+PROVIDER_HOSTS = {
+    "huggingface.co": "hf",
+    "www.huggingface.co": "hf",
+    **{host: "civitai" for host in CIVITAI_HOSTS},
+}
 SENSITIVE_QUERY_KEYS = {"token", "api_key", "apikey", "authorization", "access_token"}
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -129,7 +134,7 @@ class HttpClient:
         request_headers = {"User-Agent": "model-get/1", "Accept-Encoding": "identity"}
         if headers:
             request_headers.update(headers)
-        provider_hosts = {"hf": {"huggingface.co", "www.huggingface.co"}, "civitai": {"civitai.com", "www.civitai.com"}}
+        provider_hosts = {"hf": {"huggingface.co", "www.huggingface.co"}, "civitai": CIVITAI_HOSTS}
         token = self.tokens.get(provider)
         if token and _host(url) in provider_hosts[provider]:
             request_headers["Authorization"] = f"Bearer {token}"
@@ -330,7 +335,7 @@ def _resolve_civitai(url: str, requested_file: str | None, client: HttpClient, *
             continue
         download_url = item["downloadUrl"]
         _validate_https_url(download_url)
-        if _host(download_url) not in {"civitai.com", "www.civitai.com"}:
+        if _host(download_url) not in CIVITAI_HOSTS:
             raise ModelGetError("Civitai ha restituito un host di download inatteso.")
         hashes = item.get("hashes") if isinstance(item.get("hashes"), dict) else {}
         digest = _sha_from_mapping(hashes.get("SHA256") or hashes.get("sha256"))
