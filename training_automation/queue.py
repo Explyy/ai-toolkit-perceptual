@@ -34,6 +34,7 @@ EXTENSION_PHASE_FIELDS = (
     "train.timestep_type",
     "train.content_or_style",
     "train.lr",
+    "train.batch_size",
     "datasets.*.num_repeats",
     "datasets.*.resolution",
 )

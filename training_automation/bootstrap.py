@@ -144,7 +144,13 @@ def _validate_training_schedule(
             )
     elif accounting["resolution_repeats"] != RESOLUTION_REPEATS:
         raise BackupError(f"resolution_repeats must equal {RESOLUTION_REPEATS}")
-    if accounting["batch_size"] != TRAIN_BATCH_SIZE:
+    if "train.batch_size" in declared_fields:
+        # A declared convergence phase cuts the same exposure budget into more,
+        # smaller gradient steps; the batch size is then the phase's own, and the
+        # two identities checked below still hold because neither depends on it.
+        # A dataset without that declaration stays pinned to the exact value.
+        _positive_int(accounting["batch_size"], "batch_size")
+    elif accounting["batch_size"] != TRAIN_BATCH_SIZE:
         raise BackupError(f"batch_size must equal {TRAIN_BATCH_SIZE}")
     if accounting["partial_bucket_batches"] != "un-padded":
         raise BackupError("partial_bucket_batches must be 'un-padded'")

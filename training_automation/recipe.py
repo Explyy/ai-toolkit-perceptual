@@ -22,8 +22,14 @@ EVALUATION_PROMPT_COUNT = 6
 # validator that is supposed to protect it, so they are checked as a phase
 # instead of compared to the base recipe.
 REFINEMENT_FIELDS = (("train", "steps"), ("train", "lr"), ("datasets", "num_repeats"))
+# A convergence phase deviates in the same fields as a refinement plus the batch
+# size, which is the point of the kind: one gradient step per image instead of
+# four images averaged into one step.
+CONVERGENCE_FIELDS = REFINEMENT_FIELDS + (("train", "batch_size"),)
 BASE_LEARNING_RATE = 0.00005
 BASE_RESOLUTION_REPEATS = [16, 4, 1]
+CONVERGENCE_BATCH_SIZE = 1
+CONVERGENCE_MAX_LEARNING_RATE = 0.0002
 
 
 def _validate_cohort(document: dict[str, Any], *, prompt_count: int) -> None:
@@ -122,9 +128,94 @@ def _validate_refinement_phase(process: dict[str, Any]) -> None:
         )
 
 
+def _validate_convergence_phase(process: dict[str, Any]) -> None:
+    """Check the deviations a convergence recipe is allowed to carry.
+
+    A convergence pass is not a refinement with different numbers. A refinement
+    adjusts an already trained model with a step smaller than the base run; this
+    kind deliberately does the opposite and says so: every image produces its own
+    gradient step and the step is larger than the base rate, because the measured
+    face passes applied too few, too small updates to restructure facial
+    geometry. Both deviations are required here, not merely tolerated, and the
+    refinement contract that forbids them stays exactly as it is.
+    """
+    train = process["train"]
+    dataset = process["datasets"][0]
+    # One band only: this kind exists for face geometry, which is where the
+    # centre-dense sigmoid timestep array spends its budget. The style/linear
+    # pairing is refinement's low-noise arm and is refused here.
+    band = (train.get("content_or_style"), train.get("timestep_type"))
+    if band != ("balanced", "sigmoid"):
+        raise BackupError(
+            "a convergence recipe must concentrate the face-geometry band: "
+            "content_or_style: balanced with timestep_type: sigmoid; "
+            f"got content_or_style={train.get('content_or_style')!r} "
+            f"timestep_type={train.get('timestep_type')!r}"
+        )
+    batch_size = train.get("batch_size")
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size != CONVERGENCE_BATCH_SIZE
+    ):
+        raise BackupError(
+            "a convergence recipe exists to give every image its own gradient step, so "
+            f"train.batch_size must be {CONVERGENCE_BATCH_SIZE}: {batch_size!r}"
+        )
+    lr = train.get("lr")
+    if (
+        isinstance(lr, bool)
+        or not isinstance(lr, (int, float))
+        or not BASE_LEARNING_RATE < lr <= CONVERGENCE_MAX_LEARNING_RATE
+    ):
+        raise BackupError(
+            "a convergence recipe requires a learning rate above the base rate "
+            f"{BASE_LEARNING_RATE} and at most {CONVERGENCE_MAX_LEARNING_RATE}: {lr!r}"
+        )
+    repeats = dataset.get("num_repeats")
+    resolution = dataset.get("resolution")
+    if not isinstance(repeats, list) or sorted(repeats) != sorted(BASE_RESOLUTION_REPEATS):
+        raise BackupError(
+            f"a convergence recipe must reorder the {BASE_RESOLUTION_REPEATS} exposure budget, "
+            f"not replace it: {repeats!r}"
+        )
+    if not isinstance(resolution, list) or len(resolution) != len(repeats):
+        raise BackupError(
+            "a convergence recipe needs one num_repeats entry per configured resolution: "
+            f"{repeats!r} over {resolution!r}"
+        )
+    if resolution != sorted(resolution):
+        raise BackupError(f"a convergence recipe requires ascending resolutions: {resolution!r}")
+    if repeats != sorted(repeats):
+        # The weight has to grow with the resolution: [1, 16, 4] would keep the
+        # budget away from 1024px, the only band where a face inside a
+        # full-figure crop carries its detail.
+        raise BackupError(
+            f"a convergence recipe must weight every higher resolution more than the one "
+            f"below it, so num_repeats must ascend: {repeats!r}"
+        )
+    steps = train.get("steps")
+    cadence = (process.get("sample") or {}).get("sample_every")
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+        raise BackupError(f"a convergence recipe requires a positive train.steps: {steps!r}")
+    if not isinstance(cadence, int) or cadence <= 0 or steps % cadence:
+        # The archive gate requires the configured samples at the final step, and
+        # that verdict arrives only after the paid run.
+        raise BackupError(
+            f"a convergence recipe must end on its own {cadence!r}-step sampling cadence: {steps!r}"
+        )
+
+
 def _validate_recipe(
-    recipe_path: Path, repo_root: Path, *, prompt_count: int, refinement: bool = False
+    recipe_path: Path,
+    repo_root: Path,
+    *,
+    prompt_count: int,
+    refinement: bool = False,
+    convergence: bool = False,
 ) -> dict[str, Any]:
+    if refinement and convergence:
+        raise BackupError("a recipe is either a refinement or a convergence phase, not both")
     document = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
     process = document["config"]["process"][0]
     expected = {
@@ -158,6 +249,10 @@ def _validate_recipe(
         for path in REFINEMENT_FIELDS:
             expected.pop(path, None)
         _validate_refinement_phase(process)
+    elif convergence:
+        for path in CONVERGENCE_FIELDS:
+            expected.pop(path, None)
+        _validate_convergence_phase(process)
     for path, wanted in expected.items():
         if path[0] == "datasets":
             actual = process["datasets"][0][path[1]]
@@ -235,18 +330,33 @@ def validate_refinement_recipe(recipe_path: Path, repo_root: Path) -> None:
     )
 
 
+def validate_convergence_recipe(recipe_path: Path, repo_root: Path) -> None:
+    """Validate the recipe of a declared convergence phase.
+
+    Same cohort, same regularization, same exposure budget and same pinned image
+    support as the full run; only the phase fields deviate, and batch size and
+    learning rate deviate in the direction a refinement may not take.
+    """
+    _validate_recipe(
+        recipe_path, repo_root, prompt_count=EVALUATION_PROMPT_COUNT, convergence=True
+    )
+
+
 def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--unified", action="store_true")
     parser.add_argument("--refinement", action="store_true")
+    parser.add_argument("--convergence", action="store_true")
     parser.add_argument("recipe", type=Path)
     parser.add_argument("repo_root", type=Path)
     args = parser.parse_args()
-    if args.unified and args.refinement:
-        parser.error("choose either --unified or --refinement")
-    if args.refinement:
+    if sum((args.unified, args.refinement, args.convergence)) > 1:
+        parser.error("choose exactly one of --unified, --refinement or --convergence")
+    if args.convergence:
+        validate_convergence_recipe(args.recipe, args.repo_root)
+    elif args.refinement:
         validate_refinement_recipe(args.recipe, args.repo_root)
     elif args.unified:
         validate_unified_recipe(args.recipe, args.repo_root)
