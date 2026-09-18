@@ -32,6 +32,18 @@ SELF_DELETE_ATTEMPTS = 3
 SELF_DELETE_RETRY_SECONDS = 1800
 CHILD_TERMINATION_SECONDS = 30
 CHILD_TERMINATION_POLL_SECONDS = 0.2
+# How often a supervisor that lost the child's output asks the child itself what
+# it is doing. Only an exit status ends a shard, so this is a question, not a
+# deadline: a child that is still running is still running.
+CHILD_STATUS_POLL_SECONDS = 60
+# A read that failed once may not have failed for good, and a pipe nobody drains
+# eventually blocks the writer. The drain is retried a bounded number of times
+# before the supervisor stops reading and only waits.
+CAPTURE_DRAIN_ATTEMPTS = 3
+# 127 is a statement about the child: it means the child ended that way. A
+# supervisor that never saw the child end says so with its own status instead of
+# borrowing the child's.
+CAPTURE_UNRESOLVED_EXIT = 125
 
 
 def _component(env: Mapping[str, str], name: str) -> str:
@@ -256,6 +268,92 @@ def _ensure_child_stopped(
     return stopped
 
 
+def _drain_output(stream: Any, emit: Callable[[str], None]) -> str | None:
+    """Copy the child's output through, or describe why it could not be read."""
+    try:
+        for line in stream:
+            emit(line)
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _capture_output(
+    stream: Any,
+    emit: Callable[[str], None],
+    *,
+    attempts: int = CAPTURE_DRAIN_ATTEMPTS,
+) -> str | None:
+    """Follow the child's output to its end, retrying a failed read.
+
+    The child is decoded leniently, so ordinary progress-bar bytes cannot raise
+    here at all: a tqdm block glyph split across a read boundary is exactly the
+    stream this supervisor is built to carry. What remains are real read
+    failures, and those are retried, because abandoning a pipe the child is
+    still writing to eventually blocks the child itself.
+    """
+    budget = max(1, int(attempts))
+    failure: str | None = None
+    for attempt in range(1, budget + 1):
+        failure = _drain_output(stream, emit)
+        if failure is None:
+            return None
+        if attempt < budget:
+            emit(
+                "parallel worker could not read the supervised child's output "
+                f"({failure}); retrying that read {attempt}/{budget - 1}\n"
+            )
+    return failure
+
+
+def _observe_child_exit(
+    process: Any,
+    *,
+    emit: Callable[[str], None],
+    poll_seconds: float = CHILD_STATUS_POLL_SECONDS,
+) -> int | None:
+    """Return the child's real exit status, or None when it cannot be observed.
+
+    Losing the output stream says nothing about the process that was writing
+    into it. The supervisor therefore asks the child itself, and keeps asking
+    for as long as the child is alive: an exit status is the only evidence
+    allowed to end a shard. Waiting on a child that never exits is the same
+    unbounded wait a readable pipe already implies for a hung trainer; what is
+    not allowed is converting a living child into a failure.
+    """
+    wait = getattr(process, "wait", None)
+    if wait is None:
+        return None
+    timed = True
+    while True:
+        try:
+            status = wait(timeout=max(0.0, float(poll_seconds))) if timed else wait()
+        except (subprocess.TimeoutExpired, TimeoutError):
+            emit(
+                "parallel worker has lost the supervised child's output and the "
+                "child is still running; no failure is concluded and nothing is "
+                "scheduled against it\n"
+            )
+            continue
+        except TypeError:
+            if not timed:
+                return None
+            # A child object whose wait() takes no timeout: ask it the blocking
+            # way rather than inventing a status on its behalf.
+            timed = False
+            continue
+        except Exception as exc:
+            emit(
+                "parallel worker could not read the supervised child's exit status "
+                f"({type(exc).__name__}: {exc})\n"
+            )
+            return None
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            return None
+
+
 def _deadline_text(now: Callable[[], float], seconds: float) -> str:
     return datetime.fromtimestamp(now() + seconds, tz=timezone.utc).isoformat(
         timespec="seconds"
@@ -455,8 +553,14 @@ def run_worker(
         log = log_path.open("a", encoding="utf-8", buffering=1)
     except Exception as exc:
         def emit_console(message: str) -> None:
-            output.write(message)
-            output.flush()
+            # Best-effort for the same reason: this path exists to hold and
+            # then delete an instance whose durable log is already gone, and a
+            # console write must not be what prevents it.
+            try:
+                output.write(message)
+                output.flush()
+            except Exception:
+                pass
 
         emit_console(f"parallel worker could not initialize its durable log: {type(exc).__name__}: {exc}\n")
         stop_after_hold(
@@ -473,12 +577,30 @@ def run_worker(
     recovery_limit = max(0, min(int(recovery_attempts), len(RECOVERY_BACKOFF_SECONDS)))
     with log:
         def emit(message: str) -> None:
-            output.write(message)
-            output.flush()
-            log.write(message)
+            # Two sinks, written independently and both best-effort. A console
+            # whose consumer went away and a volume that filled up while it was
+            # receiving a 9B checkpoint are ordinary events on a training pod,
+            # and neither may raise out of here: this supervisor is the
+            # container command, so an exception escaping the capture path ends
+            # the container, takes a still-training child with it and leaves the
+            # instance billing before the hold or the self-delete can run. The
+            # durable log goes first, because it is the sink that still exists
+            # tomorrow, and losing one sink never costs the line in the other.
+            try:
+                log.write(message)
+            except Exception:
+                pass
+            try:
+                output.write(message)
+                output.flush()
+            except Exception:
+                pass
 
         recovery_started = 0
         terminal_recovery_state = False
+        # False only when this supervisor never saw how the child ended. Every
+        # other path either observed an exit status or never started a child.
+        shard_outcome_known = True
         terminal_reason = "no archive-only recovery was possible"
         if recovery_path.is_file():
             try:
@@ -561,31 +683,82 @@ def run_worker(
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    # The child prints tqdm progress bars whose glyphs are
+                    # multi-byte, and a read boundary can fall inside one of
+                    # them. Strict decoding turns that ordinary byte into an
+                    # exception, so the stream is decoded leniently: an
+                    # unreadable character is a damaged character, never a
+                    # verdict on the run.
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
                     start_new_session=True,
                 )
+            except Exception as exc:
+                # No child was started, so this failure is the shard's own and
+                # nothing alive can be harmed by treating it as one.
+                emit(
+                    "parallel worker launch failure: "
+                    f"{type(exc).__name__}: {exc}\n"
+                )
+                exit_code = 127
+            else:
                 child = {
                     "process": process,
                     "pgid": child_process_group(process),
                     "reaped": False,
                 }
                 children.append(child)
-                if process.stdout is None:
-                    raise RuntimeError("parallel worker could not capture child output")
-                for line in process.stdout:
-                    emit(line)
-                exit_code = int(process.wait())
-                child["reaped"] = True
-            except Exception as exc:
-                emit(
-                    "parallel worker launch/capture failure: "
-                    f"{type(exc).__name__}: {exc}\n"
-                )
-                exit_code = 127
-                # Losing the pipe says nothing about the child, and nothing is
-                # signalled here: a transient read error must not destroy an
-                # otherwise healthy shard. The guard runs at the deadline.
+                capture_failure: str | None = None
+                try:
+                    stream = process.stdout
+                except Exception as exc:
+                    stream = None
+                    capture_failure = f"{type(exc).__name__}: {exc}"
+                else:
+                    capture_failure = (
+                        None
+                        if stream is not None
+                        else "the child was started without a readable output stream"
+                    )
+                if capture_failure is None:
+                    capture_failure = _capture_output(stream, emit)
+                if capture_failure is None:
+                    try:
+                        exit_code = int(process.wait())
+                        child["reaped"] = True
+                    except Exception as exc:
+                        capture_failure = f"{type(exc).__name__}: {exc}"
+                if capture_failure is not None:
+                    # The supervisor lost the output, not the child. Nothing is
+                    # signalled and nothing is concluded until the child itself
+                    # says how it ended.
+                    emit(
+                        "parallel worker lost the supervised child's output stream "
+                        f"({capture_failure}); the child is unaffected and this "
+                        "supervisor now waits for its real exit status\n"
+                    )
+                    observed = _observe_child_exit(process, emit=emit)
+                    if observed is None:
+                        shard_outcome_known = False
+                        exit_code = CAPTURE_UNRESOLVED_EXIT
+                        emit(
+                            "parallel worker could not establish how the supervised "
+                            "child ended, so it records no failure for this shard\n"
+                        )
+                    else:
+                        exit_code = observed
+                        child["reaped"] = True
+                        emit(
+                            "parallel worker recovered the supervised child's real "
+                            f"exit status after losing its output: exit={exit_code}\n"
+                        )
             emit(f"parallel worker {label} exit={exit_code}\n")
+            if not shard_outcome_known:
+                # An unobserved child is not a failed shard: no recovery
+                # relaunch over a process that may still be running, and no
+                # terminal state written on a guess.
+                break
             if exit_code == 0:
                 if recovery_started:
                     atomic_write_json(recovery_path, {
@@ -632,7 +805,19 @@ def run_worker(
             recovery_state = _load_mapping(recovery_path)
             recovery_state["status"] = "running"
             atomic_write_json(recovery_path, recovery_state)
-        if exit_code != 0:
+        if not shard_outcome_known:
+            # The hold exists to preserve a failure for diagnosis and then stop
+            # paying for it. A child whose exit was never observed may still be
+            # training or publishing, and destroying it to save the bill is the
+            # one outcome this supervisor must never produce.
+            emit(
+                "parallel worker holds nothing and deletes nothing because the "
+                "supervised child's outcome was never observed; this supervisor "
+                "exits here, which ends the container command without deleting the "
+                "instance and without protecting the child from a provider restart, "
+                "so this instance needs manual inspection now\n"
+            )
+        elif exit_code != 0:
             stop_after_hold(
                 emit,
                 f"the supervised queue ended with exit={exit_code}: {terminal_reason}",
