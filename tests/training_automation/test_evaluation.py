@@ -391,3 +391,102 @@ def test_backend_preflight_restores_cuda_visibility_when_loading_raises(monkeypa
     with pytest.raises(RuntimeError, match="backend load failed"):
         evaluation.preflight_evaluation_backends({"face_backend": "mutating:face"})
     assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
+def test_one_unassociated_checkpoint_does_not_void_the_verifiable_ones():
+    checkpoints = [
+        {
+            "step": 1700, "sample_run_status": "complete",
+            "remote_association": {
+                "status": "unavailable",
+                "reason": "no verified catalog checkpoint receipt for this job and step",
+            },
+        },
+        {
+            "step": 1800, "sample_run_status": "complete",
+            "remote_association": {"status": "unique", "reason": None},
+        },
+        {
+            "step": 2033, "sample_run_status": "complete",
+            "remote_association": {"status": "ambiguous", "reason": "two catalog receipts"},
+        },
+    ]
+
+    assert evaluation.shortlist_unavailable_reason(
+        checkpoints, ranking_error=None, identity_ranking_error=None
+    ) is None
+    eligible, excluded = evaluation.partition_shortlist_candidates(checkpoints)
+    assert [item["step"] for item in eligible] == [1800]
+    assert [item["step"] for item in excluded] == [1700, 2033]
+    assert "unavailable" in excluded[0]["reason"]
+    assert "ambiguous" in excluded[1]["reason"]
+    note = evaluation.shortlist_partial_coverage_note(excluded)
+    assert "1700" in note and "2033" in note
+
+
+def test_an_excluded_checkpoint_never_competes_for_the_top_three():
+    checkpoints = [
+        {
+            "step": step, "sample_run_status": "complete",
+            "remote_association": {"status": status, "reason": None},
+            "samples": [{"metrics": {"clipping_fraction_proxy": 0.1}}],
+        }
+        for step, status in ((100, "unavailable"), (200, "unique"), (300, "unique"))
+    ]
+    identity = [
+        {"step": step, "mean_face_cosine_similarity": score, "prompt_indices": [0, 1, 2]}
+        for step, score in ((100, 0.99), (200, 0.80), (300, 0.70))
+    ]
+    eligible, _ = evaluation.partition_shortlist_candidates(checkpoints)
+
+    ranked = evaluation.shortlist_checkpoints(eligible, identity)
+
+    assert [item["step"] for item in ranked] == [200, 300]
+
+
+def test_report_excludes_the_unassociated_step_without_voiding_the_shortlist(tmp_path):
+    config_path, output = setup_job(tmp_path)
+    state = output / ".automation" / "backup-state.json"
+    state.parent.mkdir()
+    state.write_text(json.dumps({
+        "schema_version": 2,
+        "destination": {
+            "repo_id": "owner/private", "repo_type": "dataset",
+            "remote_prefix": "training-backups",
+        },
+        "checkpoints": {
+            "final-only": {
+                "status": "backed_up", "verified": True, "cataloged": True,
+                "step": 200, "job_id": "person-deadbeef0000",
+                "catalog_checkpoint_id": "job--step-000000200--abc123",
+                "commit_id": "immutable-revision",
+            }
+        },
+    }), encoding="utf-8")
+
+    report = json.loads(evaluation.evaluate_job(
+        job_config_path=config_path, output_dir=output,
+        reference_images=[], config={},
+    ).read_text())
+
+    shortlist = report["automatic_shortlist"]
+    assert report["ranking"]["status"] == "available"
+    assert [item["step"] for item in shortlist["excluded"]] == [100]
+    # The remaining reason is the honest identity one, not a veto inherited
+    # from a step this job never uniquely associated.
+    assert "unique verified remote association" not in (shortlist["reason"] or "")
+    assert "valid faces" in shortlist["reason"]
+
+
+def test_shortlist_is_unavailable_only_when_no_checkpoint_is_associated():
+    checkpoints = [
+        {
+            "step": 100, "sample_run_status": "complete",
+            "remote_association": {"status": "ambiguous", "reason": "two receipts"},
+        },
+    ]
+    reason = evaluation.shortlist_unavailable_reason(
+        checkpoints, ranking_error=None, identity_ranking_error=None
+    )
+    assert "no checkpoint has a unique verified remote association" in reason
+    assert "[100]" in reason

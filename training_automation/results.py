@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .backup import BackupError, LocalArtifact, sha256_file, verify_remote_artifacts
 from .catalog import CatalogStore, resolve_model, safe_relative_path
+from .evaluation import shortlist_exclusion_reason
 from .gallery import render_gallery
 from .reporting import render_checkpoint_pages, render_top_comparison
 from .state import atomic_write_json
@@ -390,6 +391,22 @@ def _catalog_identity(
     return resolve_model(catalog, matches[0]["id"])
 
 
+def _shortlist_exclusions(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the checkpoints the report kept out of the shortlist candidates."""
+    excluded = (report.get("automatic_shortlist") or {}).get("excluded") or []
+    return [
+        {
+            "step": int(item.get("step", -1)),
+            "remote_association_status": str(
+                item.get("remote_association_status") or "unavailable"
+            ),
+            "reason": str(item.get("reason") or "no reason recorded"),
+        }
+        for item in excluded
+        if isinstance(item, Mapping)
+    ]
+
+
 def _shortlist_checkpoints(
     report: Mapping[str, Any]
 ) -> tuple[list[tuple[Mapping[str, Any], Mapping[str, Any]]], str | None]:
@@ -405,13 +422,23 @@ def _shortlist_checkpoints(
         )
     items = shortlist.get("items") or []
     checkpoint_documents = report.get("checkpoints") or []
-    if len(items) != min(3, len(checkpoint_documents)) or not items:
+    # A checkpoint this job cannot resolve to exactly one verified remote object
+    # is never exported, but it does not disqualify the checkpoints that can be:
+    # the candidate set is the eligible subset, and the shortlist must be its
+    # deterministic top.
+    candidates = [
+        checkpoint
+        for checkpoint in checkpoint_documents
+        if shortlist_exclusion_reason(checkpoint) is None
+    ]
+    if len(items) != min(3, len(candidates)) or not items:
         raise BackupError(
             "available automatic shortlist must contain the deterministic top candidates"
         )
     checkpoints = {int(item["step"]): item for item in checkpoint_documents}
     if len(checkpoints) != len(checkpoint_documents):
         raise BackupError("evaluation report contains duplicate checkpoint steps")
+    eligible_steps = {int(checkpoint["step"]) for checkpoint in candidates}
     signatures = []
     for checkpoint in checkpoint_documents:
         samples = checkpoint.get("samples") or []
@@ -421,12 +448,9 @@ def _shortlist_checkpoints(
         if not signature or len(signature) != len(set(signature)):
             raise BackupError("checkpoint samples lack a unique prompt/seed set")
         signatures.append(set(signature))
-        if (
-            checkpoint.get("sample_run_status") != "complete"
-            or checkpoint.get("remote_association", {}).get("status") != "unique"
-        ):
+        if checkpoint.get("sample_run_status") != "complete":
             raise BackupError(
-                "available automatic shortlist requires complete uniquely associated checkpoints"
+                "available automatic shortlist requires complete checkpoint sample runs"
             )
     if any(signature != signatures[0] for signature in signatures[1:]):
         raise BackupError(
@@ -440,8 +464,19 @@ def _shortlist_checkpoints(
         raise BackupError(
             "available automatic shortlist requires identity aggregates for every checkpoint"
         )
+    # Eligibility is checked on the shortlist itself before the deterministic
+    # comparison, so a report that shipped an unexportable step is refused for
+    # that reason and not for the ordering mismatch it also produces.
+    for item in items:
+        step = int(item["step"])
+        if step in checkpoints and step not in eligible_steps:
+            raise BackupError(
+                f"shortlisted step {step} has no unique verified remote association"
+            )
     expected = []
     for step, checkpoint in checkpoints.items():
+        if step not in eligible_steps:
+            continue
         clipping = [
             float(sample["metrics"]["clipping_fraction_proxy"])
             for sample in checkpoint["samples"]
@@ -467,6 +502,10 @@ def _shortlist_checkpoints(
         checkpoint = checkpoints.get(step)
         if checkpoint is None:
             raise BackupError(f"shortlisted step {step} is absent from checkpoint evidence")
+        if step not in eligible_steps:
+            raise BackupError(
+                f"shortlisted step {step} has no unique verified remote association"
+            )
         checkpoint_id = str(checkpoint.get("catalog_checkpoint_id") or "")
         if not checkpoint_id:
             raise BackupError(f"shortlisted step {step} has no catalog checkpoint identity")
@@ -768,6 +807,11 @@ def publish_ranked_results(
                     },
                     "status": "available" if shortlist else "unavailable",
                     "reason": unavailable_reason,
+                    # Which checkpoints never competed is part of the answer to
+                    # "what did the exported candidate beat"; an available
+                    # shortlist that ranked a subset says so here instead of
+                    # looking complete.
+                    "excluded_candidates": _shortlist_exclusions(report),
                     "exported_candidate_count": len(shortlist),
                     "method": (report.get("automatic_shortlist") or {}).get("method"),
                     "canonical_selected_checkpoint_id": model.get("selected_checkpoint_id"),
@@ -1019,6 +1063,7 @@ def publish_refreshed_report(
         "model_weights_transferred": False,
         "shortlist_status": "available" if shortlist else "unavailable",
         "shortlist_reason": unavailable_reason,
+        "shortlist_excluded_candidates": _shortlist_exclusions(report),
         "overview": "overview.png",
         "checkpoints": rendered_records,
     }

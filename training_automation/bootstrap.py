@@ -16,7 +16,13 @@ from .archive import EvidenceArchive
 from .backup import EVIDENCE_CONTRACT, BackupError, HuggingFaceBackupClient
 from .catalog import CatalogStore, resolve_model, safe_relative_path
 from .evaluation import preflight_evaluation_backends
-from .lifecycle import SimplePodClient, verify_instance_identity, wait_for_binding
+from .lifecycle import (
+    InstanceBinding,
+    SimplePodClient,
+    delete_verified_instance,
+    verify_instance_identity,
+    wait_for_binding,
+)
 from .queue import (
     EXTENSION_OPTIONAL_FIELDS,
     EXTENSION_REQUIRED_FIELDS,
@@ -784,6 +790,24 @@ def _completion_evidence(
     return files, {"jobs": completion_jobs, "job_count": len(completion_jobs)}
 
 
+def _persist_instance_binding(
+    state: dict[str, Any], state_path: Path, binding: InstanceBinding
+) -> None:
+    """Record the verified identity of this instance before any paid work.
+
+    The supervisor cannot resolve the remote binding document by itself, so
+    without this record a failed shard has no identity-verified way to stop its
+    own instance. The write happens the moment the binding is verified, long
+    before any delete request, so it never moves a durable write past one.
+    """
+    state.update({
+        "instance_id": binding.instance_id,
+        "instance_hash_id": binding.instance_hash_id,
+        "instance_notes": binding.instance_notes,
+    })
+    atomic_write_json(state_path, state)
+
+
 def _binding_for_manifest(
     *,
     client: HuggingFaceBackupClient,
@@ -1062,15 +1086,19 @@ def _finalize_completed_run(
     archive_state = archive.publish(files, completion)
     if archive_state.get("status") != "completed":
         raise BackupError("remote completion archive did not verify")
-    verify_instance_identity(simplepod, binding)
-    state.update({
-        "status": "delete-requested",
-        "archive_completion_revision": archive_state["completion_revision"],
-        "delete_requested": True,
-    })
-    atomic_write_json(state_path, state)
-    simplepod.delete(binding.instance_id)
-    state["status"] = "delete-accepted"
+
+    def record_delete_request() -> None:
+        state.update({
+            "status": "delete-requested",
+            "archive_completion_revision": archive_state["completion_revision"],
+            "delete_requested": True,
+        })
+        atomic_write_json(state_path, state)
+
+    outcome = delete_verified_instance(
+        simplepod, binding, before_request=record_delete_request
+    )
+    state.update({"status": "delete-accepted", "delete_outcome": outcome})
     atomic_write_json(state_path, state)
     return state
 
@@ -1155,6 +1183,7 @@ def run_parallel_bootstrap(
                 run_id=run_id,
                 shard_id=shard_id,
             )
+            _persist_instance_binding(state, state_path, binding)
             queue = queue_factory(run_root / "queue.yaml")
             queue_state = _validate_recovery_queue(
                 queue,
@@ -1211,6 +1240,7 @@ def run_parallel_bootstrap(
             run_id=run_id,
             shard_id=shard_id,
         )
+        _persist_instance_binding(state, state_path, binding)
         minimum_free = int(manifest["storage"]["minimum_free_bytes"])
         available = shutil.disk_usage(storage_root).free
         if available < minimum_free:

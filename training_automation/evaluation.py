@@ -279,6 +279,48 @@ def shortlist_checkpoints(
     return items[:3]
 
 
+def shortlist_exclusion_reason(checkpoint: Mapping[str, Any]) -> str | None:
+    """Return why this checkpoint cannot be a shortlist candidate, or None.
+
+    A shortlisted checkpoint is exported as weights, so it must resolve to
+    exactly one verified remote object. Ambiguous means two or more catalog
+    checkpoints exist for this job and step and the sample filenames do not say
+    which bytes produced the images; unavailable means this job published no
+    verified receipt for that step at all. Either way the checkpoint cannot be
+    shipped - but that is a property of that checkpoint alone, not of the run.
+    """
+    association = checkpoint.get("remote_association") or {}
+    status = str(association.get("status") or "unavailable")
+    if status == "unique":
+        return None
+    return (
+        f"remote association is {status}: "
+        f"{association.get('reason') or 'no reason recorded'}"
+    )
+
+
+def partition_shortlist_candidates(
+    checkpoints: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split the evaluated checkpoints into shippable candidates and exclusions."""
+    eligible: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for checkpoint in checkpoints:
+        reason = shortlist_exclusion_reason(checkpoint)
+        if reason is None:
+            eligible.append(checkpoint)
+        else:
+            excluded.append({
+                "step": int(checkpoint["step"]),
+                "remote_association_status": str(
+                    (checkpoint.get("remote_association") or {}).get("status")
+                    or "unavailable"
+                ),
+                "reason": reason,
+            })
+    return eligible, excluded
+
+
 def shortlist_unavailable_reason(
     checkpoints: list[dict[str, Any]],
     *, ranking_error: str | None, identity_ranking_error: str | None,
@@ -292,16 +334,32 @@ def shortlist_unavailable_reason(
     ]
     if incomplete:
         return f"checkpoint sample runs are incomplete at steps {incomplete}"
-    unverified = [
-        int(checkpoint["step"])
-        for checkpoint in checkpoints
-        if checkpoint.get("remote_association", {}).get("status") != "unique"
-    ]
-    if unverified:
-        return f"checkpoint samples lack a unique verified remote association at steps {unverified}"
+    # A checkpoint without a unique verified remote association is excluded from
+    # the candidates, not treated as a verdict on the other checkpoints. Voiding
+    # the whole shortlist for one such step is what made an extended run publish
+    # no top three at all while every other checkpoint of the same run was
+    # completely and uniquely associated.
+    eligible, excluded = partition_shortlist_candidates(checkpoints)
+    if not eligible:
+        steps = [item["step"] for item in excluded]
+        return (
+            "no checkpoint has a unique verified remote association "
+            f"(steps {steps})"
+        )
     if identity_ranking_error:
         return identity_ranking_error
     return None
+
+
+def shortlist_partial_coverage_note(excluded: list[dict[str, Any]]) -> str | None:
+    """Say out loud which checkpoints could not compete for the top three."""
+    if not excluded:
+        return None
+    return (
+        "ranked only the checkpoints with a unique verified remote association; "
+        "excluded steps "
+        + ", ".join(f"{item['step']} ({item['reason']})" for item in excluded)
+    )
 
 
 def _choose_latest_complete_run(
@@ -449,7 +507,8 @@ def _evaluate_job(
         checkpoints, ranking_error=ranking_error,
         identity_ranking_error=identity_ranking_error,
     )
-    shortlist = shortlist_checkpoints(checkpoints, identity_ranked) if not shortlist_error else []
+    eligible, excluded_candidates = partition_shortlist_candidates(checkpoints)
+    shortlist = shortlist_checkpoints(eligible, identity_ranked) if not shortlist_error else []
     report = {
         "schema_version": REPORT_SCHEMA,
         "job_config": str(job_config_path),
@@ -474,7 +533,8 @@ def _evaluate_job(
         },
         "automatic_shortlist": {
             "status": "available" if shortlist else "unavailable",
-            "reason": shortlist_error,
+            "reason": shortlist_error or shortlist_partial_coverage_note(excluded_candidates),
+            "excluded": excluded_candidates,
             "method": "top three by mean face cosine descending on the common valid-face prompt subset, then mean clipping ascending, then step ascending; evidence shortlist only",
             "items": shortlist,
         },

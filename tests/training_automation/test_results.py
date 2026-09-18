@@ -619,3 +619,131 @@ def test_archive_refresh_rejects_mutable_evidence_revision_before_evidence_downl
         "training-archives/run-archive/worker-a/completion.json",
         ARCHIVE_COMPLETION_REVISION,
     )]
+
+
+def test_extended_run_exports_its_ranked_checkpoints_despite_an_unassociated_step(
+    tmp_path,
+):
+    """An extension resumes from a checkpoint of the previous job.
+
+    That base step can appear in this job's evidence with samples but without a
+    unique verified receipt of its own. It cannot be exported, and it must not
+    take the whole top three down with it: the LaProfumosa refinement published
+    `unavailable` with zero candidates while every other checkpoint of the same
+    run was complete and uniquely associated.
+    """
+    samples = _write_samples(tmp_path / "samples", steps=(50, 100, 200, 300))
+    report = _report(samples)
+    client, _ = _catalog_and_client(report)
+    report["checkpoints"].insert(0, {
+        "step": 50,
+        "final": False,
+        "catalog_checkpoint_id": None,
+        "remote_checkpoint": None,
+        "remote_checkpoint_candidates": [],
+        "remote_association": {
+            "status": "unavailable",
+            "reason": "no verified catalog checkpoint receipt for this job and step",
+        },
+        "sample_run_status": "complete",
+        "samples": samples[50],
+    })
+    # The base step would win on identity if it were allowed to compete.
+    report["identity_ranking"]["items"].append(
+        {"step": 50, "mean_face_cosine_similarity": 0.99, "prompt_indices": [0, 1]}
+    )
+    report["automatic_shortlist"]["excluded"] = [{
+        "step": 50,
+        "remote_association_status": "unavailable",
+        "reason": (
+            "remote association is unavailable: no verified catalog checkpoint "
+            "receipt for this job and step"
+        ),
+    }]
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    record, _ = publish_ranked_results(
+        client=client,
+        repo_id="owner/private",
+        repo_type="dataset",
+        run_id="run-1",
+        job_id="subject-job",
+        report_path=report_path,
+        sample_root=tmp_path / "samples",
+        work_dir=tmp_path / "results",
+        sleep=lambda _: None,
+        completed_at="2026-09-15T12:00:00+00:00",
+    )
+
+    assert record["status"] == "available"
+    assert record["exported_candidate_count"] == 3
+    assert [item["step"] for item in record["candidates"]] == [200, 100, 300]
+    assert "training-results/latest/0001-subject.json" in client.remote
+    assert not any("/top-4" in path for path in client.remote)
+    # A partial ranking must say so where a human reads it: the published index
+    # and the gallery, not only the evaluation report.
+    index = json.loads(client.remote["training-results/run-1/0001-subject/index.json"])
+    assert index["status"] == "available"
+    assert index["excluded_candidates"] == [{
+        "step": 50,
+        "remote_association_status": "unavailable",
+        "reason": (
+            "remote association is unavailable: no verified catalog checkpoint "
+            "receipt for this job and step"
+        ),
+    }]
+    gallery = client.remote[
+        "training-results/run-1/0001-subject/evaluation-gallery.html"
+    ].decode()
+    assert "Partial coverage" in gallery
+    assert "step 50" in gallery
+    assert "no verified catalog checkpoint receipt" in gallery
+
+
+def test_shortlist_may_not_contain_a_checkpoint_without_a_unique_association(tmp_path):
+    """The named per-step refusal, not the generic publisher wrapper.
+
+    A fourth eligible checkpoint keeps the candidate count at three, so the
+    count check passes and the shortlist reaches the refusal that actually
+    protects the export.
+    """
+    samples = _write_samples(tmp_path / "samples", steps=(100, 200, 300, 400))
+    report = _report(samples)
+    report["checkpoints"].append({
+        "step": 400,
+        "final": False,
+        "catalog_checkpoint_id": "checkpoint-400",
+        "remote_checkpoint": {"commit_id": "r0"},
+        "remote_association": {"status": "unique", "reason": None},
+        "sample_run_status": "complete",
+        "samples": samples[400],
+    })
+    report["identity_ranking"]["items"].append(
+        {"step": 400, "mean_face_cosine_similarity": 0.10, "prompt_indices": [0, 1]}
+    )
+    client, _ = _catalog_and_client(report)
+    report["checkpoints"][0]["remote_association"] = {
+        "status": "ambiguous", "reason": "two verified catalog receipts"
+    }
+
+    with pytest.raises(
+        BackupError, match="shortlisted step 100 has no unique verified remote association"
+    ):
+        results._shortlist_checkpoints(report)
+
+    report_path = tmp_path / "evaluation.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(BackupError, match="bounded retries"):
+        publish_ranked_results(
+            client=client,
+            repo_id="owner/private",
+            repo_type="dataset",
+            run_id="run-1",
+            job_id="subject-job",
+            report_path=report_path,
+            sample_root=tmp_path / "samples",
+            work_dir=tmp_path / "results",
+            max_attempts=1,
+        )
+    assert not any(path.startswith("training-results/") for path in client.remote)

@@ -66,7 +66,7 @@ class CompletedQueue:
     def __init__(
         self, path, *, reference_available=True,
         identity_ranking_status="available", write_sample=True,
-        pose_backend_available=True,
+        pose_backend_available=True, cadence=(100, 100),
     ):
         config = yaml.safe_load(Path(path).read_text())
         self.state_path = Path(config["state_path"])
@@ -76,6 +76,10 @@ class CompletedQueue:
         self.config = config
         self.pose_configured = bool((config.get("evaluation") or {}).get("landmark_backend"))
         self.pose_backend_available = pose_backend_available
+        # (sample_every, save_every). The archive gate requires one saved
+        # checkpoint per sampled step, and only the cadences bootstrap declares
+        # supported; the default is the pair the real recipes ship.
+        self.sample_every, self.save_every = cadence
         self.jobs = []
         for index, dataset in enumerate(config["datasets"]):
             job_id = f"{dataset['name']}-job"
@@ -95,8 +99,9 @@ class CompletedQueue:
                     "name": job_id,
                     "process": [{
                         "train": {"steps": final_step},
+                        "save": {"save_every": self.save_every},
                         "sample": {
-                            "sample_every": 100,
+                            "sample_every": self.sample_every,
                             "seed": 42,
                             "walk_seed": False,
                             "samples": [
@@ -131,7 +136,8 @@ class CompletedQueue:
                 (samples / "not-a-sample-file").mkdir()
             trainer = yaml.safe_load(job.config_path.read_text())
             final_step = trainer["config"]["process"][0]["train"]["steps"]
-            expected_steps = list(range(100, final_step, 100)) + [final_step]
+            step_every = trainer["config"]["process"][0]["sample"]["sample_every"]
+            expected_steps = list(range(step_every, final_step, step_every)) + [final_step]
             receipts = {}
             for step in expected_steps:
                 checkpoint_samples = []
@@ -163,9 +169,26 @@ class CompletedQueue:
                     "remote_association": {"status": "unique", "reason": None},
                     "samples": checkpoint_samples,
                 })
+                # A receipt carries the per-checkpoint evidence contract, so the
+                # archive gate holds it to published, verified evidence of its
+                # own step instead of tolerating it as a pre-contract legacy
+                # receipt.
                 receipts[str(step)] = {
                     "status": "backed_up", "verified": True, "cataloged": True,
                     "final": step == final_step,
+                    "step": step,
+                    "evidence_contract": 1,
+                    "catalog_checkpoint_id": f"{job.job_id}-{step:09d}",
+                    "evidence": {
+                        "status": "published",
+                        "verified": True,
+                        "commit_id": f"commit-{step:09d}",
+                        "evaluation_remote_path": (
+                            f"models/{job.job_id}/checkpoints/{job.job_id}-{step:09d}/evaluation.json"
+                        ),
+                        "sample_run_status": "complete",
+                        "sample_count": 23,
+                    },
                 }
             (automation / "backup-state.json").write_text(json.dumps({
                 "schema_version": 2,
@@ -487,6 +510,42 @@ def test_nonround_final_schedule_and_pose_evidence_archive_before_delete(tmp_pat
     assert pod.deleted == [42]
 
 
+def test_save_cadence_out_of_step_with_sampling_never_passes_completion_gate(tmp_path):
+    """A sampled step with no checkpoint of its own cannot carry its evidence.
+
+    The run samples every 100 steps and saves every 200, so half the scheduled
+    evaluations have no checkpoint to travel with. The archive gate has to
+    refuse it, and the paid instance has to survive the refusal.
+    """
+    pod = Pod()
+    with pytest.raises(BackupError, match="does not retain the required evaluation schedule"):
+        run_parallel_bootstrap(
+            env=env(tmp_path), hub_client=setup_client(), pod_client=pod,
+            queue_factory=lambda path: CompletedQueue(path, cadence=(100, 200)),
+            snapshot_fetch=snapshot_fetch,
+            recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+        )
+    assert pod.deleted == []
+
+
+def test_unsupported_sample_cadence_never_passes_completion_gate(tmp_path):
+    """Only the declared cadences are archivable, even when the pair agrees.
+
+    150/150 is self-consistent and produces complete evidence at every one of
+    its own steps; it is refused because it is not a cadence the pinned
+    recipes ship, so an unreviewed cadence cannot reach a delete decision.
+    """
+    pod = Pod()
+    with pytest.raises(BackupError, match="does not retain the required evaluation schedule"):
+        run_parallel_bootstrap(
+            env=env(tmp_path), hub_client=setup_client(), pod_client=pod,
+            queue_factory=lambda path: CompletedQueue(path, cadence=(150, 150)),
+            snapshot_fetch=snapshot_fetch,
+            recipe_path=Path(__file__).parents[2] / "config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b.yaml",
+        )
+    assert pod.deleted == []
+
+
 def test_configured_pose_backend_failure_never_deletes(tmp_path):
     client = setup_client()
     manifest = json.loads(client.snapshots[MANIFEST_REVISION]["private/manifest.json"])
@@ -540,6 +599,12 @@ def test_completed_queue_restart_runs_archive_only_then_deletes(tmp_path, monkey
     )
     assert failed["status"] == "failed" and failed["delete_requested"] is False
     assert pod.deleted == []
+    # The supervisor cannot resolve the remote binding document by itself, so a
+    # failed shard can only stop its own instance if the verified identity is
+    # already on persistent storage.
+    assert failed["instance_id"] == 42
+    assert failed["instance_hash_id"] == "hash-42"
+    assert failed["instance_notes"] == "training-run:run-1;shard:a"
 
     class RecoveryQueue(CompletedQueue):
         run_calls = 0

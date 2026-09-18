@@ -152,10 +152,27 @@ def _shortlist(report: Mapping[str, Any]) -> str:
             f"{_number(item.get('mean_clipping_fraction_proxy'))}"
             "</li>"
         )
+    # An available shortlist that ranked only part of the run must say which
+    # checkpoints never competed, otherwise a partial top three reads as if it
+    # had beaten every checkpoint of the job.
+    excluded = [item for item in shortlist.get("excluded") or [] if isinstance(item, Mapping)]
+    partial = ""
+    if excluded:
+        entries = "".join(
+            "<li>"
+            f"step {_text(item.get('step'))} · {_text(item.get('reason') or 'no reason recorded')}"
+            "</li>"
+            for item in excluded
+        )
+        partial = (
+            '<p class="caveat">Partial coverage: these checkpoints were not eligible '
+            "for the ranking and did not compete.</p>"
+            f"<ul class=\"shortlist-excluded\">{entries}</ul>"
+        )
     return (
         '<section class="shortlist"><h2>Automatic evidence shortlist</h2>'
         '<p class="caveat">This evidence ordering does not select a model. A final checkpoint is not necessarily the highest-ranked checkpoint.</p>'
-        f"<ol>{''.join(rows)}</ol></section>"
+        f"<ol>{''.join(rows)}</ol>{partial}</section>"
     )
 
 

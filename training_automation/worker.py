@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, TextIO
 
@@ -15,6 +17,21 @@ from .state import atomic_write_json
 COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 FINALIZATION_RECOVERY_ATTEMPTS = 3
 RECOVERY_BACKOFF_SECONDS = (5, 15, 30)
+# A held instance keeps billing. The diagnostic value of the held container is
+# real but finite, so the hold is a deadline, not a state: conservative enough
+# that a human woken by the alert still finds the console, bounded so that a
+# human who is not woken does not pay for days.
+FAILURE_HOLD_SECONDS = 6 * 3600
+FAILURE_HOLD_ENV = "TRAINING_FAILURE_HOLD_SECONDS"
+HOLD_POLL_SECONDS = 60
+# The deletion itself already retries inside its own budget; this is the outer
+# budget for a provider that is still unreachable when that one ends. Bounded on
+# both sides: a transient outage must not strand the instance, and a permanent
+# one must not turn into an infinite retry.
+SELF_DELETE_ATTEMPTS = 3
+SELF_DELETE_RETRY_SECONDS = 1800
+CHILD_TERMINATION_SECONDS = 30
+CHILD_TERMINATION_POLL_SECONDS = 0.2
 
 
 def _component(env: Mapping[str, str], name: str) -> str:
@@ -35,9 +52,267 @@ def worker_log_path(env: Mapping[str, str]) -> Path:
     )
 
 
-def hold_forever() -> None:
+def failure_hold_seconds(env: Mapping[str, str]) -> float:
+    """Return the configured diagnostic hold, defaulting conservatively."""
+    raw = str(env.get(FAILURE_HOLD_ENV, "")).strip()
+    if not raw:
+        return float(FAILURE_HOLD_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(FAILURE_HOLD_SECONDS)
+    return max(0.0, value)
+
+
+def hold_for(
+    seconds: float,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Hold this instance until the deadline and not one moment longer."""
+    deadline = monotonic() + max(0.0, float(seconds))
     while True:
-        time.sleep(3600)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return
+        sleep(min(float(HOLD_POLL_SECONDS), remaining))
+
+
+def _delete_is_retryable(exc: BaseException) -> bool:
+    """Retry what time can change; give up at once on what it cannot.
+
+    An unconfirmed provider answer, a transport failure or a 5xx is exactly what
+    a second hold is for, and so is a local mount that refused one read of the
+    persisted binding. Revoked credentials, a refused method and an instance
+    whose identity does not match this process are permanent by construction:
+    spending the whole outer budget on them is spending money to learn nothing.
+    A binding that was never persisted is permanent in the same way.
+    """
+    from .backup import BackupError
+    from .lifecycle import InstanceIdentityError, PermanentApiError
+
+    if isinstance(exc, (PermanentApiError, InstanceIdentityError)):
+        return False
+    if isinstance(exc, BackupError):
+        return True
+    if isinstance(exc, FileNotFoundError):
+        return False
+    if isinstance(exc, OSError):
+        return True
+    return False
+
+
+def child_process_group(process: Any) -> int | None:
+    """Return the process group of a real supervised child, if it has one.
+
+    The child is started with `start_new_session=True`, so it leads its own
+    group and the trainer it runs as its own subprocess inherits that group.
+    Addressing the group is the difference between signalling the supervisor
+    and signalling the process that is actually writing evidence.
+    """
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        return os.getpgid(pid)
+    except Exception:
+        return None
+
+
+def _group_is_gone(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        # Existing but unsignalable is not gone.
+        return False
+    return False
+
+
+def _reap(process: Any, wait_seconds: float) -> None:
+    wait = getattr(process, "wait", None)
+    if wait is None:
+        return
+    try:
+        wait(timeout=wait_seconds)
+    except Exception:
+        pass
+
+
+def _await_group_exit(
+    pgid: int,
+    *,
+    process: Any,
+    seconds: float,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> bool:
+    deadline = monotonic() + max(0.0, float(seconds))
+    while True:
+        # The direct child must be reaped or its zombie keeps the group alive.
+        _reap(process, 0.1)
+        if _group_is_gone(pgid):
+            return True
+        if monotonic() >= deadline:
+            return False
+        sleep(CHILD_TERMINATION_POLL_SECONDS)
+
+
+def _stop_process_object(process: Any, *, emit: Callable[[str], None], wait_seconds: float) -> bool:
+    """Fallback for a child with no addressable group."""
+    poll = getattr(process, "poll", None)
+    terminate = getattr(process, "terminate", None)
+    kill = getattr(process, "kill", None)
+    if poll is None or terminate is None or kill is None:
+        emit(
+            "parallel worker cannot inspect the supervised child, so it will not "
+            "delete this instance\n"
+        )
+        return False
+    try:
+        if poll() is not None:
+            return True
+        emit("parallel worker terminating the supervised child before any deletion\n")
+        terminate()
+        try:
+            process.wait(timeout=wait_seconds)
+        except Exception:
+            kill()
+            process.wait(timeout=wait_seconds)
+        stopped = poll() is not None
+    except Exception as exc:
+        emit(
+            "parallel worker could not confirm the supervised child stopped "
+            f"({type(exc).__name__}: {exc})\n"
+        )
+        return False
+    if not stopped:
+        emit("parallel worker still sees a live supervised child\n")
+    return stopped
+
+
+def _ensure_child_stopped(
+    process: Any,
+    *,
+    pgid: int | None = None,
+    emit: Callable[[str], None],
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    wait_seconds: float = CHILD_TERMINATION_SECONDS,
+) -> bool:
+    """Return True only when nothing this supervisor started can still write.
+
+    Signalling the supervised pid alone is not enough and is worse than no
+    guard at all: the queue process runs the trainer as its own subprocess, so
+    SIGTERM to the leader leaves an orphaned trainer writing into the same
+    output while the guard reports success. The whole group is signalled, and
+    death is established by observing that the group is gone, not by reading
+    the leader's return code.
+    """
+    if process is None:
+        return True
+    if pgid is None:
+        return _stop_process_object(process, emit=emit, wait_seconds=wait_seconds)
+    if _await_group_exit(
+        pgid, process=process, seconds=0, sleep=sleep, monotonic=monotonic
+    ):
+        return True
+    emit(
+        f"parallel worker terminating supervised process group {pgid} "
+        "before any deletion\n"
+    )
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except Exception as exc:
+        emit(
+            f"parallel worker could not signal process group {pgid} "
+            f"({type(exc).__name__}: {exc})\n"
+        )
+        return False
+    if _await_group_exit(
+        pgid, process=process, seconds=wait_seconds / 2, sleep=sleep, monotonic=monotonic
+    ):
+        return True
+    emit(f"parallel worker killing supervised process group {pgid}\n")
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except Exception as exc:
+        emit(
+            f"parallel worker could not kill process group {pgid} "
+            f"({type(exc).__name__}: {exc})\n"
+        )
+        return False
+    stopped = _await_group_exit(
+        pgid, process=process, seconds=wait_seconds / 2, sleep=sleep, monotonic=monotonic
+    )
+    if not stopped:
+        emit(f"parallel worker still sees a live process in group {pgid}\n")
+    return stopped
+
+
+def _deadline_text(now: Callable[[], float], seconds: float) -> str:
+    return datetime.fromtimestamp(now() + seconds, tz=timezone.utc).isoformat(
+        timespec="seconds"
+    )
+
+
+def release_instance(env: Mapping[str, str]) -> str:
+    """Delete this instance through the same lifecycle path as the success route.
+
+    The identity comes from the binding the bootstrap verified and persisted
+    before any paid work; nothing is deleted on an identity this worker cannot
+    check against the provider itself. The delete request is recorded durably
+    before it is issued, exactly as the success route records it.
+    """
+    from .lifecycle import InstanceBinding, SimplePodClient, delete_verified_instance
+
+    token = str(env.get("SIMPLEPOD_API_TOKEN", ""))
+    if not token:
+        # A precondition that no amount of waiting can satisfy, answered before
+        # any read whose failure would deserve another hold.
+        raise ValueError("SIMPLEPOD_API_TOKEN is unset, so this container cannot delete itself")
+    run_id = _component(env, "TRAINING_RUN_ID")
+    shard_id = _component(env, "TRAINING_SHARD_ID")
+    state_path = worker_log_path(env).with_name("bootstrap-state.json")
+    state = _load_mapping(state_path)
+    if (
+        state.get("schema_version") != 1
+        or state.get("run_id") != run_id
+        or state.get("shard_id") != shard_id
+    ):
+        raise ValueError("bootstrap state identity does not match this worker")
+    try:
+        binding = InstanceBinding.from_document({
+            "schema_version": 1,
+            "run_id": run_id,
+            "shard_id": shard_id,
+            "instance_id": state.get("instance_id", 0),
+            "instance_hash_id": state.get("instance_hash_id", ""),
+            "instance_notes": state.get("instance_notes", ""),
+        })
+    except Exception as exc:
+        # Not retryable: no amount of waiting creates a binding this container
+        # never received.
+        raise ValueError(
+            f"this container has no verified instance binding to delete: {exc}"
+        ) from None
+    client = SimplePodClient(token)
+
+    def record_delete_request() -> None:
+        # The failure itself stays readable in "status"; only the delete
+        # request is added, so a container restart still refuses to resume on
+        # an outcome it cannot know.
+        state["delete_requested"] = True
+        state["delete_requested_by"] = "diagnostic-hold-deadline"
+        atomic_write_json(state_path, state)
+
+    return delete_verified_instance(client, binding, before_request=record_delete_request)
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:
@@ -82,21 +357,112 @@ def run_worker(
     *,
     env: Mapping[str, str] | None = None,
     popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
-    hold: Callable[[], None] = hold_forever,
+    hold: Callable[[], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    now: Callable[[], float] = time.time,
+    delete_instance: Callable[[Mapping[str, str]], str] = release_instance,
+    self_delete_attempts: int = SELF_DELETE_ATTEMPTS,
+    self_delete_retry_seconds: float = SELF_DELETE_RETRY_SECONDS,
     recovery_attempts: int = FINALIZATION_RECOVERY_ATTEMPTS,
     console: TextIO | None = None,
 ) -> int:
     values = dict(os.environ if env is None else env)
     output = console or sys.stdout
+    limit = failure_hold_seconds(values)
+    attempts_allowed = max(1, int(self_delete_attempts))
+    # Every child this supervisor ever started, with the group it leads. The
+    # guard runs over all of them: a relaunch after a lost pipe can leave an
+    # earlier child alive, and the later child exiting says nothing about it.
+    children: list[dict[str, Any]] = []
+
+    def every_child_stopped(emit: Callable[[str], None]) -> bool:
+        stopped = True
+        for child in children:
+            if child["pgid"] is None and child["reaped"]:
+                # No group to address and its exit status was already collected:
+                # this one is observably finished.
+                continue
+            if not _ensure_child_stopped(
+                child["process"],
+                pgid=child["pgid"],
+                emit=emit,
+                sleep=sleep,
+                monotonic=monotonic,
+            ):
+                stopped = False
+        return stopped
+
+    def wait_out(seconds: float) -> None:
+        if hold is not None:
+            hold()
+        else:
+            hold_for(seconds, sleep=sleep, monotonic=monotonic)
+
+    def stop_after_hold(emit: Callable[[str], None], reason: str) -> None:
+        """Hold this instance for diagnosis, then stop paying for it.
+
+        The deletion has its own bounded retry budget; this is the outer one. A
+        provider outage that spans the whole inner budget must not leave the
+        instance billing forever, which is the failure this supervisor exists to
+        remove, so the hold is repeated a fixed number of times before the
+        container gives up out loud.
+        """
+        seconds = limit
+        for attempt in range(1, attempts_allowed + 1):
+            emit(
+                f"parallel worker holding this instance for diagnosis because {reason}; "
+                f"the hold ends at {_deadline_text(now, seconds)} "
+                f"({int(seconds)}s from now) and the instance then deletes itself "
+                f"(self-delete attempt {attempt}/{attempts_allowed})\n"
+            )
+            wait_out(seconds)
+            emit(
+                "parallel worker diagnostic hold reached its deadline; requesting "
+                f"self-delete {attempt}/{attempts_allowed}\n"
+            )
+            # Death is established here, at the deadline, and not when the pipe
+            # broke: a healthy child keeps the whole hold to finish its training
+            # or its publication, and only the instant before the delete request
+            # does the supervisor insist that nothing can still be writing.
+            if not every_child_stopped(emit):
+                emit(
+                    "parallel worker refuses to delete this instance while a supervised "
+                    "child may still be writing evidence; manual cleanup is required\n"
+                )
+                return
+            try:
+                outcome = delete_instance(values)
+            except Exception as exc:
+                emit(
+                    f"parallel worker self-delete {attempt}/{attempts_allowed} did not "
+                    f"confirm ({type(exc).__name__}: {exc})\n"
+                )
+                if not _delete_is_retryable(exc) or attempt == attempts_allowed:
+                    emit(
+                        "parallel worker could not delete its own instance; "
+                        "manual cleanup is required\n"
+                    )
+                    return
+                seconds = max(0.0, float(self_delete_retry_seconds))
+                continue
+            emit(f"parallel worker self-delete outcome: {outcome}\n")
+            return
+
     try:
         log_path = worker_log_path(values)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log = log_path.open("a", encoding="utf-8", buffering=1)
     except Exception as exc:
-        output.write(f"parallel worker could not initialize its durable log: {type(exc).__name__}: {exc}\n")
-        output.flush()
-        hold()
+        def emit_console(message: str) -> None:
+            output.write(message)
+            output.flush()
+
+        emit_console(f"parallel worker could not initialize its durable log: {type(exc).__name__}: {exc}\n")
+        stop_after_hold(
+            emit_console,
+            f"its durable log could not be initialized: {type(exc).__name__}: {exc}",
+        )
         return 127
 
     child_env = dict(values)
@@ -113,6 +479,7 @@ def run_worker(
 
         recovery_started = 0
         terminal_recovery_state = False
+        terminal_reason = "no archive-only recovery was possible"
         if recovery_path.is_file():
             try:
                 recovery_state = _load_mapping(recovery_path)
@@ -132,6 +499,10 @@ def run_worker(
                         if recovery_state.get("status") == "completed"
                         else int(recovery_state.get("last_exit_code", 127))
                     )
+                    terminal_reason = (
+                        "the recovery budget already ended in "
+                        f"{recovery_state.get('status')}"
+                    )
                     emit(
                         "parallel worker preserving terminal recovery state "
                         f"{recovery_state.get('status')} without another child launch\n"
@@ -149,6 +520,7 @@ def run_worker(
                         atomic_write_json(recovery_path, recovery_state)
                         terminal_recovery_state = True
                         exit_code = int(recovery_state["last_exit_code"])
+                        terminal_reason = reason
                         emit(f"parallel worker recovery stopped: {reason}\n")
                     else:
                         recovery_started += 1
@@ -170,6 +542,9 @@ def run_worker(
             except Exception as exc:
                 terminal_recovery_state = True
                 exit_code = 127
+                terminal_reason = (
+                    f"recovery could not be safely resumed: {type(exc).__name__}: {exc}"
+                )
                 emit(
                     "parallel worker could not safely resume recovery: "
                     f"{type(exc).__name__}: {exc}\n"
@@ -177,6 +552,7 @@ def run_worker(
         while not terminal_recovery_state:
             label = "initial" if recovery_started == 0 else f"recovery-{recovery_started}"
             emit(f"parallel worker starting {label} supervised queue attempt\n")
+            process = None
             try:
                 process = popen(
                     command,
@@ -186,18 +562,29 @@ def run_worker(
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    start_new_session=True,
                 )
+                child = {
+                    "process": process,
+                    "pgid": child_process_group(process),
+                    "reaped": False,
+                }
+                children.append(child)
                 if process.stdout is None:
                     raise RuntimeError("parallel worker could not capture child output")
                 for line in process.stdout:
                     emit(line)
                 exit_code = int(process.wait())
+                child["reaped"] = True
             except Exception as exc:
                 emit(
                     "parallel worker launch/capture failure: "
                     f"{type(exc).__name__}: {exc}\n"
                 )
                 exit_code = 127
+                # Losing the pipe says nothing about the child, and nothing is
+                # signalled here: a transient read error must not destroy an
+                # otherwise healthy shard. The guard runs at the deadline.
             emit(f"parallel worker {label} exit={exit_code}\n")
             if exit_code == 0:
                 if recovery_started:
@@ -223,10 +610,7 @@ def run_worker(
                         "reason": reason,
                     })
                 emit(f"parallel worker recovery stopped: {reason}\n")
-                emit(
-                    "parallel worker preserving this instance for diagnosis; "
-                    "manual cleanup is required\n"
-                )
+                terminal_reason = reason
                 break
             recovery_started += 1
             backoff = RECOVERY_BACKOFF_SECONDS[recovery_started - 1]
@@ -248,8 +632,11 @@ def run_worker(
             recovery_state = _load_mapping(recovery_path)
             recovery_state["status"] = "running"
             atomic_write_json(recovery_path, recovery_state)
-    if exit_code != 0:
-        hold()
+        if exit_code != 0:
+            stop_after_hold(
+                emit,
+                f"the supervised queue ended with exit={exit_code}: {terminal_reason}",
+            )
     return exit_code
 
 
