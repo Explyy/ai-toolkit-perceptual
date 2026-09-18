@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from training_automation import cli, queue as queue_module
-from training_automation.queue import TrainingQueue
+from training_automation.queue import QueueConfigurationError, QueueJob, TrainingQueue
 
 
 def write_configs(tmp_path: Path) -> Path:
@@ -300,3 +300,57 @@ def test_cli_returns_nonzero_for_failed_job(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "TrainingQueue", FailedQueue)
     assert cli.main(["run", str(tmp_path / "automation.yaml")]) == 1
+
+
+def refinement_process(*, sample_every, save_every, steps=1200):
+    return {
+        "train": {"steps": steps},
+        "save": {"save_every": save_every},
+        "sample": {
+            "sample_every": sample_every,
+            "samples": [{"prompt": "single adult subject [trigger]"}],
+        },
+    }
+
+
+def refinement_job(tmp_path):
+    return QueueJob(
+        job_id="subject-0-job",
+        config_path=tmp_path / "subject-0-job.yaml",
+        output_root=tmp_path / "output",
+        reference_images=(),
+    )
+
+
+def test_refinement_preflight_refuses_a_save_cadence_out_of_step_with_sampling(tmp_path):
+    """The pre-flight is the only place this costs nothing to catch.
+
+    The archive gate reaches the same verdict, but only after the whole paid
+    run is over. A refinement that samples every 100 steps and saves every 200
+    has to be refused before the first GPU hour.
+    """
+    with pytest.raises(QueueConfigurationError, match="must be the same cadence"):
+        TrainingQueue._assert_phase_evidence_reachable(
+            refinement_job(tmp_path),
+            refinement_process(sample_every=100, save_every=200),
+            {"base_training_steps": 600},
+        )
+
+
+def test_refinement_preflight_refuses_an_unsupported_cadence(tmp_path):
+    """A self-consistent pair is still refused when the cadence is not declared."""
+    with pytest.raises(QueueConfigurationError, match="must be the same cadence"):
+        TrainingQueue._assert_phase_evidence_reachable(
+            refinement_job(tmp_path),
+            refinement_process(sample_every=150, save_every=150),
+            {"base_training_steps": 600},
+        )
+
+
+def test_refinement_preflight_accepts_the_shipped_cadence(tmp_path):
+    """The control above must fail for the cadence, not for the fixture."""
+    TrainingQueue._assert_phase_evidence_reachable(
+        refinement_job(tmp_path),
+        refinement_process(sample_every=100, save_every=100),
+        {"base_training_steps": 600},
+    )
