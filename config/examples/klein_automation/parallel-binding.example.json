@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "run_id": "replace-with-run-id",
+  "shard_id": "a",
+  "instance_id": 12345,
+  "instance_hash_id": "exact-hashId-from-GET-instance",
+  "instance_notes": "training-run:replace-with-run-id;shard:a"
+}

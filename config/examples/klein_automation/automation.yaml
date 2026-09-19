@@ -1,0 +1,47 @@
+schema_version: 1
+trainer_yaml: trainer-klein-9b.yaml
+repo_root: /app/ai-toolkit
+generated_dir: /storage/config/generated
+state_path: /storage/automation/queue-state.json
+continue_on_error: false
+
+checkpoint_backup:
+  enabled: true
+  repo_id_env: HF_REPO_ID
+  repo_type: dataset
+  token_env: HF_TOKEN
+  remote_prefix: training-backups
+  max_attempts: 4
+  backoff_seconds: 2
+  catalog:
+    destination_kind: loras
+
+evaluation:
+  enabled: true
+  # Optional, CPU-only, user-supplied weights. Omit both keys for explicit
+  # unavailable identity metrics.
+  # face_backend: training_automation.backends:InsightFaceCPUBackend
+  # face_backend_options:
+  #   model_dir: /storage/models/insightface/models/your-model
+  # Optional real landmark backend:
+  # landmark_backend: training_automation.backends:MediaPipePoseCPUBackend
+  # landmark_backend_options:
+  #   model_path: /storage/models/mediapipe/pose_landmarker.task
+  #   min_visibility: 0.5
+
+datasets:
+  - name: character-name
+    # Increment when dataset content changes without changing folder path.
+    dataset_revision: images-and-captions-v1
+    catalog_name: character-name
+    folder: /storage/datasets/character-name
+    trigger_word: CHARACTER_TOKEN
+    destination_kind: loras
+    reference_images:
+      - /storage/references/character-name/front.jpg
+    trainer_dataset:
+      caption_ext: txt
+      caption_dropout_rate: 0.05
+      cache_latents_to_disk: true
+      resolution: [512, 768, 1024]
+      num_repeats: 16

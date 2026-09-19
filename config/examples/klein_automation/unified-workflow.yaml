@@ -1,0 +1,97 @@
+schema_version: 1
+
+# These point at the storage folders used by the GUI. HF remains authoritative;
+# correctness does not require a provider network volume.
+# DATASETS_FOLDER, COMFYUI_ROOT, and LORAS_ROOT environment values are also
+# accepted. If two configured values differ, automation holds before training.
+dataset_root: /storage/datasets
+comfyui_root: /storage/ComfyUI
+storage_root: /storage
+work_root: /storage/automation/unified
+# Explicit first-boot opt-in. Only these configured paths beneath storage_root
+# are created; existing files, settings, and symlinks are never replaced.
+initialize_storage_directories: true
+# The opt-in controller initializes this GUI setting only when it is absent and
+# the native /app/ai-toolkit/datasets folder contains no unseen files.
+gui_database: /app/ai-toolkit/aitk_db.db
+initialize_gui_dataset_root: true
+
+hub:
+  repo_id_env: HF_REPO_ID
+  repo_type: dataset
+  token_env: HF_TOKEN
+
+dataset_storage:
+  enabled: true
+  remote_prefix: datasets
+  catalog_path: training-automation/dataset-catalog.json
+  # Canonical immutable model identity recorded in both catalogs. This remains
+  # the Hub model name even when the trainer reads weights from a local path.
+  base_arch: flux2_klein_9b
+  base_model: black-forest-labs/FLUX.2-klein-base-9B
+  # Leave at least 1 GiB free after staging the immutable dataset snapshot.
+  minimum_free_bytes: 1073741824
+
+worker:
+  # TRAINING_WORKER_ID/COUNT take priority. Two instances of the same template
+  # use ids 0 and 1 with count 2; one instance uses the defaults below.
+  id: 0
+  count: 1
+
+sync:
+  catalog_prefix: training-backups
+  results_prefix: training-results
+  # Install every available automatic shortlist rank into the canonical
+  # numeric-name model folder. Missing/conflicting rank evidence holds safely.
+  ranks: [1, 2, 3]
+  # Historical runs have no trustworthy chronology. Seed them explicitly once:
+  # legacy_runs:
+  #   - run_id: e372619d-f4dc-4f4b-a2ba-b0df127e24fc
+  #     revision: REPLACE_WITH_IMMUTABLE_40_HEX_REVISION
+  #     model_ids: [1, 2, 3, 4, 5, 6]
+
+discovery:
+  quiet_seconds: 60
+  # Seven complete 16+4+1 loader epochs expose every original photo 147 times,
+  # the nearest complete-epoch schedule to the requested target of 150.
+  target_exposures: 147
+  ledger_path: training-automation/workflow-ledger.json
+  retry_incomplete: false
+  order: []
+  # Root may publish prior immutable identities so existing datasets never replay.
+  # legacy_completed_index:
+  #   path: training-automation/legacy-completed-datasets.json
+  #   revision: REPLACE_WITH_IMMUTABLE_40_HEX_REVISION
+
+queue:
+  trainer_yaml: /app/ai-toolkit/config/examples/klein_automation/trainer-subject-likeness-masked-klein-9b-v2.yaml
+  repo_root: /app/ai-toolkit
+  output_root: /storage/output
+  trigger_word: Owhx
+
+checkpoint_policy:
+  save_every: 200
+  max_local_step_saves: 5
+
+evaluation:
+  enabled: true
+  require_identity_available: true
+  reference_provenance: training-set
+  face_backend: training_automation.backends:InsightFaceCPUBackend
+  face_backend_options:
+    model_dir: /opt/training-automation-models/insightface/models/buffalo_l
+  reference_identity_filter:
+    single_face_only: true
+    minimum_valid_count: 3
+    minimum_valid_fraction: 0.5
+  landmark_backend: training_automation.backends:UltralyticsPoseCPUBackend
+  landmark_backend_options:
+    model_path: /opt/training-automation-models/ultralytics/yolo11n-pose.pt
+    expected_sha256: 869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0
+    min_detection_confidence: 0.25
+    min_keypoint_confidence: 0.5
+    iou_threshold: 0.7
+    image_size: 640
+
+archive:
+  remote_prefix: training-archives

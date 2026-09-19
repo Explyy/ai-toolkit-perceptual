@@ -1,0 +1,349 @@
+import json
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from training_automation.backup import (
+    BackupConfigurationError,
+    BackupError,
+    CheckpointBackup,
+    HuggingFaceBackupClient,
+    LocalArtifact,
+    verify_remote_artifacts,
+)
+from training_automation.catalog import CatalogStore, restore_generation, restore_training
+FAKE_SPEC = importlib.util.spec_from_file_location("training_automation_test_fakes", Path(__file__).with_name("fakes.py"))
+FAKE_MODULE = importlib.util.module_from_spec(FAKE_SPEC)
+assert FAKE_SPEC.loader is not None
+FAKE_SPEC.loader.exec_module(FAKE_MODULE)
+FakeHubClient = FAKE_MODULE.FakeHubClient
+
+
+class PathsInfoApi:
+    def __init__(self, *, fail_call: int | None = None, omit: str | None = None):
+        self.calls = []
+        self.fail_call = fail_call
+        self.omit = omit
+
+    def get_paths_info(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == self.fail_call:
+            raise RuntimeError("Hub metadata request failed")
+        return [
+            SimpleNamespace(
+                path=path,
+                size=len(path.encode()),
+                lfs={"sha256": f"sha-{path}"},
+            )
+            for path in kwargs["paths"]
+            if path != self.omit
+        ]
+
+
+def metadata_client(api: PathsInfoApi) -> HuggingFaceBackupClient:
+    client = HuggingFaceBackupClient.__new__(HuggingFaceBackupClient)
+    client._api = api
+    return client
+
+
+def test_hugging_face_metadata_batches_large_requests_at_one_revision():
+    api = PathsInfoApi()
+    client = metadata_client(api)
+    unique_paths = [f"archive/evidence/sample-{index:03}.png" for index in range(205)]
+    requested = unique_paths + [unique_paths[0]]
+
+    metadata = client.path_metadata(
+        "owner/private", "dataset", requested, "immutable-revision"
+    )
+
+    assert [len(call["paths"]) for call in api.calls] == [100, 100, 6]
+    assert all(
+        (call["repo_id"], call["repo_type"], call["revision"])
+        == ("owner/private", "dataset", "immutable-revision")
+        for call in api.calls
+    )
+    assert set(metadata) == set(unique_paths)
+    assert metadata[unique_paths[-1]] == {
+        "size": len(unique_paths[-1].encode()),
+        "sha256": f"sha-{unique_paths[-1]}",
+    }
+
+
+def test_hugging_face_metadata_empty_request_avoids_api_call():
+    api = PathsInfoApi()
+    assert metadata_client(api).path_metadata(
+        "owner/private", "dataset", [], "immutable-revision"
+    ) == {}
+    assert api.calls == []
+
+
+def test_hugging_face_metadata_later_batch_error_propagates():
+    api = PathsInfoApi(fail_call=2)
+    paths = [f"archive/evidence/{index:03}.png" for index in range(101)]
+    with pytest.raises(RuntimeError, match="Hub metadata request failed"):
+        metadata_client(api).path_metadata(
+            "owner/private", "dataset", paths, "immutable-revision"
+        )
+    assert [len(call["paths"]) for call in api.calls] == [100, 1]
+
+
+def test_batched_metadata_missing_entry_fails_remote_verification(tmp_path):
+    paths = [f"archive/evidence/{index:03}.png" for index in range(101)]
+    missing_path = paths[-1]
+    api = PathsInfoApi(omit=missing_path)
+    artifacts = [
+        LocalArtifact(
+            local_path=str(tmp_path / f"unused-{index}"),
+            remote_path=path,
+            size=len(path.encode()),
+            sha256=f"sha-{path}",
+        )
+        for index, path in enumerate(paths)
+    ]
+
+    with pytest.raises(BackupError, match=f"size verification failed for {missing_path}"):
+        verify_remote_artifacts(
+            metadata_client(api),
+            repo_id="owner/private",
+            repo_type="dataset",
+            artifacts=artifacts,
+            revision="immutable-revision",
+            context="archive",
+        )
+    assert [len(call["paths"]) for call in api.calls] == [100, 1]
+
+
+def make_backup(tmp_path: Path, client: FakeHubClient, **kwargs) -> CheckpointBackup:
+    return CheckpointBackup(
+        repo_id=kwargs.pop("repo_id", "owner/private"),
+        repo_type=kwargs.pop("repo_type", "dataset"),
+        state_path=tmp_path / "backup.json",
+        client=client,
+        sleep=kwargs.pop("sleep", lambda _: None),
+        catalog_metadata={
+            "name": "character",
+            "base_arch": "flux2_klein_9b",
+            "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+            "trigger_word": "TOK",
+            "destination_kind": "loras",
+        },
+        **kwargs,
+    )
+
+
+def test_retries_interrupted_upload_then_verifies_and_catalogs(tmp_path):
+    client = FakeHubClient()
+    client.fail_backup_commits = 1
+    checkpoint = tmp_path / "character_000000100.safetensors"
+    optimizer = tmp_path / "optimizer.pt"
+    checkpoint.write_bytes(b"weights")
+    optimizer.write_bytes(b"optimizer")
+    backup = make_backup(tmp_path, client, max_attempts=2)
+
+    commit = backup.protect(
+        job_id="job", checkpoint_id="step-000000100", step=100,
+        paths=[checkpoint, optimizer], final=False,
+    )
+
+    state = json.loads((tmp_path / "backup.json").read_text())
+    entry = next(iter(state["checkpoints"].values()))
+    assert commit.startswith("r")
+    assert entry["status"] == "backed_up"
+    assert entry["verified"] is True and entry["cataloged"] is True
+    assert entry["attempts"] == 2
+    assert backup.can_delete(checkpoint)
+    catalog = json.loads(client.remote["training-backups/catalog.json"])
+    assert catalog["models"][0]["id"] == 1
+    assert catalog["models"][0]["folder"] == "0001-character"
+    assert catalog["models"][0]["checkpoints"][0]["revision"] == commit
+
+
+def test_pending_upload_resumes_after_restart(tmp_path):
+    client = FakeHubClient()
+    client.fail_backup_commits = 1
+    checkpoint = tmp_path / "job_000000001.safetensors"
+    checkpoint.write_bytes(b"checkpoint")
+    backup = make_backup(tmp_path, client, max_attempts=1)
+    with pytest.raises(BackupError):
+        backup.protect(
+            job_id="job", checkpoint_id="step-000000001", step=1,
+            paths=[checkpoint], final=False,
+        )
+    assert next(iter(json.loads((tmp_path / "backup.json").read_text())["checkpoints"].values()))["status"] == "pending"
+
+    restarted = make_backup(tmp_path, client, max_attempts=2)
+    commits = restarted.resume_pending()
+    assert len(commits) == 1
+    assert next(iter(json.loads((tmp_path / "backup.json").read_text())["checkpoints"].values()))["status"] == "backed_up"
+
+
+def test_failed_verification_never_marks_backed_up(tmp_path):
+    client = FakeHubClient()
+    client.corrupt_metadata = True
+    checkpoint = tmp_path / "job_000000001.safetensors"
+    checkpoint.write_bytes(b"checkpoint")
+    backup = make_backup(tmp_path, client, max_attempts=1)
+    with pytest.raises(BackupError):
+        backup.protect(
+            job_id="job", checkpoint_id="step-000000001", step=1,
+            paths=[checkpoint], final=False,
+        )
+    entry = next(iter(json.loads((tmp_path / "backup.json").read_text())["checkpoints"].values()))
+    assert entry["status"] == "pending"
+    assert not backup.can_delete(checkpoint)
+
+
+def test_missing_remote_sha_downloads_and_rejects_same_size_content_mismatch(tmp_path):
+    class MissingHashClient(FakeHubClient):
+        def path_metadata(self, repo_id, repo_type, paths, revision):
+            return {
+                path: {"size": len(self.snapshots[revision][path]), "sha256": None}
+                for path in paths
+            }
+
+        def download_file(self, repo_id, repo_type, path, revision, destination):
+            payload = self.snapshots[revision][path]
+            destination.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+
+    checkpoint = tmp_path / "job_000000001.safetensors"
+    checkpoint.write_bytes(b"checkpoint")
+    backup = make_backup(tmp_path, MissingHashClient(), max_attempts=1)
+    with pytest.raises(BackupError, match="checkpoint backup failed") as caught:
+        backup.protect(
+            job_id="job", checkpoint_id="step-000000001", step=1,
+            paths=[checkpoint], final=False,
+        )
+    assert "downloaded-byte hash verification" in str(caught.value.__cause__)
+    entry = next(iter(json.loads((tmp_path / "backup.json").read_text())["checkpoints"].values()))
+    assert entry["status"] == "pending"
+    assert not entry.get("verified", False)
+
+
+def test_public_destination_fails_closed(tmp_path):
+    backup = make_backup(tmp_path, FakeHubClient(private=False))
+    with pytest.raises(BackupConfigurationError, match="non-private"):
+        backup.validate_destination()
+
+
+def test_repo_type_is_limited(tmp_path):
+    with pytest.raises(BackupConfigurationError):
+        make_backup(tmp_path, FakeHubClient(), repo_type="space")
+
+
+def test_state_is_bound_to_destination_and_legacy_receipts_fail_closed(tmp_path):
+    client = FakeHubClient()
+    backup = make_backup(tmp_path, client)
+    backup._save(backup._state())
+    with pytest.raises(BackupConfigurationError, match="different repo_id"):
+        make_backup(tmp_path, client, repo_id="owner/other")._state()
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"schema_version": 1, "checkpoints": {"old": {"status": "backed_up"}}}))
+    with pytest.raises(BackupConfigurationError, match="legacy backup state"):
+        CheckpointBackup(
+            repo_id="owner/private", repo_type="dataset", state_path=legacy,
+            client=client,
+        )._state()
+
+
+def test_same_step_new_bytes_create_new_immutable_checkpoint(tmp_path):
+    client = FakeHubClient()
+    checkpoint = tmp_path / "job_000000001.safetensors"
+    checkpoint.write_bytes(b"first")
+    backup = make_backup(tmp_path, client)
+    first = backup.protect(
+        job_id="job", checkpoint_id="step-000000001", step=1,
+        paths=[checkpoint], final=False,
+    )
+    checkpoint.write_bytes(b"second")
+    second = backup.protect(
+        job_id="job", checkpoint_id="step-000000001", step=1,
+        paths=[checkpoint], final=False,
+    )
+    assert first != second
+    catalog = json.loads(client.remote["training-backups/catalog.json"])
+    checkpoints = catalog["models"][0]["checkpoints"]
+    assert len(checkpoints) == 2
+    assert checkpoints[0]["checkpoint_id"] != checkpoints[1]["checkpoint_id"]
+
+
+def test_backup_catalog_roundtrip_separates_generation_and_training_layout(tmp_path):
+    client = FakeHubClient()
+    checkpoint = tmp_path / "job_000000010.safetensors"
+    optimizer = tmp_path / "optimizer.pt"
+    config = tmp_path / "config.yaml"
+    checkpoint.write_bytes(b"weights")
+    optimizer.write_bytes(b"optimizer")
+    config.write_bytes(b"config")
+    backup = make_backup(tmp_path, client)
+    backup.protect(
+        job_id="job", checkpoint_id="step-000000010", step=10,
+        paths=[checkpoint, optimizer, config], final=False,
+    )
+    store = CatalogStore(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        catalog_path="training-backups/catalog.json", work_dir=tmp_path / "catalog-work",
+    )
+    catalog, _ = store.read()
+    generation_root = tmp_path / "comfy-loras"
+    generated = restore_generation(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        catalog=catalog, identifier="0001", roots={"loras": generation_root},
+        checkpoint_id=catalog["models"][0]["checkpoints"][0]["checkpoint_id"],
+    )
+    assert Path(generated[0]["path"]).parent == generation_root / "0001-character"
+    resume_root = tmp_path / "resume-job-root"
+    restored = restore_training(
+        client=client, repo_id="owner/private", repo_type="dataset",
+        catalog=catalog, identifier=1, target_root=resume_root,
+        checkpoint_id=catalog["models"][0]["checkpoints"][0]["checkpoint_id"],
+    )
+    assert {Path(item["path"]).relative_to(resume_root).as_posix() for item in restored} == {
+        "job_000000010.safetensors", "optimizer.pt", "config.yaml"
+    }
+
+
+def test_different_jobs_at_same_step_keep_distinct_catalog_checkpoints(tmp_path):
+    client = FakeHubClient()
+    first = tmp_path / "first_000000010.safetensors"
+    second = tmp_path / "second_000000010.safetensors"
+    first.write_bytes(b"same weights")
+    second.write_bytes(b"same weights")
+    backup = make_backup(tmp_path, client)
+    backup.protect(
+        job_id="first-job", checkpoint_id="step-000000010", step=10,
+        paths=[first], final=False,
+    )
+    backup.protect(
+        job_id="second-job", checkpoint_id="step-000000010", step=10,
+        paths=[second], final=False,
+    )
+    catalog = json.loads(client.remote["training-backups/catalog.json"])
+    checkpoint_ids = [item["checkpoint_id"] for item in catalog["models"][0]["checkpoints"]]
+    assert len(checkpoint_ids) == 2
+    assert checkpoint_ids[0].startswith("first-job--")
+    assert checkpoint_ids[1].startswith("second-job--")
+
+
+def test_pre_reserved_catalog_id_mismatch_fails_before_checkpoint_upload(tmp_path):
+    client = FakeHubClient()
+    checkpoint = tmp_path / "job_000000010.safetensors"
+    checkpoint.write_bytes(b"weights")
+    backup = CheckpointBackup(
+        repo_id="owner/private", repo_type="dataset",
+        state_path=tmp_path / "backup.json", client=client,
+        catalog_metadata={
+            "name": "character", "base_arch": "flux2_klein_9b",
+            "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
+            "trigger_word": "TOK", "destination_kind": "loras",
+            "expected_id": 2,
+        },
+    )
+    with pytest.raises(BackupConfigurationError, match="expected pre-reserved id 2"):
+        backup.protect(
+            job_id="job", checkpoint_id="step-000000010", step=10,
+            paths=[checkpoint], final=False,
+        )
+    assert not any(message.startswith("Backup") for message in client.messages)
