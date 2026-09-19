@@ -275,7 +275,6 @@ def validate_manifest(
         for reference in references:
             if safe_relative_path(str(reference)).as_posix() not in file_paths:
                 raise BackupError("every reference_path must name a staged dataset file")
-    selected = [item for item in normalized if str(item["shard_id"]) == shard_id]
     sources = manifest.get("model_sources")
     if not isinstance(sources, list) or any(not isinstance(item, Mapping) for item in sources):
         raise BackupError("model_sources must be a list of mappings")
@@ -335,7 +334,29 @@ def validate_manifest(
         if not options.get("model_path") or not re.fullmatch(r"[0-9a-f]{64}", str(options.get("expected_sha256", ""))):
             raise BackupError("Ultralytics pose backend requires model_path and expected_sha256")
     _validate_checkpoint_policy(manifest)
-    return selected
+    shard_datasets = [item for item in normalized if str(item["shard_id"]) == shard_id]
+    if "selected_dataset_ids" not in manifest:
+        return shard_datasets
+    selected_ids = manifest["selected_dataset_ids"]
+    if not isinstance(selected_ids, list) or not selected_ids:
+        raise BackupError("selected_dataset_ids must be a nonempty list of dataset id strings")
+    if any(not isinstance(dataset_id, str) for dataset_id in selected_ids):
+        raise BackupError("selected_dataset_ids must contain only dataset id strings")
+    if len(selected_ids) != len(set(selected_ids)):
+        raise BackupError("selected_dataset_ids must contain unique dataset ids")
+    known_ids = set(ids)
+    unknown_ids = sorted(set(selected_ids) - known_ids)
+    if unknown_ids:
+        raise BackupError(f"selected_dataset_ids contains unknown dataset ids: {unknown_ids}")
+    shard_dataset_ids = {str(item["id"]) for item in shard_datasets}
+    cross_shard_ids = sorted(set(selected_ids) - shard_dataset_ids)
+    if cross_shard_ids:
+        raise BackupError(
+            f"selected_dataset_ids contains dataset ids outside shard {shard_id!r}: "
+            f"{cross_shard_ids}"
+        )
+    selected_id_set = set(selected_ids)
+    return [item for item in shard_datasets if str(item["id"]) in selected_id_set]
 
 
 def _validate_catalog_reservations(
