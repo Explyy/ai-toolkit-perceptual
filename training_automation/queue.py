@@ -37,6 +37,9 @@ EXTENSION_PHASE_FIELDS = (
     "train.batch_size",
     "datasets.*.num_repeats",
     "datasets.*.resolution",
+    "face_id.enabled",
+    "face_id.identity_loss_weight",
+    "face_id.identity_metrics",
 )
 EXTENSION_PHASE_FIELD_KEYS = {"name", "changes"}
 # Fields that may legitimately differ between the base run and its extension:
