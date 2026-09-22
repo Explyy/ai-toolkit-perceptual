@@ -1,0 +1,104 @@
+name: Training automation
+
+on:
+  push:
+    branches:
+      - codex/klein-training-backup-evaluation
+      - codex/parallel-klein-training
+    paths:
+      - "training_automation/**"
+      - "tests/training_automation/**"
+      - "docker/automation/**"
+      - "config/examples/klein_automation/**"
+      - "docs/training-automation.md"
+      - "notebooks/**"
+      - "scripts/**"
+      - "jobs/process/BaseSDTrainProcess.py"
+      - ".github/workflows/training-automation.yml"
+  pull_request:
+    paths:
+      - "training_automation/**"
+      - "tests/training_automation/**"
+      - "docker/automation/**"
+      - "config/examples/klein_automation/**"
+      - "docs/training-automation.md"
+      - "notebooks/**"
+      - "scripts/**"
+      - "jobs/process/BaseSDTrainProcess.py"
+      - ".github/workflows/training-automation.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a unique GHCR image tag after tests"
+        required: false
+        type: boolean
+        default: false
+      skip_automated_tests:
+        description: "Skip automated suites for an explicitly reviewed source build"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cpu-tests:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_automated_tests) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pyyaml pillow numpy
+      - name: Run deterministic CPU suite and dataset-storage smoke
+        env:
+          TRAINING_DATASET_SMOKE_ARTIFACT: ${{ runner.temp }}/synthetic-training-report/dataset-storage-smoke.json
+        run: python -m pytest -q tests/training_automation
+      - name: Render synthetic report review artifact
+        env:
+          TRAINING_REPORT_ARTIFACT_DIR: ${{ runner.temp }}/synthetic-training-report
+        run: python tests/training_automation/render_synthetic_reports.py
+      - name: Upload synthetic report review artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-training-report-${{ github.sha }}
+          path: ${{ runner.temp }}/synthetic-training-report
+
+  docker:
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'workflow_dispatch' &&
+        (needs.cpu-tests.result == 'success' ||
+          (inputs.skip_automated_tests && needs.cpu-tests.result == 'skipped'))
+      }}
+    needs: cpu-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free hosted-runner space for the pinned base image
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet
+          docker system prune --all --force
+      - id: image
+        name: Compute lowercase image tag
+        env:
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+        run: echo "tag=ghcr.io/${OWNER,,}/ai-toolkit-perceptual:training-automation-${SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - if: github.event_name == 'workflow_dispatch' && inputs.publish
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/automation/Dockerfile
+          push: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+          tags: ${{ steps.image.outputs.tag }}

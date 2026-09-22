@@ -1,0 +1,207 @@
+---
+# Provenance: the sigmoid refinement recipe
+# (trainer-subject-likeness-masked-klein-9b-refinement-sigmoid.yaml) with exactly
+# two training fields changed: batch_size 4 -> 1 and lr 0.00002 -> 0.0001.
+#
+# This is a convergence pass, not a refinement, and the distinction is the whole
+# reason for the file. A refinement adjusts an already trained model with a step
+# smaller than the base run; `_validate_refinement_phase` pins 0 < lr < 0.00005
+# for that reason and still does. This recipe deliberately goes the other way,
+# so it is validated by `_validate_convergence_phase` and selected with
+# `python -m training_automation.recipe --convergence`.
+#
+# Why these two deviations:
+#   batch_size: 1  the sigmoid face pass applied only 216 updates, each averaging
+#                  four images into one gradient step. Averaging a full-figure
+#                  crop with a close-up portrait blurs exactly the facial
+#                  geometry the pass exists to move. At batch 1 every image
+#                  produces its own step, so the same exposure budget becomes
+#                  four times as many updates.
+#   lr: 0.0001     measured evidence says duration, not noise band, moved the
+#                  identity score (+0.139 Elisa, +0.085 Mady from duration;
+#                  -0.016 / -0.010 from the sigmoid face pass at lr 0.00002).
+#                  Too little movement to restructure a face. A step above the
+#                  base rate is the probe for that, and is the deviation a
+#                  refinement may not carry.
+#
+# Everything else is byte-identical to the sigmoid refinement: same evaluation
+# cohort and seeds, same prompts, weight_noise with bound_norm: true,
+# cache_text_embeddings: false, flowmatch scheduler, bf16 dtype, and the same
+# reversed [1, 4, 16] exposure budget over ascending resolutions. The exposure
+# budget does not change: batch size only decides how many gradient steps that
+# budget is cut into.
+#
+# steps: 1500 continues a 1200-step base for 300 steps and stays on the 100-step
+# sampling cadence, so the final checkpoint has its scheduled evaluation and the
+# archive gate can pass. A different base step needs the queue entry's own
+# training_steps, kept on the same cadence.
+job: extension
+config:
+  name: generated-by-parallel-queue
+  process:
+    - type: diffusion_trainer
+      training_folder: /storage/output
+      sqlite_db_path: ./aitk_db.db
+      device: cuda
+      trigger_word: null
+      performance_log_every: 10
+      network:
+        type: lokr
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+        network_kwargs:
+          ignore_if_contains: []
+      save:
+        dtype: bf16
+        save_every: 100
+        max_step_saves_to_keep: 120
+        save_format: diffusers
+        push_to_hub: false
+      datasets:
+        - folder_path: replaced-by-bootstrap
+          mask_path: null
+          mask_min_value: 0.1
+          default_caption: ''
+          caption_ext: txt
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          network_weight: 1
+          resolution: [512, 768, 1024]
+          controls: []
+          shrink_video_to_frames: true
+          num_frames: 1
+          flip_x: false
+          flip_y: false
+          num_repeats: [1, 4, 16]
+          loss_split: sum
+      train:
+        weight_noise:
+          enabled: true
+          mode: relative
+          sigma: 0.0125
+          bound_norm: true
+          log_every: 1
+        max_grad_norm: 1
+        batch_size: 1
+        bypass_guidance_embedding: false
+        steps: 1500
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        timestep_type: sigmoid
+        content_or_style: balanced
+        optimizer_params:
+          weight_decay: 0.0001
+        unload_text_encoder: false
+        cache_text_embeddings: false
+        lr: 0.0001
+        ema_config:
+          use_ema: false
+          ema_decay: 0.99
+        skip_first_sample: false
+        force_first_sample: true
+        disable_sampling: false
+        dtype: bf16
+        diff_output_preservation: true
+        diff_output_preservation_multiplier: 1
+        diff_output_preservation_class: woman
+        switch_boundary_every: 1
+        loss_type: mse
+        diffusion_loss_weight: 1
+        diffusion_loss_max_t: 1
+        diffusion_loss_min_t: 0
+        custom_timestep_distribution: null
+        custom_timestep_curve: null
+        max_denoising_steps: 999
+        min_denoising_steps: 0
+        loss_split: null
+      logging:
+        log_every: 1
+        use_ui_logger: true
+      model:
+        name_or_path: black-forest-labs/FLUX.2-klein-base-9B
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        arch: flux2_klein_9b
+        low_vram: false
+        model_kwargs:
+          match_target_res: false
+        layer_offloading: false
+        layer_offloading_text_encoder_percent: 1
+        layer_offloading_transformer_percent: 1
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 640
+        height: 960
+        samples:
+          - {seed: 4301, prompt: "single adult subject [trigger], full body contrapposto standing pose, weight on the right leg with the left knee relaxed, both arms and hands visible, feet fully in frame, tailored neutral outfit, sunlit courtyard with stone paving and planters, clear daylight"}
+          - {seed: 4302, prompt: "single adult subject [trigger], full body walking mid-stride toward camera-left, right leg forward with the opposite left arm swinging forward, both hands and feet visible, casual travel outfit, station concourse with columns and a departure board, cool daylight"}
+          - {seed: 4303, prompt: "single adult subject [trigger], medium shot from the waist up, torso turned three-quarters with the head toward camera, both forearms visible, knit pullover, beside a tall window in a quiet room, soft lateral light"}
+          - {seed: 4304, prompt: "single adult subject [trigger], medium shot standing at a workshop bench, one hand resting on the bench and the other relaxed at the side, shoulders level, rolled-sleeve shirt, directional task light"}
+          - {seed: 4305, prompt: "single adult subject [trigger], close-up frontal portrait of the face, shoulders level, both eyes visible, neutral expression, plain background, soft even daylight"}
+          - {seed: 4306, prompt: "single adult subject [trigger], close-up three-quarter portrait of the face turned slightly to the left with the gaze toward camera, neutral expression, plain background, soft window light"}
+        neg: ''
+        seed: 42
+        walk_seed: false
+        guidance_scale: 4
+        sample_steps: 25
+        num_frames: 1
+        fps: 1
+      face_id:
+        enabled: false
+        init_scale: 0.3
+        identity_loss_weight: 0
+        landmark_loss_weight: 0
+        body_proportion_loss_weight: 0
+        body_proportion_loss_min_t: 0.8
+        body_proportion_loss_max_t: 1
+        body_shape_loss_weight: 0
+        body_shape_loss_max_t: 1
+        body_shape_loss_min_t: 0.8
+        identity_loss_min_t: 0
+        identity_loss_max_t: 0.9
+        identity_metrics: false
+        identity_loss_use_average: true
+        identity_loss_min_cos: 0.4
+      depth_consistency:
+        loss_weight: 0.005
+        input_size: 518
+        preview_every: 1
+        mask_source: subject
+        loss_max_t: 1
+        model_id: depth-anything/Depth-Anything-V2-Large-hf
+        loss_min_t: 0
+        grad_checkpoint: true
+        ssi_weight: 0
+        grad_weight: 1
+        grad_scales: 6
+      subject_mask:
+        enabled: true
+        background_loss_weight: 0
+        clothing_loss_weight: 1
+        body_loss_weight: 1
+        save_debug_previews: true
+        cache_resolution: 768
+        segformer_res: 768
+meta:
+  name: "[name]"
+  version: "3.0"
+  evaluation_cohort: "subject-likeness-core-v3"
+  evaluation_cases:
+    - {case_id: full-contrapposto, category: full-figure, seed: 4301}
+    - {case_id: full-walking-stride, category: full-figure, seed: 4302}
+    - {case_id: medium-window-turn, category: medium, seed: 4303}
+    - {case_id: medium-bench-lean, category: medium, seed: 4304}
+    - {case_id: face-frontal-closeup, category: face, seed: 4305}
+    - {case_id: face-three-quarter-closeup, category: face, seed: 4306}
