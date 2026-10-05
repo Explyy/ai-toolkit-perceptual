@@ -41,3 +41,13 @@ test('workflow login and image publication require the exact reviewed release re
     ]) assert.equal(allowed({ ref, event_name: event }, { publish }), expected, `${event} ${ref} publish=${publish}`);
   }
 });
+
+test('native SQLite addon actually opens, queries and closes using the running Node binary', () => {
+  const output = execFileSync(process.execPath, ['../docker/dataset-studio/check_sqlite.cjs', process.cwd()],
+    { cwd: process.cwd(), encoding: 'utf8' });
+  const receipt = JSON.parse(output);
+  assert.equal(receipt.node, process.versions.node);
+  assert.equal(receipt.platform, process.platform);
+  assert.equal(receipt.architecture, process.arch);
+  assert.equal(receipt.openQueryClose, 'passed');
+});
