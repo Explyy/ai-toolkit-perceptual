@@ -7,6 +7,7 @@ import AdvancedWorkspace from './AdvancedWorkspace';
 import { ActionLane } from './actionLane';
 import { captionModels, defaultCaptionModel, CaptionPreferences } from './captionModels';
 import type { Image, State, JobLink } from './store';
+import type { AnalysisProgress } from './analysisProgress';
 import { selectionRectangle, selectionHits, selectionCommit, SelectionGesture } from './selectionTools';
 import {
   previewCaptionText,
@@ -18,7 +19,10 @@ import {
 } from './captionTextTools';
 const button = 'rounded-lg border border-gray-600 bg-gray-800 px-4 py-2.5 disabled:opacity-40 hover:bg-gray-700';
 const field = 'w-full min-w-0 rounded-lg border border-gray-600 bg-gray-950 p-3';
-type View = State & { jobsLive: any[]; preview: boolean; captionHostSupported: boolean; analysisEnabled: boolean };
+type View = State & {
+  managedSync: {phase:string;pending:boolean;reason?:string;revision?:string};
+  space: {free:number;reserve:number;missingBytes:number;outputBytes:number};
+ analysisProgress: AnalysisProgress; jobsLive: any[]; preview: boolean; captionHostSupported: boolean; analysisEnabled: boolean };
 type Draft = { caption: string; revision: number; draftRevision: number; persisted?: string };
 const pollPhases = new Set(['prepared', 'enqueue-intent', 'active']);
 function initialPreferences(s: State): CaptionPreferences {
@@ -30,7 +34,7 @@ function initialPreferences(s: State): CaptionPreferences {
     instructions: old?.instructions ?? s.settings.instructions,
   };
 }
-function PreviewImage({ dataset, image }: { dataset: string; image: Image }) {
+function PreviewImage({ dataset, image, height }: { dataset: string; image: Image; height: number }) {
   const holder = useRef<HTMLDivElement>(null),
     [url, setUrl] = useState(''),
     [failed, setFailed] = useState(false),
@@ -65,7 +69,7 @@ function PreviewImage({ dataset, image }: { dataset: string; image: Image }) {
     };
   }, [dataset, image.id, attempt]);
   return (
-    <div ref={holder} style={{ height: 360 }} className="w-full flex items-center justify-center rounded bg-gray-950">
+    <div ref={holder} style={{ height }} className="w-full flex items-center justify-center rounded bg-gray-950">
       {url ? (
         <img
           src={url}
@@ -76,7 +80,7 @@ function PreviewImage({ dataset, image }: { dataset: string; image: Image }) {
             width: '100%',
             height: '100%',
             maxWidth: '100%',
-            maxHeight: 360,
+            maxHeight: height,
             minHeight: 0,
             objectFit: 'contain',
           }}
@@ -94,6 +98,12 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     [error, setError] = useState(''),
     [busy, setBusy] = useState(''),
     [search, setSearch] = useState(''),
+    [target, setTarget] = useState('3'),
+    [categoryFilter, setCategoryFilter] = useState('all'),
+    [membershipFilter, setMembershipFilter] = useState('all'),
+    [tagFilter, setTagFilter] = useState(''),
+    [minQuality, setMinQuality] = useState(0),
+    [tagDrafts, setTagDrafts] = useState<Record<string,string>>({}),
     [size, setSize] = useState(460),
     [advanced, setAdvanced] = useState(false),
     [advancedMounted, setAdvancedMounted] = useState(false),
@@ -123,7 +133,6 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     prefBase = useRef(0),
     prefError = useRef(false),
     generationId = useRef<string | null>(null),
-    analysisStamp = useRef(''),
     prefCurrent = useRef(pref),
     prefEpoch = useRef(0);
   prefCurrent.current = pref;
@@ -136,6 +145,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     setState(s);
     if (initialized.current !== dataset) {
       initialized.current = dataset;
+      setTarget(String(s.settings.count));
       setPref(initialPreferences(s));
       setDrafts(
         Object.fromEntries(
@@ -219,6 +229,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     initialized.current = '';
     setState(null);
     setDrafts({});
+    setTagDrafts({});
     cancelSelection();
     setTextPreview(null);
     setTextToolsOpen(false);
@@ -230,7 +241,6 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     prefDirty.current = false;
     prefError.current = false;
     generationId.current = null;
-    analysisStamp.current = '';
     draftFailure.current = false;
     void refresh();
   }, [dataset]);
@@ -260,38 +270,13 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
         if (!advanced && scope.current === owner) await refresh();
       } catch {
         if (scope.current === owner)
-          setError('Aggiornamento non confermato: nessun nuovo lavoro è stato creato. Riprova a leggere lo stato.');
+          setError('Connessione interrotta: mostriamo gli ultimi dati confermati. Il lavoro già avviato continua sul server; aggiorniamo appena torna la connessione.');
       } finally {
         release();
       }
     }, 4000);
     return () => clearInterval(timer);
   }, [dataset, advanced]);
-  useEffect(() => {
-    if (!state?.images.length || busy) return;
-    const stamp =
-      dataset +
-      ':' +
-      state.images
-        .map(x => x.id)
-        .sort()
-        .join(',') +
-      ':' +
-      state.settings.count;
-    if (analysisStamp.current === stamp) return;
-    const release = lane.current.tryBackground(),
-      owner = scope.current;
-    if (!release) return;
-    analysisStamp.current = stamp;
-    void request('automaticAnalysis')
-      .catch(() => {
-        if (scope.current === owner) {
-          analysisStamp.current = '';
-          setError('Analisi non confermata: riprova. Originali e revisione manuale conservati.');
-        }
-      })
-      .finally(release);
-  }, [state, dataset, busy]);
   useEffect(() => {
     const leave = (e: BeforeUnloadEvent) => {
       if (Object.keys(draftRef.current).length || prefDirty.current) {
@@ -474,7 +459,11 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
   }
   const images = (state?.images ?? []).filter(x => !x.discarded),
     visible = images.filter(x =>
-      (x.filename + ' ' + (drafts[x.id]?.caption ?? x.caption)).toLowerCase().includes(search.toLowerCase()),
+      (x.filename + ' ' + (drafts[x.id]?.caption ?? x.caption)).toLowerCase().includes(search.toLowerCase()) &&
+      (categoryFilter === 'all' || x.category === categoryFilter) &&
+      (membershipFilter === 'all' || (membershipFilter === 'included' ? !x.excluded : !!x.excluded)) &&
+      (!tagFilter || x.tags.some(t=>t.toLowerCase().includes(tagFilter.toLowerCase()))) &&
+      (!minQuality || (x.analysis && x.analysis.quality>=minQuality)),
     ),
     selected = images.filter(x => !x.excluded),
     automatic = state?.jobs.filter(x => x.kind === 'caption' && x.automatic) ?? [],
@@ -655,10 +644,10 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
         {items.map(image => (
           <article
             key={image.id}
-            style={{ minWidth: 0, border: hits.has(image.id) ? '2px solid #60a5fa' : '2px solid #374151' }}
-            className="min-w-0 rounded-xl border border-gray-700 bg-gray-900 p-4 space-y-3"
+            style={{ minWidth: 0, padding: 12, background: '#111827', border: hits.has(image.id) ? '2px solid #60a5fa' : '2px solid transparent' }}
+            className="min-w-0 rounded-xl space-y-3"
           >
-            <label className="flex gap-3 items-center break-all">
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, minWidth: 0 }}>
               <input
                 type="checkbox"
                 aria-label={'Seleziona ' + image.filename}
@@ -671,10 +660,9 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                   )
                 }
               />
-              <span>{image.filename}</span>
+              <span title={image.filename} style={{ flex: '1 1 120px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{image.filename}</span>
               {image.analysisStatus?.phase === 'complete' && (
-                <label className="flex items-center gap-2 text-sm">
-                  Categoria
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap', flexShrink: 0 }} className="text-sm">
                   <select
                     aria-label={'Categoria ' + image.filename}
                     className="rounded border border-gray-600 bg-gray-950 p-1"
@@ -694,7 +682,14 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                   <span className="text-gray-400">{image.categorySource === 'manual' ? 'Rivista' : 'Automatica'}</span>
                 </label>
               )}
-            </label>
+            </div>
+            {['queued','running','waiting'].includes(state?.analysisProgress.phase ?? '') && (
+              <p className="text-xs text-amber-200" style={{ margin: '6px 0', minHeight: 16 }}>
+                {image.analysisStatus?.phase !== 'complete' ? 'Analisi in attesa' :
+                  state?.analysisProgress.tentative.includes(image.id) ? 'Proposta provvisoria: includi' : 'Proposta provvisoria: escludi'}
+                {(image.reviewRevision ?? 0) > 0 ? ' · revisione protetta' : ''}
+              </p>
+            )}
             <div
               data-selection-image={image.id}
               style={{ cursor: 'crosshair' }}
@@ -710,7 +705,11 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                   );
               }}
             >
-              <PreviewImage dataset={dataset} image={image} />
+              <PreviewImage dataset={dataset} image={image} height={Math.min(520, Math.max(220, size * .76))} />
+            </div>
+            <div className="my-2 flex flex-wrap items-center gap-2 text-xs" aria-label={'Qualità e tag '+image.filename}>
+              <span className="rounded bg-gray-800 px-2 py-1">{image.analysis && Number.isFinite(image.analysis.quality) ? `Qualità ${Math.round(image.analysis.quality)}/100` : 'Qualità in attesa'}</span>
+              {image.tags.map(tag=><span key={tag} className="rounded bg-gray-800 px-2 py-1">{tag}</span>)}
             </div>
             <label className="block text-sm">
               Caption
@@ -722,9 +721,16 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                 onChange={e => changeCaption(image, e.target.value)}
               />
             </label>
+            <label className="block text-xs mt-2">Tag
+              <input aria-label={'Tag '+image.filename} className={field+' mt-1'} value={tagDrafts[image.id] ?? image.tags.join(', ')}
+                onChange={e=>setTagDrafts(old=>({...old,[image.id]:e.target.value}))} placeholder="Tag separati da virgole" />
+            </label>
+            {tagDrafts[image.id] !== undefined && <button className="text-sm underline" disabled={!!busy}
+              onClick={()=>void run('Salvataggio tag',async()=>{const value=tagDrafts[image.id];await request('edit',{ids:[image.id],patch:{tags:value.split(',').map(x=>x.trim()).filter(Boolean)}});
+                setTagDrafts(old=>{if(old[image.id]!==value)return old;const copy={...old};delete copy[image.id];return copy;});})}>Salva tag</button>}
             {drafts[image.id] && (
               <div className="flex items-center gap-3 text-sm">
-                <span className="text-amber-200">Bozza non salvata</span>
+                <span className="text-amber-200">{drafts[image.id].persisted===drafts[image.id].caption?'Bozza salvata sul server · da applicare':'Bozza da salvare'}</span>
                 <button
                   className="underline"
                   onClick={() =>
@@ -765,9 +771,9 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
               <p className="text-gray-400 text-sm mt-1">Carica, seleziona e descrivi le tue immagini.</p>
             </div>
             <label className={button + ' cursor-pointer'}>
-              Carica più immagini
+              Carica immagini
               <input
-                aria-label="Carica più immagini"
+                aria-label="Carica immagini"
                 className="sr-only"
                 type="file"
                 multiple
@@ -781,64 +787,53 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
               />
             </label>
           </header>
+          <details
+            className="rounded-xl border border-gray-700 p-4"
+            open={advanced}
+            onToggle={e => {
+              (() => {
+                setAdvanced(e.currentTarget.open);
+                if (e.currentTarget.open) setAdvancedMounted(true);
+              })();
+              if (!e.currentTarget.open) void refresh();
+            }}
+          >
+            <summary className="cursor-pointer text-lg">Avanzate</summary>
+            {state && <p className="my-3 text-sm text-gray-400">Spazio: {(state.space.free/1e9).toFixed(2)} GB liberi · {(state.space.missingBytes/1e6).toFixed(1)} MB di copie mancanti · {(state.space.outputBytes/1e6).toFixed(1)} MB per risultati · riserva {(state.space.reserve/1e9).toFixed(0)} GB. Le copie derivate duplicate completate vengono consolidate quando necessario; gli originali restano separati.</p>}
+            {advancedMounted && <AdvancedWorkspace dataset={dataset} onNativeView={onNativeView} />}
+          </details>
           <section className="rounded-xl border border-gray-700 bg-gray-900 p-4 sm:p-5 space-y-4">
             {state && images.length > 0 && (
-              <section aria-label="Preselezione automatica" className="rounded-lg border border-gray-700 p-3 space-y-2">
-                <div className="flex flex-wrap items-center gap-3">
-                  <strong>Preselezione automatica</strong>
-                  <label className="flex items-center gap-2 text-sm">
-                    N immagini
-                    <input
-                      aria-label="Numero immagini proposte"
-                      type="number"
-                      min={1}
-                      max={1000}
-                      className="rounded border border-gray-600 bg-gray-950 p-2"
-                      style={{ width: 90 }}
-                      value={state.settings.count}
-                      disabled={!!busy}
-                      onChange={e => {
-                        const count = Number(e.target.value);
-                        if (Number.isInteger(count) && count >= 1 && count <= 1000)
-                          void run('Salvataggio N', () =>
-                            request('settings', { settings: { ...current.current!.settings, count } }),
-                          );
-                      }}
-                    />
+              <section aria-label="Analisi immagini" className="space-y-3">
+                <div style={{ display:'flex', flexWrap:'wrap', alignItems:'end', gap:12 }}>
+                  <label className="text-sm" style={{ whiteSpace:'nowrap' }}>Immagini per training
+                    <input aria-label="Immagini per training" type="number" min={1} max={1000}
+                      className="rounded bg-gray-950 p-2 ml-2" style={{ width:90 }} value={target} onChange={e=>setTarget(e.target.value)} />
                   </label>
-                </div>
-                <p aria-live="polite" className="text-sm text-gray-300">
-                  {state.analysisFlow?.phase === 'complete'
-                    ? `Proposta pronta · ${state.analysisFlow.count} immagini. Rivedi inclusioni e categorie; le tue modifiche restano salvate.`
-                    : state.analysisFlow?.phase === 'pending' || state.analysisFlow?.phase === 'active'
-                      ? 'Analisi di volti, profondità e pose in corso…'
-                      : (state.analysisFlow?.reason ?? 'Analisi automatica in preparazione…')}
-                </p>
-                {state.analysisFlow?.phase === 'complete' &&
-                  Object.entries(state.analysisFlow.deficits ?? {}).some(([, n]) => n > 0) && (
-                    <p className="text-sm text-amber-300">
-                      Quote incomplete ·{' '}
-                      {Object.entries(state.analysisFlow.deficits ?? {})
-                        .filter(([, n]) => n > 0)
-                        .map(([c, n]) => `${c}: mancano ${n}`)
-                        .join(' · ')}
-                      . Proposta migliore disponibile, senza inventare categorie.
-                    </p>
-                  )}
-                {!!state.analysisFlow?.conflicts?.length && (
-                  <p className="text-sm text-amber-300">
-                    Revisione necessaria · {state.analysisFlow.conflicts.join(' · ')}
-                  </p>
-                )}
-                {['failed', 'unavailable'].includes(state.analysisFlow?.phase ?? '') && (
-                  <button
-                    className={button}
-                    disabled={!!busy}
-                    onClick={() => void run('Ripresa analisi', () => request('automaticAnalysis', { retry: true }))}
-                  >
-                    Riprova analisi
+                  <button className={button+' bg-blue-700'}
+                    disabled={!!busy || ['queued','running','waiting'].includes(state.analysisProgress?.phase) || !Number.isInteger(Number(target)) || Number(target)<1 || Number(target)>1000}
+                    onClick={()=>void run('Analisi',()=>request('automaticAnalysis',{ count:Number(target), retry:state.analysisProgress?.phase==='blocked' }), 'explicit-analysis')}>
+                    {state.analysisProgress?.phase==='blocked' ? 'Riprova analisi' : 'Analisi'}
                   </button>
-                )}
+                  {Number(target)!==state.settings.count && <span className="text-sm text-gray-400">Obiettivo in bozza · applicato con Analisi</span>}
+                </div>
+                <div role="status" aria-live="polite" className="text-sm text-gray-300 space-y-1">
+                  <strong>{({ ready:'Pronto per analisi', queued:'Analisi in coda', running:'Analisi in corso', waiting:'Conferma dei risultati in corso', complete:'Proposta pronta', blocked:'Analisi sospesa', unavailable:'Analisi non disponibile' })[state.analysisProgress?.phase ?? 'ready']}</strong>
+                  <p>{state.analysisProgress?.done ?? 0}/{images.length} immagini analizzate · {selected.length} incluse · {images.length-selected.length} escluse</p>
+                  {['queued','running','waiting'].includes(state.analysisProgress?.phase) && <>
+                    <progress style={{ width:'100%' }} max={images.length || 1} value={state.analysisProgress.done} />
+                    <p>{state.analysisProgress.currentFile ?? (state.analysisProgress.phase==='queued' ? 'In attesa del turno sulla GPU' : 'Caricamento modelli o verifica dei risultati')}
+                    {state.analysisProgress.elapsedSeconds!==undefined && ` · trascorsi ${Math.floor(state.analysisProgress.elapsedSeconds/60)}m ${Math.floor(state.analysisProgress.elapsedSeconds%60)}s`}
+                    {state.analysisProgress.etaSeconds!==undefined ? ` · restano circa ${Math.ceil(state.analysisProgress.etaSeconds/60)} min` : ' · Calcolo tempo…'}</p>
+                  </>}
+                  <p className="text-sm text-gray-400">
+                    {state.space.free >= state.space.reserve+state.space.missingBytes+state.space.outputBytes ? 'Spazio disponibile' :
+                      `Spazio insufficiente: ${(state.space.free/1e9).toFixed(2)} GB liberi, ${( (state.space.reserve+state.space.missingBytes+state.space.outputBytes)/1e9).toFixed(2)} GB necessari; mancano ${((state.space.reserve+state.space.missingBytes+state.space.outputBytes-state.space.free)/1e6).toFixed(1)} MB. Analisi verifica il recupero sicuro dello spazio; se non basta, resta sospesa e conserva gli originali.`}
+                  </p>
+                  {!!state.analysisProgress?.tentative.length && <p className="text-amber-200">Proposta provvisoria: {state.analysisProgress.tentative.length} immagini dai risultati verificati. La selezione finale e le tue revisioni restano protette.</p>}
+                  {state.analysisProgress?.detail && <p className="text-amber-200">{state.analysisProgress.detail}</p>}
+                  {state.analysisFlow?.phase==='complete' && Object.entries(state.analysisFlow.deficits ?? {}).some(([,n])=>n>0) && <p className="text-amber-200">Quote incomplete: {Object.entries(state.analysisFlow.deficits ?? {}).filter(([,n])=>n>0).map(([c,n])=>`${c}: mancano ${n}`).join(' · ')}</p>}
+                </div>
               </section>
             )}
             <label className="block text-sm">
@@ -940,7 +935,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
               <div role="alert" className="rounded-lg bg-red-950/60 text-red-200 p-4 whitespace-pre-wrap break-words">
                 {error}
                 <button className={button + ' mt-3 block'} onClick={() => void refresh()}>
-                  Rileggi lo stato
+                  Aggiorna dati confermati
                 </button>
               </div>
             )}
@@ -1003,7 +998,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
           <section className="space-y-4">
             <div className="flex flex-wrap justify-between gap-3 items-end">
               <div className="min-w-0">
-                <h3 className="text-lg">{selected.length} immagini selezionate</h3>
+                <h3 className="text-lg">{selected.length} {selected.length === 1 ? "immagine selezionata" : "immagini selezionate"}</h3>
                 <p className="text-sm text-gray-400">
                   La selezione è salvata e indica quali immagini saranno descritte.
                 </p>
@@ -1033,7 +1028,11 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                 </button>
               </div>
             </div>
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(min(100%,220px),1fr))', gap:12 }}>
+              <label className="text-sm">Categoria<select aria-label="Filtra categoria" className={field} value={categoryFilter} onChange={e=>setCategoryFilter(e.target.value)}><option value="all">Tutte le categorie</option><option value="face">Volto</option><option value="body">Corpo</option><option value="variety">Varietà</option><option value="unclassified">Da analizzare</option></select></label>
+              <label className="text-sm">Selezione<select aria-label="Filtra selezione" className={field} value={membershipFilter} onChange={e=>setMembershipFilter(e.target.value)}><option value="all">Incluse ed escluse</option><option value="included">Solo incluse</option><option value="excluded">Solo escluse</option></select></label>
+              <label className="text-sm">Tag<input aria-label="Filtra tag" className={field} value={tagFilter} onChange={e=>setTagFilter(e.target.value)} placeholder="Tutti i tag" /></label>
+              <label className="text-sm">Qualità minima: {minQuality}<input aria-label="Qualità minima" type="range" className="w-full" min={0} max={100} value={minQuality} onChange={e=>setMinQuality(Number(e.target.value))} /></label>
               <input
                 aria-label="Cerca immagini"
                 placeholder="Cerca immagine o caption"
@@ -1186,22 +1185,13 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
               </span>
             </div>
             {gallery(visible)}
+            {state && <p role="status" className="mb-3 text-sm text-gray-400">
+              Ultimo salvataggio sul server · {state.managedSync.phase==='synced'?'Sincronizzato su HF':state.managedSync.phase==='local'?'HF non configurato':state.managedSync.phase==='conflict'?'Conflitto HF: entrambe le versioni conservate':state.managedSync.phase==='error'?'Errore HF, salvataggio locale conservato':state.managedSync.phase==='pending'?'Sincronizzazione HF in attesa':'Sincronizzazione HF in corso'}
+              {state.managedSync.reason ? ' · '+state.managedSync.reason : ''}
+            </p>}
             {state && !images.length && <p className="text-gray-400">Carica le prime immagini per cominciare.</p>}
           </section>
-          <details
-            className="rounded-xl border border-gray-700 p-4"
-            open={advanced}
-            onToggle={e => {
-              (() => {
-                setAdvanced(e.currentTarget.open);
-                if (e.currentTarget.open) setAdvancedMounted(true);
-              })();
-              if (!e.currentTarget.open) void refresh();
-            }}
-          >
-            <summary className="cursor-pointer text-lg">Avanzate</summary>
-            {advancedMounted && <AdvancedWorkspace dataset={dataset} onNativeView={onNativeView} />}
-          </details>
+
         </div>
       </MainContent>
     </>

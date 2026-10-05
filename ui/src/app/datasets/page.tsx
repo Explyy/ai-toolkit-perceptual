@@ -1,4 +1,5 @@
 'use client';
+import Catalog from '@/datasetStudio/DatasetCatalog';
 
 import { useState } from 'react';
 import { Modal } from '@/components/Modal';
@@ -135,6 +136,7 @@ export default function Datasets() {
           isLoading={status === 'loading'}
           onRefresh={refreshDatasets}
         />
+        <Catalog />
       </MainContent>
 
       <Modal

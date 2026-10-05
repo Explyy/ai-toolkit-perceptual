@@ -1,3 +1,4 @@
+import { stageBudget, requireBudget } from './space';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -82,6 +83,7 @@ async function linkJob(st: StudioStore, id: string, job: any) {
   });
 }
 async function stage(st: StudioStore, link: JobLink) {
+  requireBudget(await stageBudget(st, link));
   await contained(st.folder, link.folder!, true);
   await fs.mkdir(link.folder!, { recursive: true });
   for (const [i, img] of link.scope!.entries()) {

@@ -9,6 +9,19 @@ export type HfFile = {
   oid: string;
   lfs?: { oid: string; size: number };
 };
+export function hubPath(value: unknown): string {
+  ensure(
+    typeof value === 'string' &&
+      value.length > 0 &&
+      value.length <= 1000 &&
+      !value.startsWith('/') &&
+      !/[\\\x00-\x1f]/.test(value) &&
+      value.split('/').every(p => p.length > 0 && p !== '.' && p !== '..'),
+    'Invalid Hub relative path',
+  );
+  return value;
+}
+const encodePath = (value: string) => value.split('/').map(encodeURIComponent).join('/');
 export class Hub {
   constructor(
     private token: string | undefined,
@@ -25,13 +38,86 @@ export class Hub {
       signal: AbortSignal.timeout(30000),
     });
     if (!r.ok)
-      throw new Problem(
-        r.status === 409 || r.status === 412 ? 409 : 502,
-        r.status === 409 || r.status === 412
-          ? 'Hugging Face changed since this export started. Reconcile before retrying.'
-          : 'Hugging Face request failed (' + r.status + ').',
+      throw Object.assign(
+        new Problem(
+          r.status === 409 || r.status === 412 ? 409 : 502,
+          r.status === 409 || r.status === 412
+            ? 'Hugging Face changed since this export started. Reconcile before retrying.'
+            : 'Hugging Face request failed (' + r.status + ').',
+        ),
+        { remoteStatus: r.status },
       );
     return r;
+  }
+  async owner() {
+    const user: any = await (await this.request('/api/whoami-v2')).json();
+    ensure(
+      user.type === 'user' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$/.test(user.name),
+      'Token-owner identity unavailable',
+      403,
+    );
+    return user.name as string;
+  }
+  async owned(repo: string) {
+    repoId(repo);
+    const owner = await this.owner();
+    ensure(repo.split('/')[0] === owner, 'Only token-owner private datasets are permitted', 403);
+    return this.info(repo);
+  }
+  async pages(endpoint: string, max = 10000) {
+    const first = new URL(endpoint, ORIGIN),
+      seen = new Set<string>(),
+      rows: any[] = [];
+    let next = endpoint;
+    for (let page = 0; next && page < 50; page++) {
+      ensure(!seen.has(next), 'Repeated Hub pagination cursor');
+      seen.add(next);
+      const r = await this.request(next),
+        values = await r.json();
+      ensure(Array.isArray(values), 'Invalid Hub list');
+      rows.push(...values);
+      ensure(rows.length <= max, 'Catalog limit reached; open a smaller repository/folder', 413);
+      const link = r.headers.get('link'),
+        match = link?.match(/<([^>]+)>;\s*rel="next"/);
+      next = '';
+      if (match) {
+        const url = new URL(match[1], ORIGIN);
+        ensure(
+          url.origin === ORIGIN && url.pathname === first.pathname && !url.username && !url.password,
+          'Untrusted catalog pagination',
+          502,
+        );
+        for (const [k, v] of first.searchParams)
+          if (k !== 'cursor') ensure(url.searchParams.get(k) === v, 'Catalog scope changed during pagination', 502);
+        next = url.pathname + url.search;
+      }
+    }
+    ensure(!next, 'Catalog pagination limit reached', 413);
+    return rows;
+  }
+  async repositories() {
+    const owner = await this.owner(),
+      rows = await this.pages('/api/datasets?author=' + encodeURIComponent(owner) + '&limit=100&full=true');
+    return rows
+      .filter(x => x.private === true && typeof x.id === 'string' && x.id.split('/')[0] === owner)
+      .map(x => ({ repo: repoId(x.id) }));
+  }
+  async entries(repo: string, rev: string, folder = '', recursive = false) {
+    repoId(repo);
+    revision(rev);
+    if (folder) hubPath(folder);
+    return this.pages(
+      '/api/datasets/' + repo + '/tree/' + rev + '/' + encodePath(folder) + '?recursive=' + recursive + '&limit=1000',
+      20000,
+    );
+  }
+  async optional(repo: string, rev: string, file: string, max: number) {
+    try {
+      return await this.download(repo, rev, file, max);
+    } catch (e: any) {
+      if (e.remoteStatus === 404 || e.status === 404) return undefined;
+      throw e;
+    }
   }
   async info(repo: string, rev?: string) {
     repoId(repo);
@@ -54,23 +140,25 @@ export class Hub {
   async metadata(repo: string, rev: string, remotePath: string) {
     repoId(repo);
     revision(rev);
-    path(remotePath);
+    hubPath(remotePath);
     const r = await this.request(`/api/datasets/${repo}/paths-info/${rev}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths: [remotePath], expand: false }),
     });
     const rows = (await r.json()) as HfFile[];
-    ensure(rows.length === 1 && rows[0].path === remotePath, 'Remote file not found', 404);
+    ensure(Array.isArray(rows), 'Invalid remote metadata', 502);
+    ensure(rows.length > 0, 'Remote file not found', 404);
+    ensure(rows.length === 1 && rows[0].path === remotePath, 'Remote metadata identity differs', 502);
     return rows[0];
   }
   async download(repo: string, rev: string, remotePath: string, max?: number) {
     repoId(repo);
     revision(rev);
-    path(remotePath);
+    hubPath(remotePath);
     const m = await this.metadata(repo, rev, remotePath);
     ensure(m.size <= (max ?? 24 * 1024 * 1024), 'Remote file exceeds the import limit', 413);
-    let url = `${ORIGIN}/datasets/${repo}/resolve/${rev}/${remotePath}`,
+    let url = `${ORIGIN}/datasets/${repo}/resolve/${rev}/${encodePath(remotePath)}`,
       r: Response | undefined;
     for (let hop = 0; hop < 6; hop++) {
       const u = new URL(url);
@@ -111,7 +199,7 @@ export class Hub {
   }
   async upload(repo: string, remotePath: string, bytes: Uint8Array) {
     repoId(repo);
-    path(remotePath);
+    hubPath(remotePath);
     const sha = await sha256(bytes);
     const p = await this.request(`/api/datasets/${repo}/preupload/main`, {
       method: 'POST',
@@ -232,14 +320,12 @@ export class Hub {
   }
 }
 export function directPairs(files: HfFile[], folder: string) {
-  path(folder);
+  if (folder) path(folder);
+  const prefix = folder ? folder + '/' : '';
   const map = new Map(files.map(x => [x.path, x])),
     pairs: Array<{ image: HfFile; caption: HfFile }> = [];
   for (const f of files) {
-    ensure(
-      f.path.startsWith(folder + '/') && !f.path.slice(folder.length + 1).includes('/'),
-      'Only direct files are accepted',
-    );
+    ensure(f.path.startsWith(prefix) && !f.path.slice(prefix.length).includes('/'), 'Only direct files are accepted');
     if (/\.(png|jpe?g|webp)$/i.test(f.path)) {
       const name = f.path.replace(/\.[^.]+$/, '.txt'),
         caption = map.get(name);

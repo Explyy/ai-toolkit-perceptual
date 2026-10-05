@@ -8,5 +8,7 @@ export async function register() {
   if (process.env.NEXT_RUNTIME === 'nodejs') {
     const { startMonitor } = await import('@/server/monitor');
     startMonitor();
+    const { startStudioService } = await import('@/datasetStudio/service');
+    startStudioService();
   }
 }

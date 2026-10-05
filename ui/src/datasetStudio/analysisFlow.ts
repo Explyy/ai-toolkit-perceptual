@@ -8,6 +8,8 @@ import { ensure, stableJSON, select, analyzePixels } from './domain';
 import { inferredCategory, validateSignals, MODEL_ANALYZER } from './analysisPolicy';
 import { reconcileJob } from './jobs';
 import type { CaptionHost } from './captionFlow';
+import { stageBudget, requireBudget } from './space';
+import { reclaimPlan, reclaimInputs } from './reclamation';
 import { TOOLKIT_ROOT } from '@/paths';
 export type AnalysisSummary = {
   config: string;
@@ -144,6 +146,22 @@ async function unlinkedLegacyCollision(
     return false;
   }
 }
+// The sole user command boundary. Reads, target drafts and image edits never call this.
+export async function executeAnalysisCommand(st: StudioStore, db: any, sqlite: string, host: CaptionHost,
+  input: { revision: number; count?: number; retry?: boolean }) {
+  if (input.count !== undefined) {
+    ensure(Number.isInteger(input.count) && input.count >= 1 && input.count <= 1000, 'Numero immagini non valido');
+    const before = await st.read();
+    if (before.settings.count !== input.count) {
+      await st.mutate(input.revision, current => {
+        ensure(!current.jobs.some(j => j.kind === 'analysis' && ['prepared', 'enqueue-intent', 'active'].includes(j.automatic?.phase ?? '')),
+          'Attendi la fine dell’analisi prima di applicare un nuovo obiettivo', 409);
+        current.settings.count = input.count!;
+      });
+    }
+  }
+  return prepareAnalysis(st, db, sqlite, host, input.retry === true);
+}
 export async function prepareAnalysis(st: StudioStore, db: any, sqlite: string, host: CaptionHost, retry = false) {
   const { manifest, config } = await analysisConfiguration();
   let s = await st.read();
@@ -252,14 +270,16 @@ function identity(row: any, link: JobLink, st: StudioStore) {
     409,
   );
 }
-async function stage(st: StudioStore, link: JobLink, config: string) {
-  const space = await fs.statfs(st.folder);
-  ensure(
-    space.bavail * space.bsize >=
-      Number(process.env.DATASET_STUDIO_MIN_FREE_BYTES ?? 24000000000) + link.scope!.reduce((n, x) => n + x.size, 0),
-    'Analisi sospesa: spazio riservato insufficiente; nessun originale eliminato',
-    409,
-  );
+async function stage(st: StudioStore, link: JobLink, config: string, db: any) {
+  let budget = await stageBudget(st, link, config);
+  if (budget.deficit > 0) {
+    const plan = await reclaimPlan(st, db, budget.deficit);
+    if (plan.plannedBytes >= plan.quota && plan.files.length) {
+      await reclaimInputs(st, db, plan);
+      budget = await stageBudget(st, link, config);
+    }
+  }
+  requireBudget(budget);
   await contained(st.folder, link.folder!, true);
   await fs.mkdir(link.folder!, { recursive: true });
   const items = [];
@@ -419,7 +439,7 @@ export async function reconcileAnalysis(st: StudioStore, id: string, db: any, ho
     });
   try {
     if (!link.jobId) {
-      await stage(st, link, config);
+      await stage(st, link, config, db);
       const row = await reconcileJob(db, link, '0', st.datasetRoot);
       state = await st.locked(async () => {
         const s = await st.scan(await st.raw()),

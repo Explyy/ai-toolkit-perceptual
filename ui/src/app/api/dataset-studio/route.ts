@@ -1,4 +1,7 @@
-import { prepareAnalysis, reconcileAnalysis } from '@/datasetStudio/analysisFlow';
+import { syncStatus } from '@/datasetStudio/managedSync';
+import { freeBytes, reserveBytes, ANALYSIS_OUTPUT_BYTES } from '@/datasetStudio/space';
+import { analysisProgress } from '@/datasetStudio/analysisProgress';
+import { executeAnalysisCommand, reconcileAnalysis, analysisConfiguration } from '@/datasetStudio/analysisFlow';
 import { NextResponse } from 'next/server';
 import { getDataRoot, getDatasetsRoot, getHFToken, getTrainingFolder } from '@/server/settings';
 import { StudioStore } from '@/datasetStudio/store';
@@ -17,7 +20,9 @@ import os from 'node:os';
 import { TOOLKIT_ROOT } from '@/paths';
 export const runtime = 'nodejs';
 async function store(name: string) {
-  return new StudioStore(await getDataRoot(), await getDatasetsRoot(), name).init();
+  const st = await new StudioStore(await getDataRoot(), await getDatasetsRoot(), name).init();
+  ensure(!(await fs.lstat(path.join(st.datasetRoot,'.studio-materializing.json')).catch((e: any)=>{if(e.code==='ENOENT')return null;throw e;})), 'Importazione in corso: attendi il completamento o riapri dal catalogo per riprendere',409);
+  return st;
 }
 async function view(s: any, st: StudioStore) {
   const jobs = await prisma.job.findMany({
@@ -29,8 +34,14 @@ async function view(s: any, st: StudioStore) {
     },
     orderBy: { created_at: 'desc' },
   });
+  const config = (await analysisConfiguration()).config;
+  const missing = s.images.filter((x: any) => !x.discarded && x.analysis?.model?.config !== config);
+  const space = { free: await freeBytes(st.folder), reserve: reserveBytes(), missingBytes: missing.reduce((n: number,x: any) => n+x.size,0), outputBytes: missing.length*ANALYSIS_OUTPUT_BYTES };
   return {
     ...s,
+    managedSync: await syncStatus(st,s,!!(await getHFToken())),
+    space,
+    analysisProgress: await analysisProgress(st, s, jobs, (await analysisConfiguration()).config),
     jobsLive: jobs,
     selection: select(s.images, s.settings.count, s.settings.testId),
     hfConfigured: !!(await getHFToken()),
@@ -123,13 +134,9 @@ export async function POST(request: Request) {
         });
         break;
       case 'automaticAnalysis':
-        s = await prepareAnalysis(
-          st,
-          prisma,
+        s = await executeAnalysisCommand(st, prisma,
           process.env.DATASET_STUDIO_DB_URL?.replace(/^file:/, '') ?? path.join(TOOLKIT_ROOT, 'aitk_db.db'),
-          await captionHost(),
-          x.retry === true,
-        );
+          await captionHost(), { revision: x.revision, count: x.count, retry: x.retry === true });
         break;
       case 'reconcileAnalysis':
         s = await reconcileAnalysis(st, x.id, prisma, await captionHost(), x.retry === true);

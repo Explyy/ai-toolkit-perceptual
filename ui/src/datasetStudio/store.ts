@@ -104,6 +104,8 @@ export type TemplateDraft = {
 };
 export type State = {
   schema: 1;
+  sourceBinding?: { repo: string; folder: string; revision: string; inventory: string };
+  managedBinding?: { repo: string; key: string; title?: string; baseDigest?: string };
   analysisFlow?: AnalysisSummary;
   templateDraft?: TemplateDraft;
   captionPreferences?: CaptionPreferences;
@@ -258,6 +260,8 @@ export class StudioStore {
   }
   async save(s: State) {
     await atomic(path.join(this.folder, 'state.json'), stableJSON(s));
+    const { recordLocal } = await import('./managedSync');
+    await recordLocal(this, s);
   }
   async scan(s: State) {
     const previous = new Map(s.images.map(x => [x.id, x]));

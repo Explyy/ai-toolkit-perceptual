@@ -510,7 +510,7 @@ test('proposal membership CAS advances even when counts/deficits unchanged; pixe
 // Isolate TOOLKIT_ROOT with a tiny verified artifact fixture. This exercises the
 // real preparation path and Prisma's global name constraint without ML imports,
 // model downloads, or changing the repository's pinned model manifest.
-async function importIdentityRegression(scenario: 'fresh' | 'legacy') {
+async function importIdentityRegression(scenario: 'fresh' | 'legacy' | 'command') {
   const f = await fixture();
   try {
     await fs.mkdir(path.join(f.root, 'toolkit', 'ui'), { recursive: true });
@@ -527,7 +527,7 @@ const sharp=require(${JSON.stringify(path.resolve('node_modules/sharp'))});
 const {StudioStore,hash}=require(${JSON.stringify(path.resolve('src/datasetStudio/store.ts'))});
 const {stableJSON}=require(${JSON.stringify(path.resolve('src/datasetStudio/domain.ts'))});
 const {MODEL_ANALYZER}=require(${JSON.stringify(path.resolve('src/datasetStudio/analysisPolicy.ts'))});
-const {prepareAnalysis,reconcileAnalysis,analysisConfiguration}=require(${JSON.stringify(path.resolve('src/datasetStudio/analysisFlow.ts'))});
+const {prepareAnalysis,executeAnalysisCommand,reconcileAnalysis,analysisConfiguration}=require(${JSON.stringify(path.resolve('src/datasetStudio/analysisFlow.ts'))});
 const root=${JSON.stringify(toolkit)}, scenario=${JSON.stringify(scenario)};
 const sqlite=path.join(root,'native.db'), host={platform:'linux',gpu0:true,preview:false};
 let db;
@@ -566,8 +566,19 @@ let db;
  assert.equal((await a.read()).images[0].id,(await b.read()).images[0].id);assert.notEqual(a.datasetRoot,b.datasetRoot);
  let first;
  if(scenario==='legacy'){const link=await legacy(a);first=await reconcileAnalysis(a,link.automatic.id,db,host);}
- else first=await prepareAnalysis(a,db,sqlite,host);
+ else if(scenario==='command'){
+  let local=await a.read(); const draftTarget=6;
+  local=await a.edit(local.revision,[local.images[0].id],{excluded:1});await a.read();
+  assert.equal(await db.job.count(),0,'reads, local target draft and image click/edit must not enqueue');
+  assert.equal(local.settings.count,3);assert.equal(draftTarget,6);
+  first=await executeAnalysisCommand(a,db,sqlite,host,{revision:local.revision,count:6});
+  assert.equal(first.settings.count,6);assert.equal(await db.job.count(),1);
+  await executeAnalysisCommand(a,db,sqlite,host,{revision:local.revision,count:6});
+  assert.equal(await db.job.count(),1,'duplicate explicit command deduplicates');
+  await assert.rejects(executeAnalysisCommand(a,db,sqlite,host,{revision:(await a.read()).revision,count:9}),/Attendi/);
+ } else first=await prepareAnalysis(a,db,sqlite,host);
  assert.equal(first.analysisFlow.phase,'active',first.analysisFlow.reason);first=await complete(a);
+ if(scenario==='command'){first=await executeAnalysisCommand(a,db,sqlite,host,{revision:first.revision,count:3});assert.equal(await db.job.count(),1,'completed cache target change creates no GPU job');assert.equal(first.images[0].excluded,1,'manual exclusion survives proposal');}
  first=await a.edit(first.revision,[first.images[0].id],{category:'variety',excluded:1});
  const rowA=await db.job.findUnique({where:{id:active(first).jobId}}),stateA=await fs.readFile(path.join(a.folder,'state.json'));
  const resultA=await fs.readFile(path.join(active(first).folder,'result-000000/result.json'));
@@ -642,3 +653,5 @@ test('independent identical imports use distinct native SQLite identities and pr
   importIdentityRegression('fresh'));
 test('explicit retry recovers only a proven unlinked legacy collision; old own and unknown identities remain intact', () =>
   importIdentityRegression('legacy'));
+
+test('explicit analysis command persists target once; reads/drafts/edits do not enqueue, duplicate/cache commands preserve review', () => importIdentityRegression('command'));

@@ -10,7 +10,7 @@ Build `docker/dataset-studio/Dockerfile` from the repository root. Its Dockerfil
 
 The root prepares an isolated release tree/commit with this allowlist, workflow and docs, preserving user/concurrent edits and index. After source approval, a push to **`codex/dataset-studio-cloud-live`** triggers checks and publishes `ghcr.io/explyy/ai-toolkit-perceptual:dataset-studio-<full-commit>`. Registry login and image publication both require exact ref `refs/heads/codex/dataset-studio-cloud-live`, including dispatch with `publish=true`; other refs never publish. Workflow dispatch supports a non-publishing build but requires the workflow to be registered on GitHub; the release branch push avoids merging into `main`.
 
-The workflow runs Studio tests (including real disposable Prisma startup tests), build and then full TSC against generated route types. The image repeats source checks in that order and must pass the runtime import/config gate plus **real nginx HTTP smoke**: missing/wrong credentials deny all UI/API/media; valid credentials reach a private backend with Authorization stripped; cloud settings mutation is denied; Host/Origin/HTTPS forwarding survives; ambiguous protocols are rejected. A stopped local Docker daemon or absent nginx makes those image gates unavailable locally, never PASS. Deploy the published **digest**, retain workflow/commit/hash receipts privately and ensure provider registry pull access. Image-build success does not prove GPU or cloud persistence.
+The workflow runs Studio tests (including real disposable Prisma startup tests), build and then full TSC against generated route types. The image repeats source checks in that order and must pass the runtime import/config gate plus **real nginx HTTP smoke**: missing/wrong credentials deny all UI/API/media; valid credentials reach a private backend with Authorization stripped; cloud settings mutation is denied; Host/Origin/HTTPS forwarding survives; ambiguous protocols are rejected. A stopped local Docker daemon or absent nginx makes those image gates unavailable locally, never PASS. Bind the published **plain full-commit tag** in SimplePod `defaultTag` and independently verify/retain its immutable OCI digest. SimplePod rejects `tag@sha256:...` although Docker accepts it. Retain workflow/commit/hash receipts privately and ensure provider registry pull access. Image-build success does not prove GPU or cloud persistence.
 
 ```sh
 python3 scripts/dataset_studio_cloud.py manifest --toolkit "$PWD" > /tmp/studio-source.json
@@ -24,12 +24,14 @@ npx tsc --noEmit --incremental false
 
 Create a new Studio template/version. Do not edit template 31400 or install/restart on training nodes 168888/168824. Bind existing **DC1 volume 3489 at `/workspace`**. Independent provider receipt plus server readback proves that binding; startup's volume marker only checks consistency with the supplied identity.
 
-Expose **8675 through HTTPS ingress**. Next 8676 is loopback-only and must never be exposed. Keep the NVIDIA entrypoint and image CMD; do not invoke upstream `/start.sh` or replace source by cloning upstream. Supply private server environment:
+Expose **8675 through HTTPS ingress**. Next 8676 is loopback-only and must never be exposed. Keep the NVIDIA entrypoint and image CMD; do not invoke upstream `/start.sh` or replace source by cloning upstream. Supply private server environment. On the verified private owner-only dedicated template31531 with sole attached Studio169105, the provider actually applies template `envVariables`; per-instance environment/startScript PUT fields were ignored despite200 responses. The authorized app credential and existing HF token can be held only in this private dedicated binding, preserving scope; never in public templates/images/logs. Template startScript follows CMD and cannot override a failed startup guard. Use the existing provider SSH credential privately for routine bound login, never console/signed-URL dumps.
+
+Variables:
 
 | Variable | Value |
 | --- | --- |
 | `AI_TOOLKIT_AUTH` | Fresh random URL-safe 32–256 character password; no default |
-| `HF_TOKEN` | Existing authorized token, never public source/template/browser code |
+| `HF_TOKEN` | Existing authorized token, never public source/browser code |
 | `DATASET_STUDIO_VOLUME_ID` | `3489`, independently checked against provider binding |
 | `DATASET_STUDIO_MOUNT` | `/workspace` |
 | `DATASET_STUDIO_ROOT` | `/workspace/dataset-studio` |

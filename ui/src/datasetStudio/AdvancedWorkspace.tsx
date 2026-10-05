@@ -657,7 +657,7 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
             <section className="space-y-4">
               <h3>Equal thirds: face / body / variety</h3>
               <p className="text-sm text-gray-400">
-                Categories are manual; measured quality and similarity sort candidates. Pins are explicit overrides.
+                Le categorie provengono dall’analisi automatica e restano correggibili. Qualità e diversità ordinano la proposta; le revisioni e i pin sono scelte esplicite.
                 Unsatisfied quotas block export.
               </p>
               <div className="grid gap-3 sm:grid-cols-4">
