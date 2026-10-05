@@ -423,7 +423,11 @@ test('real native SQLite analysis queue persists one job, preserves paused capti
     await reconcileAnalysis(f.st, 'queue-fixture', db, host);
     assert.equal(await db.job.count({ where: { job_type: 'analysis' } }), 1);
     const managed = s.jobs.find(x => x.kind === 'analysis')!;
-    await db.job.update({ where: { id: managed.jobId }, data: { status: 'running', pid: 12345 } });
+    // A stale missing receipt is unknown on every host, including Linux.
+    await db.job.update({
+      where: { id: managed.jobId },
+      data: { status: 'running', pid: 12345, updated_at: new Date(Date.now() - 180000) },
+    });
     s = await reconcileAnalysis(f.st, 'queue-fixture', db, host);
     assert.equal(s.jobs.find(x => x.kind === 'analysis')!.automatic!.phase, 'blocked');
     assert.equal((await db.job.findUnique({ where: { id: managed.jobId } })).status, 'running');
@@ -440,6 +444,7 @@ test('real native SQLite analysis queue persists one job, preserves paused capti
       stat: async () => stat,
       now: () => now,
     };
+    await db.job.update({ where: { id: managed.jobId }, data: { updated_at: new Date(now) } });
     const nativeBefore = await db.job.findUnique({ where: { id: managed.jobId } }),
       queueBefore = await db.queue.findUnique({ where: { gpu_ids: '0' } });
     s = await reconcilePendingAnalysis(f.st, db, host, probe);
