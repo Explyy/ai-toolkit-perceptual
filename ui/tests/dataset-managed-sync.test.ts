@@ -1285,3 +1285,297 @@ test('malformed legacy blob evidence refuses without changing its uncertainty or
     }
   }
 });
+
+async function committedReadback429(f: Awaited<ReturnType<typeof fixture>>, h: ReturnType<typeof server>) {
+  await drainManaged(f.st, h.hub, Date.now() + 10000);
+  const state = await f.st.read();
+  await f.st.edit(state.revision, [state.images[0].id], { caption: 'latest committed curation', excluded: 1 });
+  const posts = h.commits,
+    at = Date.now() + 20000;
+  let rejected = false;
+  const hub = new Hub('fixture', (async (url: any, init: any) => {
+    if (
+      !rejected &&
+      h.commits === posts + 1 &&
+      String(url).includes('/paths-info/') &&
+      JSON.parse(init.body).paths[0].endsWith('/current.json')
+    ) {
+      rejected = true;
+      return new Response('', { status: 429, headers: { 'Retry-After': '90' } });
+    }
+    return h.transport(url, init);
+  }) as typeof fetch);
+  await drainManaged(f.st, hub, at);
+  assert.equal(rejected, true, '429 occurs only after the ordinary metadata commit is durable');
+  const outbox = (await readOutbox(f.st))!;
+  assert.equal(outbox.active!.revision, h.head);
+  assert.equal(outbox.lastRemoteFailure!.status, 429);
+  return { posts, at, outbox };
+}
+
+test('committed metadata readback429 retains verifying and adopts after cooldown/restart with exactly one commit', async () => {
+  const f = await fixture(),
+    h = server();
+  try {
+    const { posts, outbox } = await committedReadback429(f, h);
+    assert.equal(outbox.phase, 'verifying');
+    const before = await f.st.raw();
+    let requests = 0;
+    const hub = new Hub('fixture', (async (url: any, init: any) => {
+      requests++;
+      return h.transport(url, init);
+    }) as typeof fetch);
+    const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
+    await drainManaged(restarted, hub, outbox.retryAt! - 1);
+    assert.equal(requests, 0, 'readback cooldown survives restart');
+    await drainManaged(restarted, hub, outbox.retryAt! + 1);
+    const done = (await readOutbox(restarted))!;
+    assert.equal(done.phase, 'synced');
+    assert.equal(done.baseDigest, outbox.active!.digest);
+    assert.equal(done.active, undefined);
+    assert.equal(done.retryAt, undefined);
+    assert.equal(h.commits, posts + 1);
+    assert.deepEqual(await restarted.raw(), before);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('persisted committed error and exact429 false conflict adopt read-only at an unrelated new head, preserving newer curation', async () => {
+  for (const phase of ['error', 'conflict'] as const) {
+    const f = await fixture(),
+      h = server();
+    try {
+      const { posts, outbox } = await committedReadback429(f, h);
+      outbox.phase = phase;
+      outbox.reason =
+        phase === 'conflict' ? 'Remote dataset divergence; both versions preserved' : 'HF request failed (429).';
+      await fs.writeFile(path.join(f.st.folder, 'managed-outbox.json'), stableJSON(outbox));
+      h.bump(); // Another dataset advances the repo without changing this pointer.
+      const reads = new Set<string>();
+      let writes = 0,
+        edited = false,
+        durable = await f.st.raw();
+      const hub = new Hub('fixture', (async (url: any, init: any) => {
+        if (/\/(preupload|commit)\/main$/.test(String(url))) writes++;
+        if (String(url).includes('/resolve/')) reads.add(String(url).split('/resolve/')[1].slice(0, 40));
+        if (!edited && String(url).includes('/resolve/') && String(url).endsWith('/current.json')) {
+          edited = true;
+          let s = await f.st.read();
+          s = await f.st.edit(s.revision, [s.images[1].id], {
+            caption: 'newer during committed readback',
+            excluded: 1,
+          });
+          await f.st.captionDraft(
+            s.revision,
+            s.images[2].id,
+            { caption: 'protected readback draft', baseRevision: s.images[2].revision },
+            0,
+          );
+          durable = await f.st.raw();
+        }
+        return h.transport(url, init);
+      }) as typeof fetch);
+      const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
+      await drainManaged(restarted, hub, outbox.retryAt! + 1);
+      const adopted = (await readOutbox(restarted))!;
+      assert.equal(writes, 0, 'adoption performs no preupload/upload/commit');
+      assert.equal(h.commits, posts + 1);
+      assert.ok(reads.has(outbox.active!.revision!));
+      assert.ok(reads.has(h.head));
+      assert.equal(adopted.phase, 'pending');
+      assert.equal(adopted.baseDigest, outbox.active!.digest);
+      assert.equal(adopted.desired, hash(stableJSON(managedProjection(durable))));
+      assert.equal(adopted.remoteRevision, h.head);
+      assert.equal(adopted.active, undefined);
+      assert.equal(adopted.reason, undefined);
+      assert.equal(adopted.retryAt, undefined);
+      assert.deepEqual(await restarted.raw(), durable);
+      await drainManaged(restarted, h.hub, outbox.retryAt! + 10000);
+      assert.equal((await readOutbox(restarted))!.phase, 'synced');
+      assert.deepEqual(await restarted.raw(), durable);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test('committed adoption refuses divergent pointer/original, malformed projection/receipt/binding and changing ownership or source', async () => {
+  for (const scenario of [
+    'current-pointer',
+    'current-original',
+    'recorded-metadata',
+    'projection',
+    'revision',
+    'blob',
+    'binding',
+    'changed-receipt',
+    'changed-source',
+  ]) {
+    const f = await fixture(),
+      h = server();
+    try {
+      const { posts, outbox } = await committedReadback429(f, h);
+      const active = outbox.active!;
+      outbox.phase = 'error';
+      h.bump();
+      if (scenario === 'current-pointer')
+        h.files.set(
+          managedRoot(outbox.key) + '/current.json',
+          Buffer.from(stableJSON({ schema: 1, key: outbox.key, digest: 'a'.repeat(64) })),
+        );
+      if (scenario === 'current-original')
+        h.files.set(
+          managedRoot(outbox.key) + '/blobs/' + active.projection.images[0].sha,
+          Buffer.from('foreign changed original'),
+        );
+      if (scenario === 'projection') active.projection.images[0].caption = 'tampered projection';
+      if (scenario === 'revision') active.revision = 'not-a-revision';
+      if (scenario === 'blob')
+        active.blob = {
+          path: managedRoot(outbox.key) + '/blobs/' + active.projection.images[0].sha,
+          sha: active.projection.images[0].sha,
+          size: active.projection.images[0].size,
+          parent: active.parent,
+          phase: 'commit_started',
+        };
+      await fs.writeFile(path.join(f.st.folder, 'managed-outbox.json'), stableJSON(outbox));
+      if (scenario === 'binding') {
+        const s = await f.st.raw();
+        s.managedBinding = {
+          schema: 1,
+          repo: 'daverave/Another',
+          key: outbox.key,
+          title: 'native',
+          baseDigest: outbox.baseDigest,
+        } as any;
+        await fs.writeFile(path.join(f.st.folder, 'state.json'), stableJSON(s));
+      }
+      const retained = stableJSON(active),
+        before = await f.st.raw();
+      let writes = 0,
+        injected = false;
+      const hub = new Hub('fixture', (async (url: any, init: any) => {
+        if (/\/(preupload|commit)\/main$/.test(String(url))) writes++;
+        if (
+          scenario === 'recorded-metadata' &&
+          String(url).includes('/resolve/' + active.revision + '/') &&
+          String(url).endsWith('/versions/' + active.digest + '.json')
+        )
+          return new Response('invalid immutable metadata');
+        if (
+          !injected &&
+          ['changed-receipt', 'changed-source'].includes(scenario) &&
+          String(url).includes('/resolve/' + h.head + '/') &&
+          String(url).endsWith('/current.json')
+        ) {
+          injected = true;
+          if (scenario === 'changed-receipt') {
+            const x = (await readOutbox(f.st))!;
+            x.active!.parent = 'f'.repeat(40);
+            await fs.writeFile(path.join(f.st.folder, 'managed-outbox.json'), stableJSON(x));
+          } else
+            await fs.writeFile(
+              path.join(f.datasets, 'native', '0.png'),
+              await sharp({ create: { width: 128, height: 128, channels: 3, background: '#ffffff' } })
+                .png()
+                .toBuffer(),
+            );
+        }
+        return h.transport(url, init);
+      }) as typeof fetch);
+      try {
+        await drainManaged(f.st, hub, outbox.retryAt! + 1);
+      } catch (e: any) {
+        assert.equal(scenario, 'binding');
+        assert.match(e.message, /binding changed/i);
+      }
+      const refused = (await readOutbox(f.st))!;
+      assert.equal(writes, 0, scenario);
+      assert.equal(h.commits, posts + 1, scenario);
+      assert.equal(refused.baseDigest, outbox.baseDigest, scenario);
+      assert.ok(refused.active, scenario);
+      if (scenario !== 'changed-receipt') assert.equal(stableJSON(refused.active), retained, scenario);
+      else assert.equal(refused.active.parent, 'f'.repeat(40));
+      assert.deepEqual(await f.st.raw(), before, scenario);
+      if (scenario !== 'binding') assert.equal(refused.phase, 'conflict', scenario);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test('an absent revision or unrelated conflict never qualifies for historical committed adoption', async () => {
+  for (const scenario of ['no-revision', 'no429', 'different-reason']) {
+    const f = await fixture(),
+      h = server();
+    try {
+      const { posts, outbox } = await committedReadback429(f, h);
+      outbox.phase = 'conflict';
+      outbox.reason = 'Remote dataset divergence; both versions preserved';
+      if (scenario === 'no-revision') delete outbox.active!.revision;
+      if (scenario === 'no429') outbox.lastRemoteFailure!.status = 503;
+      if (scenario === 'different-reason') outbox.reason = 'Actual remote writer conflict';
+      await fs.writeFile(path.join(f.st.folder, 'managed-outbox.json'), stableJSON(outbox));
+      let calls = 0;
+      await drainManaged(
+        f.st,
+        new Hub('fixture', (async (url: any, init: any) => {
+          calls++;
+          return h.transport(url, init);
+        }) as typeof fetch),
+        outbox.retryAt! + 1,
+      );
+      assert.equal(calls, 0);
+      assert.equal(h.commits, posts + 1);
+      assert.equal(stableJSON(await readOutbox(f.st)), stableJSON(outbox));
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test('repeated transient committed readback and real final lock contention preserve the receipt without mutation fallthrough', async () => {
+  const f = await fixture(),
+    h = server();
+  try {
+    const { posts, outbox } = await committedReadback429(f, h);
+    const retained = stableJSON(outbox.active);
+    let clock = outbox.retryAt! + 1,
+      writes = 0;
+    for (const failure of ['429', '503', 'network']) {
+      const hub = new Hub('fixture', (async (url: any, init: any) => {
+        if (/\/(preupload|commit)\/main$/.test(String(url))) writes++;
+        if (String(url).includes('/paths-info/') && JSON.parse(init.body).paths[0].endsWith('/current.json')) {
+          if (failure === 'network') throw new Error('fixture connection lost');
+          return new Response('', { status: Number(failure), headers: { 'Retry-After': '90' } });
+        }
+        return h.transport(url, init);
+      }) as typeof fetch);
+      await drainManaged(f.st, hub, clock);
+      const pending = (await readOutbox(f.st))!;
+      assert.equal(pending.phase, 'verifying', failure);
+      assert.equal(stableJSON(pending.active), retained);
+      assert.equal(h.commits, posts + 1);
+      assert.equal(writes, 0);
+      clock = Math.max(clock + 1, (pending.retryAt ?? clock) + 1);
+    }
+    let proved = false;
+    const injected = contendReceipt(f.st, () => proved);
+    const hub = new Hub('fixture', (async (url: any, init: any) => {
+      if (String(url).includes('/resolve/') && String(url).endsWith('/current.json')) proved = true;
+      return h.transport(url, init);
+    }) as typeof fetch);
+    await drainManaged(f.st, hub, clock);
+    assert.equal(injected(), true, 'real edit-lock contention occurs at adoption, after network proof');
+    assert.equal(stableJSON((await readOutbox(f.st))!.active), retained);
+    assert.equal((await readOutbox(f.st))!.phase, 'verifying');
+    assert.equal(h.commits, posts + 1);
+    const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
+    await drainManaged(restarted, h.hub, clock + 1);
+    assert.equal((await readOutbox(restarted))!.phase, 'synced');
+    assert.equal(h.commits, posts + 1);
+  } finally {
+    await f.cleanup();
+  }
+});

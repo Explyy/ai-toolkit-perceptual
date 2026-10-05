@@ -234,10 +234,24 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
     await st.locked(() => recordLocal(st, state, now));
     let o = await readOutbox(st);
     const legacyBusy = o?.phase === 'conflict' && o.reason === 'Dataset operation active; refresh' && !!o.active;
+    // A recorded successful commit is never permission to upload again. The
+    // historical false-conflict shape only permits proving its exact readback.
+    const committedReadback =
+      !!o?.active?.revision &&
+      (o.phase === 'verifying' ||
+        o.phase === 'error' ||
+        (o.phase === 'conflict' &&
+          o.reason === 'Remote dataset divergence; both versions preserved' &&
+          /^[0-9a-f]{40}$/.test(o.active.revision) &&
+          o.lastRemoteFailure?.status === 429 &&
+          Number.isSafeInteger(o.lastRemoteFailure.at) &&
+          o.lastRemoteFailure.at >= 0 &&
+          Number.isSafeInteger(o.lastRemoteFailure.retryAt) &&
+          o.lastRemoteFailure.retryAt >= o.lastRemoteFailure.at));
     if (
       !o ||
       (o.retryAt ?? 0) > now ||
-      (o.phase === 'conflict' && !legacyBusy) ||
+      (o.phase === 'conflict' && !legacyBusy && !committedReadback) ||
       (!o.active && (o.desired === o.baseDigest || now - o.changedAt < DEBOUNCE))
     )
       return;
@@ -274,6 +288,57 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
           if (rev) ensure(await verifyBlob(hub, o!, rev, image), 'Managed recovery original missing', 409);
         }
       };
+      if (committedReadback) {
+        validateActive();
+        const active = o.active!,
+          identity = stableJSON(active),
+          base = o.baseDigest;
+        ensure(o.schema === 1 && !active.blob, 'Committed recovery receipt differs', 409);
+        revision(active.revision);
+        await verifyRetained();
+        // Prove the acknowledged commit and the current pinned repository
+        // independently. A genuine later dataset edit must remain a conflict.
+        await readback(hub, o, active.revision!);
+        const current = await hub.info(o.repo);
+        if (current.sha !== active.revision) await readback(hub, o, current.sha);
+        await update(async x => {
+          ensure(
+            x.schema === 1 &&
+              x.repo === o!.repo &&
+              x.key === o!.key &&
+              x.baseDigest === base &&
+              stableJSON(x.active) === identity,
+            'Committed recovery identity changed during readback',
+            409,
+          );
+          const fresh = await st.raw(),
+            projection = managedProjection(fresh);
+          ensure(
+            projection.key === x.key && (fresh.managedBinding?.repo ?? 'daverave/Personal') === x.repo,
+            'Committed recovery binding changed',
+            409,
+          );
+          for (const image of active.projection.images) {
+            const source = fresh.images.find(
+              y => y.relative === image.relative && y.sha === image.sha && y.size === image.size,
+            );
+            ensure(source, 'Managed recovery original changed', 409);
+            await st.source(source);
+          }
+          const desired = hash(stableJSON(projection));
+          if (x.desired !== desired) {
+            x.desired = desired;
+            x.changedAt = observeTime();
+          }
+          x.baseDigest = active.digest;
+          x.remoteRevision = current.sha;
+          delete x.active;
+          delete x.reason;
+          delete x.retryAt;
+          x.phase = x.desired === active.digest ? 'synced' : 'pending';
+        });
+        return;
+      }
       if (legacyBusy) {
         // The old untyped busy status lost the prior phase. It is never proof
         // that a metadata POST was not sent: retain the operation as uncertain.
@@ -754,6 +819,17 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
         if (Number.isInteger(e.remoteStatus)) {
           x.retryAt = deadline(e, receivedAt);
           x.lastRemoteFailure = { status: e.remoteStatus, at: receivedAt, retryAt: x.retryAt };
+        }
+        if (committedReadback || (x.phase === 'verifying' && x.active?.revision)) {
+          const semantic =
+            !e.remoteStatus &&
+            ([400, 403, 409, 413].includes(e.status) ||
+              /^(Managed (metadata readback differs|original (missing|size changed|readback differs))|Remote (size mismatch|SHA-256 mismatch|Git object mismatch|metadata identity differs))$/.test(
+                e.message ?? '',
+              ));
+          x.phase = semantic ? 'conflict' : 'verifying';
+          x.reason = semantic ? e.message : 'Conferma HF in attesa; nessun reinvio automatico.';
+          return;
         }
         if (legacyBusy && x.phase === 'conflict') {
           // A failed validation/network read must not turn the legacy uncertain
