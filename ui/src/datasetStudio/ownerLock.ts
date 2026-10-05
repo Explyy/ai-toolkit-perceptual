@@ -1,7 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import sqlite3 from 'sqlite3';
-import { ensure } from './domain';
+import { ensure, Problem } from './domain';
+export class OperationBusy extends Problem {
+  constructor() {
+    super(409, 'Dataset operation active; refresh');
+  }
+}
 export async function ownedLock<T>(folder: string, action: () => Promise<T>) {
   // Never guess whether an old mkdir-lock owner is dead, including foreign PID namespaces.
   const legacy = await fs.lstat(path.join(folder, 'lock')).catch((e: any) => {
@@ -45,7 +50,7 @@ export async function ownedLock<T>(folder: string, action: () => Promise<T>) {
     transaction = false;
     return value;
   } catch (e: any) {
-    if (e.code === 'SQLITE_BUSY' || e.code === 'SQLITE_LOCKED') ensure(false, 'Dataset operation active; refresh', 409);
+    if (e.code === 'SQLITE_BUSY' || e.code === 'SQLITE_LOCKED') throw new OperationBusy();
     throw e;
   } finally {
     if (transaction) await exec('ROLLBACK').catch(() => {});

@@ -5,7 +5,7 @@ import { atomic, contained, hash } from './store';
 import { ensure, stableJSON, settings, repoId, revision, integer, text, CATEGORIES } from './domain';
 import { preferences } from './captionModels';
 import { Hub } from './hf';
-import { ownedLock } from './ownerLock';
+import { ownedLock, OperationBusy } from './ownerLock';
 const LIMIT = 16 * 1024 * 1024,
   DEBOUNCE = 3000;
 export type ManagedProjection = {
@@ -28,6 +28,7 @@ export type Outbox = {
   reason?: string;
   retryAt?: number;
   lastRemoteFailure?: { status: number; at: number; retryAt: number };
+  metadataRecoveries?: Record<string, { digest: string; parent: string; baseDigest?: string; attemptedAt: number }>;
   blobRecoveries?: Record<
     string,
     {
@@ -221,22 +222,64 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
     const state = await st.read();
     await st.locked(() => recordLocal(st, state, now));
     let o = await readOutbox(st);
+    const legacyBusy =
+      o?.phase === 'conflict' && o.reason === 'Dataset operation active; refresh' && !!o.active && !o.active.blob;
     if (
       !o ||
       (o.retryAt ?? 0) > now ||
-      o.phase === 'conflict' ||
+      (o.phase === 'conflict' && !legacyBusy) ||
       (!o.active && (o.desired === o.baseDigest || now - o.changedAt < DEBOUNCE))
     )
       return;
-    const update = async (fn: (x: Outbox) => void) =>
+    const update = async (fn: (x: Outbox) => void | Promise<void>) =>
       st.locked(async () => {
         const latest = (await readOutbox(st))!;
-        fn(latest);
+        await fn(latest);
         await save(st, latest);
         o = latest;
       });
     try {
       const info = await hub.owned(o.repo);
+      const validateActive = () => {
+        const a = o!.active!;
+        validateProjection(a.projection);
+        ensure(
+          hash(stableJSON(a.projection)) === a.digest &&
+            a.projection.key === o!.key &&
+            a.projection.key === managedProjection(state).key &&
+            o!.repo === (state.managedBinding?.repo ?? 'daverave/Personal') &&
+            a.baseDigest === o!.baseDigest &&
+            /^[0-9a-f]{40}$/.test(a.parent),
+          'Managed recovery identity differs',
+          409,
+        );
+      };
+      const verifyRetained = async (rev: string) => {
+        for (const image of o!.active!.projection.images) {
+          const source = state.images.find(
+            x => x.relative === image.relative && x.sha === image.sha && x.size === image.size,
+          );
+          ensure(source, 'Managed recovery original changed', 409);
+          await st.source(source);
+          ensure(await verifyBlob(hub, o!, rev, image), 'Managed recovery original missing', 409);
+        }
+      };
+      if (legacyBusy) {
+        // The old untyped busy status lost the prior phase. It is never proof
+        // that a metadata POST was not sent: retain the operation as uncertain.
+        validateActive();
+        const p = await pointer(hub, o.repo, info.sha, o.key);
+        ensure(
+          p?.digest === o.active!.digest || p?.digest === o.active!.baseDigest,
+          'Remote dataset divergence; both versions preserved',
+          409,
+        );
+        await verifyRetained(info.sha);
+        await update(x => {
+          x.phase = 'commit_started';
+          x.reason = 'Esito HF da verificare; curatela locale conservata.';
+        });
+      }
       if (o.active && ['commit_started', 'verifying'].includes(o.phase)) {
         const p = await pointer(hub, o.repo, info.sha, o.key);
         if (p?.digest === o.active.digest) {
@@ -251,9 +294,111 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
           });
           return;
         }
-        // A lost response may still be executing. Never turn an unknown POST into
-        // another POST automatically, even if the current pointer is still old.
         if (o.phase === 'commit_started') {
+          const active = o.active;
+          ensure(p?.digest === active.baseDigest, 'Remote dataset divergence; both versions preserved', 409);
+          validateActive();
+          const attemptKey = hash(active.parent + ':' + active.digest);
+          const attempts = o.metadataRecoveries ?? {};
+          ensure(typeof attempts === 'object' && !Array.isArray(attempts), 'Invalid metadata recovery receipt', 409);
+          for (const [key, attempt] of Object.entries(attempts)) {
+            ensure(
+              attempt &&
+                /^[0-9a-f]{64}$/.test(attempt.digest) &&
+                /^[0-9a-f]{40}$/.test(attempt.parent) &&
+                key === hash(attempt.parent + ':' + attempt.digest) &&
+                (attempt.baseDigest === undefined || /^[0-9a-f]{64}$/.test(attempt.baseDigest)) &&
+                Number.isSafeInteger(attempt.attemptedAt) &&
+                attempt.attemptedAt >= 0,
+              'Invalid metadata recovery receipt',
+              409,
+            );
+          }
+          // One exact-parent replay is safe even while the original request is
+          // still in flight: parentCommit allows at most one of them to apply.
+          // Changed HEAD or any prior attempt remains readback-only forever.
+          if (
+            !active.blob &&
+            !active.revision &&
+            info.sha === active.parent &&
+            !Object.values(o.metadataRecoveries ?? {}).some(x => x.digest === active.digest)
+          ) {
+            await verifyRetained(info.sha);
+            if (active.baseDigest) {
+              const bytes = await hub.download(
+                o.repo,
+                info.sha,
+                root(o.key) + '/versions/' + active.baseDigest + '.json',
+                LIMIT,
+              );
+              ensure(hash(bytes) === active.baseDigest, 'Managed recovery base changed', 409);
+            }
+            const operations = [
+              await hub.upload(
+                o.repo,
+                root(o.key) + '/versions/' + active.digest + '.json',
+                Buffer.from(stableJSON(active.projection)),
+              ),
+              await hub.upload(
+                o.repo,
+                root(o.key) + '/current.json',
+                Buffer.from(stableJSON({ schema: 1, key: o.key, digest: active.digest })),
+              ),
+            ];
+            ensure(
+              Buffer.byteLength(stableJSON(operations)) <= 23 * 1024 * 1024,
+              'Metadata commit payload exceeds bounded limit',
+              413,
+            );
+            const fresh = await hub.info(o.repo),
+              current = await pointer(hub, o.repo, fresh.sha, o.key);
+            if (fresh.sha === active.parent && current?.digest === active.baseDigest) {
+              await update(async asyncGuard => {
+                ensure(
+                  asyncGuard.phase === 'commit_started' &&
+                    stableJSON(asyncGuard.active) === stableJSON(active) &&
+                    !Object.values(asyncGuard.metadataRecoveries ?? {}).some(x => x.digest === active.digest),
+                  'Managed recovery receipt changed',
+                  409,
+                );
+                const latestState = await st.raw();
+                ensure(
+                  managedProjection(latestState).key === asyncGuard.key &&
+                    (latestState.managedBinding?.repo ?? 'daverave/Personal') === asyncGuard.repo,
+                  'Managed recovery local binding changed',
+                  409,
+                );
+                for (const image of active.projection.images) {
+                  const source = latestState.images.find(
+                    x => x.relative === image.relative && x.sha === image.sha && x.size === image.size,
+                  );
+                  ensure(source, 'Managed recovery original changed', 409);
+                  await st.source(source);
+                }
+                (asyncGuard.metadataRecoveries ??= {})[attemptKey] = {
+                  digest: active.digest,
+                  parent: active.parent,
+                  baseDigest: active.baseDigest,
+                  attemptedAt: observeTime(),
+                };
+              });
+              const committed = await hub.commit(o.repo, active.parent, operations, active.digest);
+              await update(x => {
+                x.active!.revision = committed;
+                x.phase = 'verifying';
+              });
+              await readback(hub, o, committed);
+              await update(x => {
+                x.baseDigest = active.digest;
+                x.remoteRevision = committed;
+                delete x.active;
+                delete x.reason;
+                delete x.retryAt;
+                x.phase = x.desired === active.digest ? 'synced' : 'pending';
+              });
+              return;
+            }
+          }
           await update(x => {
             x.reason = 'Esito HF non ancora confermato: riconciliazione in corso, nessun invio duplicato.';
           });
@@ -521,11 +666,21 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
         break;
       }
     } catch (e: any) {
+      // Contention never changes a semantic phase or erases an uncertain POST
+      // receipt. A later service tick retries the same durable operation.
+      if (e instanceof OperationBusy) return;
       const receivedAt = responseTime(e);
       await update(x => {
         if (Number.isInteger(e.remoteStatus)) {
           x.retryAt = deadline(e, receivedAt);
           x.lastRemoteFailure = { status: e.remoteStatus, at: receivedAt, retryAt: x.retryAt };
+        }
+        if (legacyBusy && x.phase === 'conflict') {
+          // A failed validation/network read must not turn the legacy uncertain
+          // operation into a normal uploading retry. Transient reads retain the
+          // legacy marker; invalid local evidence stays an explicit conflict.
+          if (!e.remoteStatus && [400, 403, 409, 413].includes(e.status)) x.reason = e.message;
+          return;
         }
         if (x.phase === 'commit_started' || x.active?.blob?.phase === 'commit_started') {
           if (e.status === 409 && !e.remoteStatus) {
