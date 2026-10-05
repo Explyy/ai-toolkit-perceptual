@@ -8,6 +8,7 @@ import { MonitorSample } from '@/types';
 export const dynamic = 'force-dynamic';
 
 export async function GET(request: Request) {
+  if (process.env.DATASET_STUDIO_PREVIEW === '1') return Response.json({ unavailable: 'System monitor disabled in isolated verification preview' }, { status: 503 });
   const monitor = startMonitor();
   const encoder = new TextEncoder();
   let unsubscribe: (() => void) | null = null;

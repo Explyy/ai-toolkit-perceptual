@@ -11,6 +11,7 @@ export const flushCache = () => {
 };
 
 export const getDatasetsRoot = async () => {
+  if (process.env.DATASET_STUDIO_DATASETS_ROOT) return path.resolve(process.env.DATASET_STUDIO_DATASETS_ROOT);
   const key = 'DATASETS_FOLDER';
   let datasetsPath = myCache.get(key) as string;
   if (datasetsPath) {
@@ -33,6 +34,7 @@ export const getDatasetsRoot = async () => {
 };
 
 export const getTrainingFolder = async () => {
+  if (process.env.DATASET_STUDIO_TRAINING_ROOT) return path.resolve(process.env.DATASET_STUDIO_TRAINING_ROOT);
   const key = 'TRAINING_FOLDER';
   let trainingRoot = myCache.get(key) as string;
   if (trainingRoot) {
@@ -53,6 +55,7 @@ export const getTrainingFolder = async () => {
 };
 
 export const getHFToken = async () => {
+  if (process.env.HF_TOKEN) return process.env.HF_TOKEN;
   const key = 'HF_TOKEN';
   let token = myCache.get(key) as string;
   if (token) {
@@ -72,6 +75,7 @@ export const getHFToken = async () => {
 };
 
 export const getDataRoot = async () => {
+  if (process.env.DATASET_STUDIO_DATA_ROOT) return path.resolve(process.env.DATASET_STUDIO_DATA_ROOT);
   const key = 'DATA_ROOT';
   let dataRoot = myCache.get(key) as string;
   if (dataRoot) {

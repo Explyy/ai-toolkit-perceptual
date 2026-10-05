@@ -5,6 +5,8 @@ import { apiClient } from '@/utils/api';
 
 export interface Settings {
   HF_TOKEN: string;
+  HF_TOKEN_CONFIGURED: boolean;
+  CLEAR_HF_TOKEN: boolean;
   TRAINING_FOLDER: string;
   DATASETS_FOLDER: string;
   MODELS_PATH: string;
@@ -13,6 +15,8 @@ export interface Settings {
 export default function useSettings() {
   const [settings, setSettings] = useState({
     HF_TOKEN: '',
+    HF_TOKEN_CONFIGURED: false,
+    CLEAR_HF_TOKEN: false,
     TRAINING_FOLDER: '',
     DATASETS_FOLDER: '',
     MODELS_PATH: '',
@@ -23,9 +27,10 @@ export default function useSettings() {
       .get('/api/settings')
       .then(res => res.data)
       .then(data => {
-        console.log('Settings:', data);
         setSettings({
-          HF_TOKEN: data.HF_TOKEN || '',
+          HF_TOKEN: '',
+          HF_TOKEN_CONFIGURED: data.HF_TOKEN_CONFIGURED === true,
+          CLEAR_HF_TOKEN: false,
           TRAINING_FOLDER: data.TRAINING_FOLDER || '',
           DATASETS_FOLDER: data.DATASETS_FOLDER || '',
           MODELS_PATH: data.MODELS_PATH || '',

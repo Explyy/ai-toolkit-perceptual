@@ -153,6 +153,7 @@ async function getGpuInfo() {
 }
 
 export async function GET() {
+  if(process.env.DATASET_STUDIO_PREVIEW==='1')return NextResponse.json({error:'GPU monitoring unavailable in isolated verification preview',gpus:[],hasNvidiaSmi:false},{status:503});
   try {
     const gpuInfo = await cached('gpu-info', getGpuInfo);
     return NextResponse.json(gpuInfo);

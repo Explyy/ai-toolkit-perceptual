@@ -17,7 +17,7 @@ export function middleware(request: NextRequest) {
   const token = request.headers.get('Authorization')?.split(' ')[1];
 
   // allow public routes to pass through
-  if (publicRoutes.some(route => request.nextUrl.pathname.startsWith(route))) {
+  if (['GET', 'HEAD'].includes(request.method) && publicRoutes.some(route => request.nextUrl.pathname.startsWith(route))) {
     return NextResponse.next();
   }
 

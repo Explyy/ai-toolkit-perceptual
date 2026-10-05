@@ -49,13 +49,16 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           }}
         />
       </head>
-      <body className={inter.className}>
+      <body
+        className={inter.className}
+        data-studio-preview={process.env.DATASET_STUDIO_PREVIEW === '1' ? 'true' : undefined}
+      >
         <script dangerouslySetInnerHTML={{ __html: `window.server_platform = "${platform}";` }} />
         <ThemeProvider>
           <AuthWrapper authRequired={authRequired}>
             <div className="flex h-screen bg-gray-950">
               <Sidebar />
-              <main className="flex-1 overflow-auto bg-gray-950 text-gray-100 relative">
+              <main className="flex-1 min-w-0 overflow-auto bg-gray-950 text-gray-100 relative">
                 <Suspense>{children}</Suspense>
               </main>
             </div>

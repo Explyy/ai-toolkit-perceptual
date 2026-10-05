@@ -138,6 +138,7 @@ export default function useMonitorStream(): MonitorStreamState {
   const [snapshot, setSnapshot] = useState(state);
 
   useEffect(() => {
+    if (document.body.dataset.studioPreview === 'true') return;
     const listener = (s: MonitorStreamState) => setSnapshot(s);
     listeners.add(listener);
     refCount++;

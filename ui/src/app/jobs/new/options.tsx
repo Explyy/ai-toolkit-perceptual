@@ -1,7 +1,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { GroupedSelectOption, SelectOption, JobConfig, ConfigDoc } from '@/types';
-import { defaultSliderConfig } from './jobConfig';
+import { defaultSliderConfig } from '@/helpers/sliderDefaults';
 import { defaultAudioSampleConfig, defaultSampleConfig, defaultIdeogramSamplesConfig } from '@/helpers/defaultSamples';
 
 type Control = 'depth' | 'line' | 'pose' | 'inpaint';

@@ -16,10 +16,15 @@ export default function Settings() {
     apiClient
       .post('/api/settings', settings)
       .then(() => {
+        setSettings(prev => ({
+          ...prev,
+          HF_TOKEN_CONFIGURED: prev.CLEAR_HF_TOKEN ? false : !!prev.HF_TOKEN || prev.HF_TOKEN_CONFIGURED,
+          HF_TOKEN: '',
+          CLEAR_HF_TOKEN: false,
+        }));
         setStatus('success');
       })
       .catch(error => {
-        console.error('Error saving settings:', error);
         setStatus('error');
       })
       .finally(() => {
@@ -64,8 +69,20 @@ export default function Settings() {
                     value={settings.HF_TOKEN}
                     onChange={handleChange}
                     className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
-                    placeholder="Enter your Hugging Face token"
+                    placeholder={
+                      settings.HF_TOKEN_CONFIGURED
+                        ? 'Token configured; leave blank to preserve'
+                        : 'Enter your Hugging Face token'
+                    }
                   />
+                  <label className="text-sm flex gap-2 mt-2">
+                    <input
+                      type="checkbox"
+                      checked={settings.CLEAR_HF_TOKEN}
+                      onChange={e => setSettings(prev => ({ ...prev, CLEAR_HF_TOKEN: e.target.checked }))}
+                    />
+                    Remove configured server token
+                  </label>
                 </div>
 
                 <div>

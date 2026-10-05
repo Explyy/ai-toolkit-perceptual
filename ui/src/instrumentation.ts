@@ -4,6 +4,7 @@
  * stats history is already populated when the first client connects.
  */
 export async function register() {
+  if (process.env.DATASET_STUDIO_PREVIEW === '1') return;
   if (process.env.NEXT_RUNTIME === 'nodejs') {
     const { startMonitor } = await import('@/server/monitor');
     startMonitor();

@@ -7,6 +7,8 @@ import AudioPlayer from './AudioPlayer';
 import { isVideo, isAudio, encodeFilePathForUrl } from '@/utils/basic';
 import useCaptionBatch, { setCachedCaption } from '@/hooks/useCaptionBatch';
 
+const pendingCaptionDrafts = new Map<string, string>();
+
 interface DatasetImageCardProps {
   imageUrl: string;
   alt: string;
@@ -127,7 +129,9 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
     captionExt,
   );
 
-  const [caption, setCaption] = useState<string>('');
+  const draftKey=imageUrl+'\0'+captionExt;
+  const [saveError,setSaveError]=useState('');
+  const [caption, setCaption] = useState<string>(()=>pendingCaptionDrafts.get(draftKey)??'');
   const [savedCaption, setSavedCaption] = useState<string>('');
   const dirtyRef = useRef<boolean>(false);
 
@@ -140,7 +144,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
   // Sync from the fetched caption, but don't clobber unsaved local edits.
   useEffect(() => {
     if (!isCaptionLoaded) return;
-    if (dirtyRef.current) return;
+    if (dirtyRef.current || pendingCaptionDrafts.has(draftKey)) return;
     setCaption(fetchedCaption);
     setSavedCaption(fetchedCaption.trim());
   }, [fetchedCaption, isCaptionLoaded]);
@@ -164,9 +168,11 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
         setSavedCaption(trimmedCaption);
         setCachedCaption(imageUrl, trimmedCaption, captionExt);
         dirtyRef.current = false;
+        pendingCaptionDrafts.delete(draftKey);setSaveError('');
       })
       .catch(error => {
-        console.error('Error saving caption:', error);
+        pendingCaptionDrafts.set(draftKey,caption);
+        setSaveError('Caption save failed. Your draft is retained; retry or revert.');
       });
   };
 
@@ -183,8 +189,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       if (trimmed === s) return;
       apiClient
         .post('/api/img/caption', { imgPath: url, caption: trimmed, ext })
-        .then(() => setCachedCaption(url, trimmed, ext))
-        .catch(err => console.error('Error saving caption on unmount:', err));
+        .then(() => {setCachedCaption(url, trimmed, ext);pendingCaptionDrafts.delete(url+'\0'+ext);})
+        .catch(() => pendingCaptionDrafts.set(url+'\0'+ext,c));
     };
   }, []);
 
@@ -197,7 +203,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
 
   const handleCaptionChange = (value: string) => {
     dirtyRef.current = value.trim() !== savedCaption;
-    setCaption(value);
+    setCaption(value);pendingCaptionDrafts.set(draftKey,value);
   };
 
   const isCaptionCurrent = caption.trim() === savedCaption;
@@ -300,7 +306,8 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
             }}
             onBlur={saveCaption}
           >
-            <textarea
+            {(saveError || pendingCaptionDrafts.has(draftKey)) && <div role="alert" className="text-sm text-amber-300 p-2">{saveError || 'Unsaved caption draft retained'} <button type="button" onClick={saveCaption}>Retry save</button> <button type="button" onClick={()=>{pendingCaptionDrafts.delete(draftKey);setCaption(fetchedCaption);dirtyRef.current=false;setSaveError('');}}>Revert</button></div>}
+              <textarea
               className={classNames('w-full bg-transparent resize-none outline-none focus:ring-0 focus:outline-none', {
                 'opacity-50 cursor-not-allowed': isAutoCaptioning,
               })}

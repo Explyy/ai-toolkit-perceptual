@@ -23,6 +23,7 @@ export interface CaptionDatasetModalState {
   jobId?: string | null;
   cloneId?: string | null;
   defaultCaptionExt?: string;
+  draftOnly?: boolean;
   onClose?: () => void;
 }
 
@@ -31,7 +32,7 @@ export const captionDatasetModalState = createGlobalState<CaptionDatasetModalSta
 export const openCaptionDatasetModal = (
   datasetPath: string,
   onClose?: () => void,
-  options?: { jobId?: string | null; cloneId?: string | null; defaultCaptionExt?: string },
+  options?: { jobId?: string | null; cloneId?: string | null; defaultCaptionExt?: string; draftOnly?: boolean },
 ) => {
   captionDatasetModalState.set({
     datasetPath,
@@ -39,6 +40,7 @@ export const openCaptionDatasetModal = (
     jobId: options?.jobId ?? null,
     cloneId: options?.cloneId ?? null,
     defaultCaptionExt: options?.defaultCaptionExt,
+    draftOnly: options?.draftOnly,
   });
 };
 
@@ -144,9 +146,10 @@ export const CaptionDatasetModal: React.FC = () => {
       })
       .then(async res => {
         const jobId = res.data.id;
-        await startJob(jobId);
-        // start the queue as well
-        await startQueue(gpuIDs || '');
+        if (!modalInfo.draftOnly) {
+          await startJob(jobId);
+          await startQueue(gpuIDs || '');
+        }
         isSavingRef.current = false;
         setIsSaving(false);
         handleClose();
@@ -229,7 +232,7 @@ export const CaptionDatasetModal: React.FC = () => {
               type="submit"
               className="rounded-md bg-blue-600 px-4 py-2 text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
-              Add to Queue
+              {modalInfo?.draftOnly ? 'Save stopped draft' : 'Add to Queue'}
             </button>
           </div>
         </form>

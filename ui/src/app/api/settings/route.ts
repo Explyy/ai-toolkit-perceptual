@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
 import { defaultTrainFolder, defaultDatasetsFolder, defaultModelsFolder } from '@/paths';
 import { flushCache } from '@/server/settings';
+import { sameOrigin } from '@/datasetStudio/http';
 
 export async function GET() {
   try {
@@ -25,6 +26,12 @@ export async function GET() {
       // if MODELS_PATH is not set, use default
       settingsObject.MODELS_PATH = defaultModelsFolder;
     }
+    settingsObject.HF_TOKEN_CONFIGURED = !!settingsObject.HF_TOKEN;
+    settingsObject.HF_TOKEN = '';
+    if (process.env.DATASET_STUDIO_DATASETS_ROOT)
+      settingsObject.DATASETS_FOLDER = process.env.DATASET_STUDIO_DATASETS_ROOT;
+    if (process.env.DATASET_STUDIO_TRAINING_ROOT)
+      settingsObject.TRAINING_FOLDER = process.env.DATASET_STUDIO_TRAINING_ROOT;
     return NextResponse.json(settingsObject);
   } catch (error) {
     return NextResponse.json({ error: 'Failed to fetch settings' }, { status: 500 });
@@ -33,16 +40,21 @@ export async function GET() {
 
 export async function POST(request: Request) {
   try {
+    sameOrigin(request);
     const body = await request.json();
-    const { HF_TOKEN, TRAINING_FOLDER, DATASETS_FOLDER, MODELS_PATH } = body;
+    const { HF_TOKEN, CLEAR_HF_TOKEN, TRAINING_FOLDER, DATASETS_FOLDER, MODELS_PATH } = body;
 
     // Upsert both settings
     await Promise.all([
-      prisma.settings.upsert({
-        where: { key: 'HF_TOKEN' },
-        update: { value: HF_TOKEN },
-        create: { key: 'HF_TOKEN', value: HF_TOKEN },
-      }),
+      ...(CLEAR_HF_TOKEN || HF_TOKEN
+        ? [
+            prisma.settings.upsert({
+              where: { key: 'HF_TOKEN' },
+              update: { value: CLEAR_HF_TOKEN ? '' : HF_TOKEN },
+              create: { key: 'HF_TOKEN', value: CLEAR_HF_TOKEN ? '' : HF_TOKEN },
+            }),
+          ]
+        : []),
       prisma.settings.upsert({
         where: { key: 'TRAINING_FOLDER' },
         update: { value: TRAINING_FOLDER },

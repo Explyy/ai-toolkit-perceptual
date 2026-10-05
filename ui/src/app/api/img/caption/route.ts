@@ -1,32 +1,25 @@
 import { NextResponse } from 'next/server';
-import fs from 'fs';
+import fs from 'node:fs/promises';
 import { getDatasetsRoot } from '@/server/settings';
-
+import { contained, atomic, captionPath } from '@/datasetStudio/store';
+import { body } from '@/datasetStudio/http';
+import { text, ensure, Problem } from '@/datasetStudio/domain';
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { imgPath, caption, ext } = body;
-    let datasetsPath = await getDatasetsRoot();
-    // make sure the dataset path is in the image path
-    if (!imgPath.startsWith(datasetsPath)) {
-      return NextResponse.json({ error: 'Invalid image path' }, { status: 400 });
-    }
-
-    // if img doesnt exist, ignore
-    try {
-      await fs.promises.access(imgPath);
-    } catch {
-      return NextResponse.json({ error: 'Image does not exist' }, { status: 404 });
-    }
-
-    // check for caption (default extension txt)
-    const captionExt = ((ext || 'txt') as string).replace(/^\.+/, '').trim() || 'txt';
-    const captionPath = imgPath.replace(/\.[^/.]+$/, '') + '.' + captionExt;
-    // save caption to file
-    await fs.promises.writeFile(captionPath, caption);
-
+    const x = await body(request);
+    const root = await fs.realpath(await getDatasetsRoot());
+    ensure(typeof x.imgPath === 'string', 'Image path required');
+    const image = await contained(root, x.imgPath);
+    ensure((await fs.stat(image)).isFile(), 'Image missing', 404);
+    const ext = x.ext ?? 'txt';
+    const caption = text(x.caption, 64000),
+      file = await contained(root, captionPath(image, ext), true);
+    await atomic(file, caption);
     return NextResponse.json({ success: true });
-  } catch (error) {
-    return NextResponse.json({ error: 'Failed to create dataset' }, { status: 500 });
+  } catch (e) {
+    return NextResponse.json(
+      { error: e instanceof Problem ? e.message : 'Caption save failed; draft remains unsaved' },
+      { status: e instanceof Problem ? e.status : 500 },
+    );
   }
 }
