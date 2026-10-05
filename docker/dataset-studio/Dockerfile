@@ -30,7 +30,10 @@ COPY --from=ui-build /app/ai-toolkit/studio-source.json /app/ai-toolkit/studio-s
 COPY scripts/dataset_studio_cloud.py /app/ai-toolkit/scripts/dataset_studio_cloud.py
 COPY extensions_built_in/dataset_studio_analysis /app/ai-toolkit/extensions_built_in/dataset_studio_analysis
 COPY docker/dataset-studio/analysis-requirements.txt /tmp/studio-analysis-requirements.txt
-RUN python -m pip install --no-deps -r /tmp/studio-analysis-requirements.txt && rm /tmp/studio-analysis-requirements.txt
+# The pinned Ubuntu base marks its Python externally managed (PEP 668).
+# Build-only override adds these two absent pinned packages without dependencies;
+# the final gate verifies existing NumPy/OpenCV/Torch/Transformers stay unchanged.
+RUN python -m pip install --break-system-packages --no-deps -r /tmp/studio-analysis-requirements.txt && rm /tmp/studio-analysis-requirements.txt
 COPY docker/dataset-studio/nginx.conf /etc/nginx/dataset-studio.conf
 COPY docker/dataset-studio/check_runtime.py /tmp/check_studio_runtime.py
 COPY docker/dataset-studio/check_analysis.py /tmp/check_studio_analysis.py
