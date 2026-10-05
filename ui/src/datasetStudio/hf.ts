@@ -157,7 +157,14 @@ export class Hub {
     revision(rev);
     if (folder) hubPath(folder);
     return this.pages(
-      '/api/datasets/' + repo + '/tree/' + rev + '/' + encodePath(folder) + '?recursive=' + recursive + '&limit=1000',
+      '/api/datasets/' +
+        repo +
+        '/tree/' +
+        rev +
+        (folder ? '/' + encodePath(folder) : '') +
+        '?recursive=' +
+        recursive +
+        '&limit=1000',
       20000,
     );
   }

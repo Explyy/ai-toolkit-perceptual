@@ -185,6 +185,57 @@ test('private owner catalog paginates, skips public/foreign repos and rejects ho
     Response.json([], { headers: { link: '<https://evil.example/api/datasets>; rel="next"' } })) as typeof fetch);
   await assert.rejects(malicious.pages('/api/datasets'), /Untrusted/);
 });
+test('catalog uses canonical pinned root URLs and preserves nested encoding across guarded pagination', async () => {
+  const pinned = 'a'.repeat(40),
+    root = 'https://huggingface.co/api/datasets/daverave/Personal/tree/' + pinned;
+  for (const sample of [
+    { folder: '', recursive: false, url: root + '?recursive=false&limit=1000' },
+    { folder: '', recursive: true, url: root + '?recursive=true&limit=1000' },
+    {
+      folder: 'àrea spaced/深度',
+      recursive: true,
+      url: root + '/%C3%A0rea%20spaced/%E6%B7%B1%E5%BA%A6?recursive=true&limit=1000',
+    },
+  ]) {
+    const calls: string[] = [];
+    const hub = new Hub('fixture-token', (async (url: any, init: any) => {
+      calls.push(String(url));
+      assert.equal(init.redirect, 'error');
+      assert.equal(init.headers.Authorization, 'Bearer fixture-token');
+      assert.equal(String(url), sample.url + (calls.length === 2 ? '&cursor=second' : ''));
+      return Response.json([{ path: calls.length + '.png' }], {
+        headers: calls.length === 1 ? { link: '<' + sample.url + '&cursor=second>; rel="next"' } : {},
+      });
+    }) as typeof fetch);
+    assert.deepEqual(await hub.entries('daverave/Personal', pinned, sample.folder, sample.recursive), [
+      { path: '1.png' },
+      { path: '2.png' },
+    ]);
+    assert.equal(calls.length, 2);
+  }
+});
+test('canonical root catalog still refuses foreign, changed-scope and repeated pagination before following it', async () => {
+  const pinned = 'a'.repeat(40),
+    endpoint = 'https://huggingface.co/api/datasets/daverave/Personal/tree/' + pinned + '?recursive=true&limit=1000';
+  for (const sample of [
+    { next: endpoint.replace('huggingface.co', 'evil.example'), error: /Untrusted/ },
+    { next: endpoint.replace(pinned, 'b'.repeat(40)), error: /Untrusted/ },
+    { next: endpoint.replace('recursive=true', 'recursive=false'), error: /scope changed/ },
+    { next: endpoint.replace('limit=1000', 'limit=100'), error: /scope changed/ },
+    { next: endpoint, error: /Repeated/ },
+  ]) {
+    let calls = 0;
+    const hub = new Hub('fixture-token', (async (url: any, init: any) => {
+      calls++;
+      assert.equal(String(url), endpoint);
+      assert.equal(init.redirect, 'error');
+      assert.equal(init.headers.Authorization, 'Bearer fixture-token');
+      return Response.json([], { headers: { link: '<' + sample.next + '>; rel="next"' } });
+    }) as typeof fetch);
+    await assert.rejects(hub.entries('daverave/Personal', pinned, '', true), sample.error);
+    assert.equal(calls, 1);
+  }
+});
 test('original pixels, saved captions/drafts/preferences/manual review restore; caption edit uploads no unchanged pixels', async () => {
   const f = await fixture(),
     h = server();
