@@ -28,7 +28,18 @@ export type Outbox = {
   reason?: string;
   retryAt?: number;
   lastRemoteFailure?: { status: number; at: number; retryAt: number };
-  metadataRecoveries?: Record<string, { digest: string; parent: string; baseDigest?: string; attemptedAt: number }>;
+  metadataRecoveries?: Record<
+    string,
+    {
+      digest: string;
+      parent: string;
+      baseDigest?: string;
+      attemptedAt: number;
+      originalParent?: string;
+      commits?: string[];
+      proofDigest?: string;
+    }
+  >;
   blobRecoveries?: Record<
     string,
     {
@@ -222,8 +233,7 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
     const state = await st.read();
     await st.locked(() => recordLocal(st, state, now));
     let o = await readOutbox(st);
-    const legacyBusy =
-      o?.phase === 'conflict' && o.reason === 'Dataset operation active; refresh' && !!o.active && !o.active.blob;
+    const legacyBusy = o?.phase === 'conflict' && o.reason === 'Dataset operation active; refresh' && !!o.active;
     if (
       !o ||
       (o.retryAt ?? 0) > now ||
@@ -254,14 +264,14 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
           409,
         );
       };
-      const verifyRetained = async (rev: string) => {
+      const verifyRetained = async (rev?: string) => {
         for (const image of o!.active!.projection.images) {
           const source = state.images.find(
             x => x.relative === image.relative && x.sha === image.sha && x.size === image.size,
           );
           ensure(source, 'Managed recovery original changed', 409);
           await st.source(source);
-          ensure(await verifyBlob(hub, o!, rev, image), 'Managed recovery original missing', 409);
+          if (rev) ensure(await verifyBlob(hub, o!, rev, image), 'Managed recovery original missing', 409);
         }
       };
       if (legacyBusy) {
@@ -274,9 +284,26 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
           'Remote dataset divergence; both versions preserved',
           409,
         );
-        await verifyRetained(info.sha);
+        const blob = o.active!.blob;
+        if (blob) {
+          ensure(
+            !o.active!.revision &&
+              ['uploading', 'commit_started'].includes(blob.phase) &&
+              /^[0-9a-f]{40}$/.test(blob.parent) &&
+              /^[0-9a-f]{64}$/.test(blob.sha) &&
+              Number.isSafeInteger(blob.size) &&
+              blob.size > 0 &&
+              blob.path === root(o.key) + '/blobs/' + blob.sha &&
+              o.active!.projection.images.some(x => x.sha === blob.sha && x.size === blob.size),
+            'Managed recovery blob identity differs',
+            409,
+          );
+        }
+        // A pending original can precede the other uploads. Its durable unknown
+        // receipt goes through the existing blob readback/history path below.
+        await verifyRetained(blob ? undefined : info.sha);
         await update(x => {
-          x.phase = 'commit_started';
+          x.phase = blob && p?.digest !== o!.active!.digest ? 'uploading' : 'commit_started';
           x.reason = 'Esito HF da verificare; curatela locale conservata.';
         });
       }
@@ -298,7 +325,6 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
           const active = o.active;
           ensure(p?.digest === active.baseDigest, 'Remote dataset divergence; both versions preserved', 409);
           validateActive();
-          const attemptKey = hash(active.parent + ':' + active.digest);
           const attempts = o.metadataRecoveries ?? {};
           ensure(typeof attempts === 'object' && !Array.isArray(attempts), 'Invalid metadata recovery receipt', 409);
           for (const [key, attempt] of Object.entries(attempts)) {
@@ -313,26 +339,69 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
               'Invalid metadata recovery receipt',
               409,
             );
+            if (
+              attempt.originalParent !== undefined ||
+              attempt.commits !== undefined ||
+              attempt.proofDigest !== undefined
+            ) {
+              ensure(
+                /^[0-9a-f]{40}$/.test(attempt.originalParent ?? '') &&
+                  Array.isArray(attempt.commits) &&
+                  attempt.commits.length > 0 &&
+                  attempt.commits.length <= 200 &&
+                  new Set(attempt.commits).size === attempt.commits.length &&
+                  attempt.commits.every(x => /^[0-9a-f]{40}$/.test(x)) &&
+                  attempt.commits[0] === attempt.parent &&
+                  attempt.commits.at(-1) === attempt.originalParent &&
+                  attempt.proofDigest ===
+                    hash(
+                      stableJSON({
+                        digest: attempt.digest,
+                        originalParent: attempt.originalParent,
+                        parent: attempt.parent,
+                        baseDigest: attempt.baseDigest,
+                        commits: attempt.commits,
+                      }),
+                    ),
+                'Invalid metadata historical proof',
+                409,
+              );
+            }
           }
           // One exact-parent replay is safe even while the original request is
           // still in flight: parentCommit allows at most one of them to apply.
-          // Changed HEAD or any prior attempt remains readback-only forever.
+          // A proven descendant can fence the old POST, but only complete
+          // historical absence and unchanged dataset base permit one new CAS.
+          // Any previous recovery for this digest stays readback-only forever.
           if (
             !active.blob &&
             !active.revision &&
-            info.sha === active.parent &&
             !Object.values(o.metadataRecoveries ?? {}).some(x => x.digest === active.digest)
           ) {
-            await verifyRetained(info.sha);
-            if (active.baseDigest) {
-              const bytes = await hub.download(
-                o.repo,
-                info.sha,
-                root(o.key) + '/versions/' + active.baseDigest + '.json',
-                LIMIT,
+            const commits =
+              info.sha === active.parent ? [info.sha] : await hub.historyTo(o.repo, info.sha, active.parent);
+            for (const rev of commits) {
+              ensure(
+                !(await hub.optional(o.repo, rev, root(o.key) + '/versions/' + active.digest + '.json', LIMIT)),
+                'Managed metadata existed in history; both versions preserved',
+                409,
               );
-              ensure(hash(bytes) === active.baseDigest, 'Managed recovery base changed', 409);
+              ensure(
+                (await pointer(hub, o.repo, rev, o.key))?.digest === active.baseDigest,
+                'Managed pointer diverged in history; both versions preserved',
+                409,
+              );
+              if (active.baseDigest) {
+                const bytes = await hub.download(
+                  o.repo,
+                  rev,
+                  root(o.key) + '/versions/' + active.baseDigest + '.json',
+                  LIMIT,
+                );
+                ensure(hash(bytes) === active.baseDigest, 'Managed recovery base changed in history', 409);
+              }
             }
+            await verifyRetained(info.sha);
             const operations = [
               await hub.upload(
                 o.repo,
@@ -352,7 +421,7 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
             );
             const fresh = await hub.info(o.repo),
               current = await pointer(hub, o.repo, fresh.sha, o.key);
-            if (fresh.sha === active.parent && current?.digest === active.baseDigest) {
+            if (fresh.sha === info.sha && current?.digest === active.baseDigest) {
               await update(async asyncGuard => {
                 ensure(
                   asyncGuard.phase === 'commit_started' &&
@@ -375,14 +444,25 @@ export async function drainManaged(st: StudioStore, hub: Hub, clock: number | ((
                   ensure(source, 'Managed recovery original changed', 409);
                   await st.source(source);
                 }
-                (asyncGuard.metadataRecoveries ??= {})[attemptKey] = {
+                (asyncGuard.metadataRecoveries ??= {})[hash(info.sha + ':' + active.digest)] = {
                   digest: active.digest,
-                  parent: active.parent,
+                  parent: info.sha,
+                  originalParent: active.parent,
+                  commits,
+                  proofDigest: hash(
+                    stableJSON({
+                      digest: active.digest,
+                      originalParent: active.parent,
+                      parent: info.sha,
+                      baseDigest: active.baseDigest,
+                      commits,
+                    }),
+                  ),
                   baseDigest: active.baseDigest,
                   attemptedAt: observeTime(),
                 };
               });
-              const committed = await hub.commit(o.repo, active.parent, operations, active.digest);
+              const committed = await hub.commit(o.repo, info.sha, operations, active.digest);
               await update(x => {
                 x.active!.revision = committed;
                 x.phase = 'verifying';

@@ -1,7 +1,55 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ActionLane } from '../src/datasetStudio/actionLane';
+import { ActionLane, LoadErrorOwner } from '../src/datasetStudio/actionLane';
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+test('a successful current reload clears only its previous same-dataset load failure', () => {
+  const errors = new LoadErrorOwner(),
+    owner = {};
+  assert.equal(errors.failed(errors.begin(owner), owner), true);
+  assert.equal(errors.succeeded(errors.begin(owner), owner), true);
+  assert.equal(errors.succeeded(errors.begin(owner), owner), false);
+});
+test('reload preserves earlier and later action/save errors and protected draft warnings', () => {
+  const errors = new LoadErrorOwner(),
+    owner = {};
+  errors.action();
+  assert.equal(errors.succeeded(errors.begin(owner), owner), false);
+  assert.equal(errors.failed(errors.begin(owner), owner), true);
+  const read = errors.begin(owner);
+  errors.action();
+  assert.equal(errors.succeeded(read, owner), false);
+  assert.equal(errors.failed(read, owner), false);
+});
+test('older requests and dataset epochs cannot overwrite or clear newer load errors', () => {
+  const errors = new LoadErrorOwner(),
+    a = {},
+    b = {},
+    newA = {};
+  const old = errors.begin(a),
+    latest = errors.begin(a);
+  assert.equal(errors.failed(latest, a), true);
+  assert.equal(errors.current(old, a), false);
+  assert.equal(errors.succeeded(old, a), false);
+  assert.equal(errors.failed(old, a), false);
+  assert.equal(errors.failed(errors.begin(a), b), false);
+  const pending = errors.begin(a);
+  assert.equal(errors.succeeded(pending, newA), false);
+  assert.equal(errors.failed(pending, newA), false);
+  errors.action();
+  assert.equal(errors.succeeded(errors.begin(newA), newA), false);
+});
+test('the current manual reload cannot replace a newer accepted curation revision or clear its load error', () => {
+  const errors = new LoadErrorOwner(),
+    owner = {};
+  assert.equal(errors.failed(errors.begin(owner), owner), true);
+  const pending = errors.begin(owner);
+  assert.equal(errors.accepts(pending, owner, 81, 82), false);
+  // Workspace calls succeeded only after accepting a current, nonstale view.
+  assert.equal(errors.accepts(pending, owner, 82, 82), true);
+  assert.equal(errors.succeeded(pending, owner), true);
+  assert.equal(errors.accepts(errors.begin(owner), owner, 81), true);
+  assert.equal(errors.accepts(errors.begin(owner), {}, 83, 82), false);
+});
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>(r => {

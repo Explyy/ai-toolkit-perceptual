@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { apiClient } from '@/utils/api';
 import { TopBar, MainContent } from '@/components/layout';
 import AdvancedWorkspace from './AdvancedWorkspace';
-import { ActionLane } from './actionLane';
+import { ActionLane, LoadErrorOwner } from './actionLane';
 import GalleryImageCard from './GalleryImageCard';
 import { MembershipController, membershipFailure, rebaseGalleryDrafts, galleryVisible, gallerySections, galleryCategories, categoryLabels, MembershipFilter } from './gallerySelection';
 import { captionModels, defaultCaptionModel, CaptionPreferences } from './captionModels';
@@ -38,7 +38,7 @@ function initialPreferences(s: State): CaptionPreferences {
 }
 export default function Workspace({ dataset, onNativeView }: { dataset: string; onNativeView: () => void }) {
   const [state, setState] = useState<View | null>(null),
-    [error, setError] = useState(''),
+    [error, writeError] = useState(''),
     [busy, setBusy] = useState(''),
     [search, setSearch] = useState(''),
     [target, setTarget] = useState('3'),
@@ -66,6 +66,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     activeDataset = useRef(dataset),
     initialized = useRef(''),
     lane = useRef(new ActionLane()),
+    loadErrors = useRef(new LoadErrorOwner()),
     scope = useRef({ dataset, epoch: 0 }),
     userPending = useRef(0),
     intentSequence = useRef(0),
@@ -80,6 +81,10 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
   activeDataset.current = dataset;
   if (scope.current.dataset !== dataset) scope.current = { dataset, epoch: scope.current.epoch + 1 };
   draftRef.current = drafts;
+  function setError(message: string) {
+    loadErrors.current.action();
+    writeError(message);
+  }
   const [, repaintMembership] = useState(0);
   const membershipOwner = useRef<{scope: object; controller: MembershipController<View>} | null>(null);
   if (membershipOwner.current?.scope !== scope.current) {
@@ -147,12 +152,16 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
   }
   async function refresh() {
     const owner = scope.current;
+    const request = loadErrors.current.begin(owner);
     try {
       const r = await apiClient.get('/api/dataset-studio', { params: { dataset } });
-      if (scope.current === owner) accept(r.data);
+      if (r.data.dataset !== owner.dataset ||
+          !loadErrors.current.accepts(request, scope.current, r.data.revision, current.current?.revision)) return;
+      accept(r.data);
+      if (loadErrors.current.succeeded(request, scope.current)) writeError('');
     } catch {
-      if (scope.current !== owner) return;
-      setError('Dataset non disponibile. Controlla la connessione e ricarica.');
+      if (loadErrors.current.failed(request, scope.current))
+        writeError('Dataset non disponibile. Controlla la connessione e ricarica.');
     }
   }
   async function request(action: string, payload: any = {}) {

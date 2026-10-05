@@ -1,3 +1,45 @@
+type LoadRequest = { owner: object; sequence: number; errorRevision: number };
+
+// A read may clear its previous load failure, but never a later action/save error.
+export class LoadErrorOwner {
+  private sequence = 0;
+  private errorRevision = 0;
+  private loadError: { owner: object; revision: number } | null = null;
+  action() {
+    this.errorRevision++;
+    this.loadError = null;
+  }
+  begin(owner: object): LoadRequest {
+    return { owner, sequence: ++this.sequence, errorRevision: this.errorRevision };
+  }
+  current(request: LoadRequest, owner: object) {
+    return request.owner === owner && request.sequence === this.sequence;
+  }
+  accepts(request: LoadRequest, owner: object, receivedRevision: number, currentRevision?: number) {
+    return (
+      this.current(request, owner) &&
+      Number.isSafeInteger(receivedRevision) &&
+      (currentRevision === undefined || receivedRevision >= currentRevision)
+    );
+  }
+  failed(request: LoadRequest, owner: object) {
+    if (!this.current(request, owner) || request.errorRevision !== this.errorRevision) return false;
+    this.loadError = { owner, revision: ++this.errorRevision };
+    return true;
+  }
+  succeeded(request: LoadRequest, owner: object) {
+    if (
+      !this.current(request, owner) ||
+      request.errorRevision !== this.errorRevision ||
+      this.loadError?.owner !== owner ||
+      this.loadError.revision !== this.errorRevision
+    )
+      return false;
+    this.action();
+    return true;
+  }
+}
+
 // One page-local lane. Pending user intents take priority over new background work.
 export class ActionLane {
   private occupied = false;

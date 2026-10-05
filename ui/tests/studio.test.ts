@@ -190,7 +190,14 @@ test('native bucket boundaries and deterministic quota/pin conflicts are explici
     assert.equal(select(s.images, 3).complete, true);
     s = await f.st.edit(s.revision, [s.images[0].id], { excluded: 1 });
     assert.equal(select(s.images, 3).complete, false);
-    await assert.rejects(f.st.prepareExport(s.revision), /quotas/);
+    const exported = await f.st.prepareExport(s.revision);
+    assert.deepEqual(
+      exported.snapshots[0].source.map(x => x.id),
+      s.images
+        .filter(x => !x.excluded)
+        .sort((a, b) => a.sha.localeCompare(b.sha))
+        .map(x => x.id),
+    );
   } finally {
     await f.cleanup();
   }
@@ -224,6 +231,82 @@ test('real JPEG/TXT export reads back immutable SHA+size, raw manifest digest an
     s = await f.st.finishExport(s.revision, next.id);
     assert(s.snapshots.at(-1)!.files.some(f => f.path === 'test/prompt.txt'));
     assert.deepEqual(await fs.readFile(await f.st.file(v.id, 'manifest.json')), old);
+  } finally {
+    await f.cleanup();
+  }
+});
+test('manual export ignores proposal count/categories/pins and preserves committed captions, drafts and membership', async () => {
+  const f = await fixture();
+  try {
+    let s = await f.st.read();
+    const first = s.images[0].id;
+    s = await f.st.edit(s.revision, [first], {
+      caption: 'Committed manual caption',
+      baseRevision: s.images[0].revision,
+    });
+    s = await f.st.captionDraft(
+      s.revision,
+      first,
+      { caption: 'Protected unsaved typing', baseRevision: s.images[0].revision },
+      0,
+    );
+    s = await f.st.edit(s.revision, [s.images[2].id], { excluded: 1, pinned: 1 });
+    s = await f.st.mutate(s.revision, state => {
+      state.settings.count = 30;
+    });
+    assert.equal(select(s.images, 30).complete, false);
+    const curation = stableJSON(s.images),
+      target = s.settings.count;
+    const before = await Promise.all(s.images.map(x => f.st.source(x)));
+    s = await f.st.prepareExport(s.revision);
+    const snapshot = s.snapshots.at(-1)!;
+    assert.equal(snapshot.source.length, 2);
+    assert.deepEqual(
+      snapshot.source.map(x => x.id),
+      s.images
+        .filter(x => !x.excluded)
+        .sort((a, b) => a.sha.localeCompare(b.sha))
+        .map(x => x.id),
+    );
+    assert.equal(snapshot.manifest.settings.count, target);
+    assert.equal(snapshot.source.find(x => x.id === first)!.caption, 'Committed manual caption');
+    for (let i = 0; i < snapshot.source.length; i++) s = await f.st.exportFile(s.revision, snapshot.id, i);
+    s = await f.st.finishExport(s.revision, snapshot.id);
+    const reopened = await f.st.read();
+    assert.equal(stableJSON(reopened.images), curation);
+    assert.equal(reopened.settings.count, 30);
+    const captionFile =
+      'training/' + String(snapshot.source.findIndex(x => x.id === first) + 1).padStart(6, '0') + '.txt';
+    assert.equal(await fs.readFile(await f.st.file(snapshot.id, captionFile), 'utf8'), 'Committed manual caption');
+    for (const [i, image] of reopened.images.entries()) assert.deepEqual(await f.st.source(image), before[i]);
+  } finally {
+    await f.cleanup();
+  }
+});
+test('manual export excludes only an explicit test reference and refuses empty or missing sources without snapshots', async () => {
+  const f = await fixture();
+  try {
+    let s = await f.st.read();
+    s = await f.st.mutate(s.revision, state => {
+      state.settings.testId = state.images[1].id;
+    });
+    s = await f.st.prepareExport(s.revision);
+    assert.equal(s.snapshots[0].source.length, 2);
+    assert(!s.snapshots[0].source.some(x => x.id === s.settings.testId));
+    const existing = stableJSON(s.snapshots);
+    s = await f.st.edit(
+      s.revision,
+      s.images.filter(x => x.id !== s.settings.testId).map(x => x.id),
+      { excluded: 1 },
+    );
+    await assert.rejects(f.st.prepareExport(s.revision), /almeno un/);
+    assert.equal(stableJSON((await f.st.raw()).snapshots), existing);
+    for (const image of s.images) await fs.unlink(path.join(f.st.datasetRoot, image.relative));
+    await assert.rejects(f.st.prepareExport(s.revision), /Stale/);
+    s = await f.st.read();
+    assert.equal(s.images.length, 0);
+    await assert.rejects(f.st.prepareExport(s.revision), /almeno un/);
+    assert.equal(stableJSON((await f.st.raw()).snapshots), existing);
   } finally {
     await f.cleanup();
   }
@@ -791,86 +874,136 @@ test('actual native GIF/BMP upload preserves valid source bytes and all original
 test('membership validates all targets before save: changed bytes, TXT and symlinks refuse the entire bulk', async () => {
   const f = await fixture();
   try {
-    const s = await f.st.read(), ids = s.images.slice(0, 2).map(x => x.id);
-    const stateFile = path.join(f.st.folder, 'state.json'), before = await fs.readFile(stateFile);
-    const outboxFile = path.join(f.st.folder, 'managed-outbox.json'), outbox = await fs.readFile(outboxFile);
-    const file = path.join(f.st.datasetRoot, s.images[1].relative), original = await fs.readFile(file);
+    const s = await f.st.read(),
+      ids = s.images.slice(0, 2).map(x => x.id);
+    const stateFile = path.join(f.st.folder, 'state.json'),
+      before = await fs.readFile(stateFile);
+    const outboxFile = path.join(f.st.folder, 'managed-outbox.json'),
+      outbox = await fs.readFile(outboxFile);
+    const file = path.join(f.st.datasetRoot, s.images[1].relative),
+      original = await fs.readFile(file);
     // Same length, different bytes: size/mtime shortcuts cannot accept this.
-    const changed = Buffer.from(original); changed[changed.length - 1] ^= 1;
+    const changed = Buffer.from(original);
+    changed[changed.length - 1] ^= 1;
     await fs.writeFile(file, changed);
-    await assert.rejects(f.st.edit(s.revision, ids, {excluded: 1}), /image changed/i);
+    await assert.rejects(f.st.edit(s.revision, ids, { excluded: 1 }), /image changed/i);
     assert.deepEqual(await fs.readFile(stateFile), before);
     assert.deepEqual(await fs.readFile(outboxFile), outbox);
     await fs.writeFile(file, original);
-    const txt = file.replace('.png', '.txt'), caption = await fs.readFile(txt);
+    const txt = file.replace('.png', '.txt'),
+      caption = await fs.readFile(txt);
     await fs.writeFile(txt, 'Externally changed');
-    await assert.rejects(f.st.edit(s.revision, ids, {excluded: 1}), /caption changed/i);
+    await assert.rejects(f.st.edit(s.revision, ids, { excluded: 1 }), /caption changed/i);
     assert.deepEqual(await fs.readFile(stateFile), before);
     await fs.writeFile(txt, caption);
-    await fs.unlink(file); await fs.symlink(path.join(f.st.datasetRoot, s.images[0].relative), file);
-    await assert.rejects(f.st.edit(s.revision, ids, {excluded: 1}), /symlink/i);
+    await fs.unlink(file);
+    await fs.symlink(path.join(f.st.datasetRoot, s.images[0].relative), file);
+    await assert.rejects(f.st.edit(s.revision, ids, { excluded: 1 }), /symlink/i);
     assert.deepEqual(await fs.readFile(stateFile), before);
-    await fs.unlink(file); await fs.writeFile(file, original);
-    await fs.unlink(txt); await fs.symlink(path.join(f.st.datasetRoot, s.images[0].relative.replace('.png', '.txt')), txt);
-    await assert.rejects(f.st.edit(s.revision, ids, {excluded: 1}), /symlink/i);
+    await fs.unlink(file);
+    await fs.writeFile(file, original);
+    await fs.unlink(txt);
+    await fs.symlink(path.join(f.st.datasetRoot, s.images[0].relative.replace('.png', '.txt')), txt);
+    await assert.rejects(f.st.edit(s.revision, ids, { excluded: 1 }), /symlink/i);
     assert.deepEqual(await fs.readFile(stateFile), before);
-  } finally { await f.cleanup(); }
+  } finally {
+    await f.cleanup();
+  }
 });
 test('membership preserves protected captions, legacy tags and managed outbox; manual review/image CAS advance', async () => {
   const f = await fixture();
   try {
-    let s = await f.st.read(), id = s.images[0].id;
-    s = await f.st.edit(s.revision, [id], {caption: 'Manual caption', tags: ['legacy'], baseRevision: s.images[0].revision});
-    s = await f.st.captionDraft(s.revision, id, {caption: 'Later protected draft', baseRevision: s.images[0].revision}, 0);
-    const image = structuredClone(s.images[0]), oldOutbox = JSON.parse(await fs.readFile(path.join(f.st.folder, 'managed-outbox.json'), 'utf8'));
-    s = await f.st.edit(s.revision, [id], {excluded: 1});
+    let s = await f.st.read(),
+      id = s.images[0].id;
+    s = await f.st.edit(s.revision, [id], {
+      caption: 'Manual caption',
+      tags: ['legacy'],
+      baseRevision: s.images[0].revision,
+    });
+    s = await f.st.captionDraft(
+      s.revision,
+      id,
+      { caption: 'Later protected draft', baseRevision: s.images[0].revision },
+      0,
+    );
+    const image = structuredClone(s.images[0]),
+      oldOutbox = JSON.parse(await fs.readFile(path.join(f.st.folder, 'managed-outbox.json'), 'utf8'));
+    s = await f.st.edit(s.revision, [id], { excluded: 1 });
     assert.equal(s.images[0].revision, image.revision + 1);
     assert.equal(s.images[0].reviewRevision, (image.reviewRevision ?? 0) + 1);
     assert.equal(s.images[0].caption, 'Manual caption');
     assert.equal(s.images[0].captionDraft?.caption, image.captionDraft!.caption);
     assert.equal(s.images[0].captionDraft?.baseRevision, s.images[0].revision);
     assert.equal(s.images[0].captionDraftRevision, image.captionDraftRevision! + 1);
-    await assert.rejects(f.st.captionDraft(s.revision, id, {caption: 'Concurrent old tab', baseRevision: image.revision}, image.captionDraftRevision!), /nessun overwrite/);
+    await assert.rejects(
+      f.st.captionDraft(
+        s.revision,
+        id,
+        { caption: 'Concurrent old tab', baseRevision: image.revision },
+        image.captionDraftRevision!,
+      ),
+      /nessun overwrite/,
+    );
     assert.deepEqual(s.images[0].tags, ['legacy']);
     const outbox = JSON.parse(await fs.readFile(path.join(f.st.folder, 'managed-outbox.json'), 'utf8'));
     assert.notEqual(outbox.desired, oldOutbox.desired);
     assert.equal(outbox.phase, 'pending');
-    await assert.rejects(f.st.edit(s.revision, [id], {caption: 'Stale save', baseRevision: image.revision}), /draft retained/);
+    await assert.rejects(
+      f.st.edit(s.revision, [id], { caption: 'Stale save', baseRevision: image.revision }),
+      /draft retained/,
+    );
     // Reopening restores a fresh protected draft that can save without another edit.
     s = await f.st.read();
-    s = await f.st.edit(s.revision, [id], {caption: s.images[0].captionDraft!.caption, baseRevision: s.images[0].captionDraft!.baseRevision});
+    s = await f.st.edit(s.revision, [id], {
+      caption: s.images[0].captionDraft!.caption,
+      baseRevision: s.images[0].captionDraft!.baseRevision,
+    });
     const loaded = await f.st.read();
     assert.equal(loaded.images[0].caption, 'Later protected draft');
     assert.equal(loaded.images[0].captionDraft, undefined);
     assert.deepEqual(loaded.images[0].tags, ['legacy']);
-    s = await f.st.edit(loaded.revision, [id], {excluded: 0});
+    s = await f.st.edit(loaded.revision, [id], { excluded: 0 });
     assert.equal((await f.st.read()).images[0].excluded, 0);
-  } finally { await f.cleanup(); }
+  } finally {
+    await f.cleanup();
+  }
 });
 test('targeted membership is not discovery; authoritative read still hashes and discovers changed untargeted originals', async () => {
   const f = await fixture();
   try {
-    const s = await f.st.read(), unrelated = s.images[2];
+    const s = await f.st.read(),
+      unrelated = s.images[2];
     const source = path.join(f.st.datasetRoot, unrelated.relative);
-    const bytes = await sharp({create:{width:1536,height:1024,channels:3,background:'#abcdef'}}).png().toBuffer();
+    const bytes = await sharp({ create: { width: 1536, height: 1024, channels: 3, background: '#abcdef' } })
+      .png()
+      .toBuffer();
     await fs.writeFile(source, bytes);
-    const saved = await f.st.edit(s.revision, [s.images[0].id], {excluded: 1});
+    const saved = await f.st.edit(s.revision, [s.images[0].id], { excluded: 1 });
     assert.equal(saved.images[2].sha, unrelated.sha);
     const discovered = await f.st.read();
     assert.equal(discovered.images.find(x => x.filename === unrelated.filename)!.sha, hash(bytes));
     assert.notEqual(discovered.images.find(x => x.filename === unrelated.filename)!.id, unrelated.id);
     assert.equal(discovered.images[0].excluded, 1);
-  } finally { await f.cleanup(); }
+  } finally {
+    await f.cleanup();
+  }
 });
 test('membership never rebases an already stale caption draft', async () => {
   const f = await fixture();
   try {
-    let s = await f.st.read(), id = s.images[0].id;
-    s = await f.st.captionDraft(s.revision, id, {caption: 'Protected stale text', baseRevision: -1}, 0);
-    const draft = structuredClone(s.images[0].captionDraft), token = s.images[0].captionDraftRevision;
-    s = await f.st.edit(s.revision, [id], {excluded: 1});
+    let s = await f.st.read(),
+      id = s.images[0].id;
+    s = await f.st.captionDraft(s.revision, id, { caption: 'Protected stale text', baseRevision: -1 }, 0);
+    const draft = structuredClone(s.images[0].captionDraft),
+      token = s.images[0].captionDraftRevision;
+    s = await f.st.edit(s.revision, [id], { excluded: 1 });
     assert.deepEqual(s.images[0].captionDraft, draft);
     assert.equal(s.images[0].captionDraftRevision, token);
-    await assert.rejects(f.st.edit(s.revision, [id], {caption: draft!.caption, baseRevision: draft!.baseRevision}), /draft retained/);
-  } finally { await f.cleanup(); }
+    await assert.rejects(
+      f.st.edit(s.revision, [id], { caption: draft!.caption, baseRevision: draft!.baseRevision }),
+      /draft retained/,
+    );
+  } finally {
+    await f.cleanup();
+  }
 });

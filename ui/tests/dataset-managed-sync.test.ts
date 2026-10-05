@@ -982,7 +982,7 @@ test('old and recovery CAS race applies one operation; applied/lost response ado
 test('unknown recovery never replays after restart; changed HEAD, divergence and invalid identity refuse', async () => {
   for (const scenario of [
     'unknown',
-    'head-changed',
+    'missing-parent',
     'diverged',
     'tampered',
     'source-changed',
@@ -994,7 +994,11 @@ test('unknown recovery never replays after restart; changed HEAD, divergence and
       h = server();
     try {
       const old = await legacyBusy(f, h);
-      if (scenario === 'head-changed') h.bump();
+      if (scenario === 'missing-parent') {
+        old.active!.parent = 'f'.repeat(40);
+        await fs.writeFile(path.join(f.st.folder, 'managed-outbox.json'), stableJSON(old));
+        h.bump();
+      }
       if (scenario === 'diverged')
         h.files.set(
           managedRoot(old.key) + '/current.json',
@@ -1038,11 +1042,244 @@ test('unknown recovery never replays after restart; changed HEAD, divergence and
       if (scenario === 'unknown') {
         assert.equal(after.phase, 'commit_started');
         assert.equal(Object.keys(after.metadataRecoveries!).length, 1);
-      } else if (scenario === 'head-changed') assert.equal(after.phase, 'commit_started');
-      else assert.equal(after.phase, 'conflict');
+      } else assert.equal(after.phase, 'conflict');
       await drainManaged(await new StudioStore(f.data, f.datasets, 'native').init(), hub, Date.now() + 20000);
       assert.equal(posts, scenario === 'unknown' ? 1 : 0);
       assert.ok((await readOutbox(f.st))!.active);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test('legacy busy with an uncertain blob resumes verified readback or one bounded recovery without requiring unuploaded originals', async () => {
+  for (const applied of [true, false]) {
+    const f = await fixture(),
+      h = server();
+    try {
+      let first = true;
+      const lost = new Hub('fixture', (async (url: any, init: any) => {
+        if (first && String(url).endsWith('/commit/main')) {
+          first = false;
+          if (applied) await h.transport(url, init);
+          throw Error('uncertain original');
+        }
+        return h.transport(url, init);
+      }) as typeof fetch);
+      await drainManaged(f.st, lost, Date.now() + 10000);
+      const old = (await readOutbox(f.st))!;
+      assert.equal(old.active!.blob!.phase, 'commit_started');
+      const original = structuredClone(old.active!.blob!);
+      old.phase = 'conflict';
+      old.reason = 'Dataset operation active; refresh';
+      await fs.writeFile(path.join(f.st.folder, 'managed-outbox.json'), stableJSON(old));
+      const s = await f.st.read();
+      await f.st.edit(s.revision, [s.images[0].id], { caption: 'newer saved caption', excluded: 1 });
+      const durable = await f.st.raw();
+      h.bump();
+      const posts = h.commits;
+      await drainManaged(f.st, h.hub, Date.now() + 20000);
+      const pending = (await readOutbox(f.st))!;
+      assert.equal(pending.phase, 'pending');
+      assert.equal(pending.baseDigest, old.active!.digest);
+      assert.equal(h.commits - posts, applied ? 3 : 4);
+      if (applied) assert.equal(pending.blobRecoveries?.[original.sha], undefined);
+      else assert.deepEqual(pending.blobRecoveries![original.sha].original, original);
+      assert.deepEqual(await f.st.raw(), durable);
+      await drainManaged(f.st, h.hub, Date.now() + 30000);
+      assert.equal((await readOutbox(f.st))!.phase, 'synced');
+      assert.deepEqual(await f.st.raw(), durable);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test('unknown metadata recovers at a proven descendant once, retaining original parent and latest curation', async () => {
+  const f = await fixture(),
+    h = server();
+  try {
+    const old = await legacyBusy(f, h),
+      original = structuredClone(old.active!);
+    h.bump();
+    h.bump();
+    const proven = h.head,
+      posts = h.commits;
+    let typed = false;
+    const hub = new Hub('fixture', (async (url: any, init: any) => {
+      if (!typed && String(url).endsWith('/preupload/main')) {
+        typed = true;
+        const s = await f.st.read();
+        await f.st.edit(s.revision, [s.images[0].id], { caption: 'latest during historical proof', excluded: 1 });
+      }
+      return h.transport(url, init);
+    }) as typeof fetch);
+    await drainManaged(f.st, hub, Date.now() + 10000);
+    const pending = (await readOutbox(f.st))!;
+    assert.equal(pending.phase, 'pending');
+    assert.equal(pending.baseDigest, original.digest);
+    assert.equal(h.commits, posts + 1);
+    const receipt = Object.values(pending.metadataRecoveries!)[0] as any;
+    assert.equal(receipt.parent, proven);
+    assert.equal(receipt.originalParent, original.parent);
+    assert.deepEqual(receipt.commits, [
+      proven,
+      (BigInt('0x' + proven) - BigInt(1)).toString(16).padStart(40, '0'),
+      original.parent,
+    ]);
+    assert.match(receipt.proofDigest, /^[0-9a-f]{64}$/);
+    const durable = await f.st.raw();
+    const beforeLate = h.head;
+    await assert.rejects(
+      h.hub.commit('daverave/Personal', original.parent, [], original.digest),
+      (e: any) => e.remoteStatus === 409,
+    );
+    assert.equal(h.head, beforeLate);
+    await drainManaged(await new StudioStore(f.data, f.datasets, 'native').init(), h.hub, Date.now() + 20000);
+    assert.equal((await readOutbox(f.st))!.phase, 'synced');
+    assert.deepEqual(await f.st.raw(), durable);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('historical metadata, pointer or base changes refuse even when current bytes look restored; incomplete proof never posts', async () => {
+  for (const scenario of [
+    'version-deleted',
+    'pointer-restored',
+    'base-restored',
+    'cap',
+    'foreign',
+    'non404',
+    'head-during-proof',
+  ]) {
+    const f = await fixture(),
+      h = server();
+    try {
+      const old = await legacyBusy(f, h),
+        active = structuredClone(old.active!),
+        prefix = managedRoot(old.key);
+      h.bump();
+      if (scenario === 'version-deleted')
+        h.files.set(prefix + '/versions/' + active.digest + '.json', Buffer.from(stableJSON(active.projection)));
+      if (scenario === 'pointer-restored')
+        h.files.set(
+          prefix + '/current.json',
+          Buffer.from(stableJSON({ schema: 1, key: old.key, digest: 'f'.repeat(64) })),
+        );
+      const basePath = prefix + '/versions/' + active.baseDigest + '.json',
+        base = Buffer.from(h.files.get(basePath)!);
+      if (scenario === 'base-restored') h.files.set(basePath, Buffer.from('corrupted historic base'));
+      h.bump();
+      h.files.delete(prefix + '/versions/' + active.digest + '.json');
+      h.files.set(
+        prefix + '/current.json',
+        Buffer.from(stableJSON({ schema: 1, key: old.key, digest: active.baseDigest })),
+      );
+      h.files.set(basePath, base);
+      if (scenario === 'cap') for (let i = 0; i < 201; i++) h.bump();
+      const durable = await f.st.raw(),
+        posts = h.commits;
+      let bumped = false;
+      const hub = new Hub('fixture', (async (url: any, init: any) => {
+        if (scenario === 'foreign' && String(url).includes('/commits/'))
+          return Response.json([{ id: h.head }], { headers: { link: '<https://foreign.example/next>; rel="next"' } });
+        if (
+          scenario === 'non404' &&
+          String(url).includes('/paths-info/') &&
+          JSON.parse(init.body).paths[0] === prefix + '/versions/' + active.digest + '.json'
+        )
+          return new Response('', { status: 503 });
+        if (scenario === 'head-during-proof' && !bumped && String(url).endsWith('/preupload/main')) {
+          bumped = true;
+          h.bump();
+        }
+        return h.transport(url, init);
+      }) as typeof fetch);
+      await drainManaged(f.st, hub, Date.now() + 10000);
+      const after = (await readOutbox(f.st))!;
+      assert.equal(h.commits, posts, scenario);
+      assert.equal(stableJSON(after.active), stableJSON(active), scenario);
+      assert.equal(after.metadataRecoveries, undefined, scenario);
+      assert.deepEqual(await f.st.raw(), durable, scenario);
+      assert.equal(
+        after.phase,
+        ['non404', 'head-during-proof'].includes(scenario) ? 'commit_started' : 'conflict',
+        scenario,
+      );
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test('descendant recovery loss or receipt contention consumes one durable attempt across restart and further head advances', async () => {
+  for (const scenario of ['unapplied', 'lost-applied', 'busy-after']) {
+    const f = await fixture(),
+      h = server();
+    try {
+      const old = await legacyBusy(f, h);
+      h.bump();
+      const parent = h.head;
+      let posts = 0;
+      const hub = new Hub('fixture', (async (url: any, init: any) => {
+        if (String(url).endsWith('/commit/main')) {
+          posts++;
+          const pending = (await readOutbox(f.st))!;
+          assert.equal(stableJSON(pending.active), stableJSON(old.active));
+          assert.equal(Object.values(pending.metadataRecoveries!)[0].parent, parent);
+          if (scenario === 'unapplied') throw Error('uncertain response, not applied');
+          if (scenario === 'lost-applied') h.loseResponse();
+        }
+        return h.transport(url, init);
+      }) as typeof fetch);
+      if (scenario === 'busy-after') contendReceipt(f.st, o => !!o.metadataRecoveries && posts === 1);
+      await drainManaged(f.st, hub, Date.now() + 10000);
+      h.bump();
+      const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
+      await drainManaged(restarted, hub, Date.now() + 30000);
+      assert.equal(posts, 1);
+      const after = (await readOutbox(restarted))!;
+      assert.equal(Object.keys(after.metadataRecoveries!).length, 1);
+      assert.equal(after.phase, scenario === 'unapplied' ? 'commit_started' : 'synced');
+      if (scenario === 'unapplied') assert.equal(stableJSON(after.active), stableJSON(old.active));
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test('malformed legacy blob evidence refuses without changing its uncertainty or local curation', async () => {
+  for (const malformed of ['path', 'sha', 'size', 'parent', 'phase', 'source']) {
+    const f = await fixture(),
+      h = server();
+    try {
+      const lost = new Hub('fixture', (async (url: any, init: any) => {
+        if (String(url).endsWith('/commit/main')) throw Error('unknown blob');
+        return h.transport(url, init);
+      }) as typeof fetch);
+      await drainManaged(f.st, lost, Date.now() + 10000);
+      const old = (await readOutbox(f.st))!;
+      old.phase = 'conflict';
+      old.reason = 'Dataset operation active; refresh';
+      const blob = old.active!.blob!;
+      if (malformed === 'path') blob.path = '../foreign';
+      if (malformed === 'sha') blob.sha = 'f'.repeat(64);
+      if (malformed === 'size') blob.size++;
+      if (malformed === 'parent') blob.parent = 'bad';
+      if (malformed === 'phase') (blob as any).phase = 'done';
+      if (malformed === 'source')
+        await fs.writeFile(
+          path.join(f.st.datasetRoot, '0.png'),
+          await fs.readFile(path.join(f.st.datasetRoot, '1.png')),
+        );
+      await fs.writeFile(path.join(f.st.folder, 'managed-outbox.json'), stableJSON(old));
+      const posts = h.commits;
+      await drainManaged(f.st, h.hub, Date.now() + 10000);
+      const after = (await readOutbox(f.st))!;
+      assert.equal(after.phase, 'conflict');
+      assert.equal(h.commits, posts);
+      assert.equal(stableJSON(after.active), stableJSON(old.active));
     } finally {
       await f.cleanup();
     }

@@ -18,7 +18,6 @@ import {
   text,
   settings,
   stableJSON,
-  select,
   bucket,
   analyzePixels,
 } from './domain';
@@ -325,7 +324,14 @@ export class StudioStore {
             old?.categorySource ?? (old?.category && old.category !== 'unclassified' ? 'manual' : undefined),
           reviewRevision:
             old?.reviewRevision ??
-            (old && (old.category !== 'unclassified' || old.excluded || old.pinned || old.discarded || old.revision > (old.captionRevision ?? 0)) ? 1 : 0),
+            (old &&
+            (old.category !== 'unclassified' ||
+              old.excluded ||
+              old.pinned ||
+              old.discarded ||
+              old.revision > (old.captionRevision ?? 0))
+              ? 1
+              : 0),
           analysisStatus: old?.analysisStatus,
           revision: (old?.revision ?? 0) + (old && !old.captionOverride && old.caption !== originalCaption ? 1 : 0),
           captionRevision:
@@ -411,20 +417,36 @@ export class StudioStore {
         ensure(image, 'Image changed or disappeared', 409);
         const original = await contained(this.datasetRoot, path.join(this.datasetRoot, image.relative));
         const stat = await fs.stat(original);
-        ensure(stat.isFile() && stat.size === image.size && stat.size <= 24*1024*1024, 'Original image changed; refresh selection before retrying', 409);
+        ensure(
+          stat.isFile() && stat.size === image.size && stat.size <= 24 * 1024 * 1024,
+          'Original image changed; refresh selection before retrying',
+          409,
+        );
         await this.source(image);
         {
-          const caption = await contained(this.datasetRoot, captionPath(path.join(this.datasetRoot, image.relative), 'txt'), true);
+          const caption = await contained(
+            this.datasetRoot,
+            captionPath(path.join(this.datasetRoot, image.relative), 'txt'),
+            true,
+          );
           let value = '';
           try {
             const captionStat = await fs.stat(caption);
             ensure(captionStat.isFile() && captionStat.size < 64000, 'Caption must be a regular file below64KB');
             value = await fs.readFile(caption, 'utf8');
-          } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
-          ensure(image.captionOverride || value === image.caption, 'Original caption changed; refresh selection before retrying', 409);
+          } catch (e: any) {
+            if (e.code !== 'ENOENT') throw e;
+          }
+          ensure(
+            image.captionOverride || value === image.caption,
+            'Original caption changed; refresh selection before retrying',
+            409,
+          );
         }
       }
-      const freshDrafts = s.images.filter(x => ids.includes(x.id) && x.captionDraft?.baseRevision === x.revision).map(x => x.id);
+      const freshDrafts = s.images
+        .filter(x => ids.includes(x.id) && x.captionDraft?.baseRevision === x.revision)
+        .map(x => x.id);
       apply(s);
       for (const id of freshDrafts) {
         const image = s.images.find(x => x.id === id)!;
@@ -545,13 +567,15 @@ export class StudioStore {
   }
   async prepareExport(rev: number) {
     return this.mutate(rev, s => {
-      const result = select(s.images, s.settings.count, s.settings.testId);
-      ensure(result.complete, 'Selection has unsatisfied quotas or pins; resolve before export');
+      const selected = s.images
+        .filter(x => !x.excluded && !x.discarded && x.id !== s.settings.testId)
+        .sort((a, b) => a.sha.localeCompare(b.sha) || a.id.localeCompare(b.id));
+      ensure(selected.length, 'Seleziona almeno un’immagine per esportare il dataset');
       const manifest = {
         schema: 1,
         dataset: this.name,
         settings: s.settings,
-        source: result.selected.map(x => ({
+        source: selected.map(x => ({
           id: x.id,
           sha: x.sha,
           filename: x.filename,
@@ -582,7 +606,7 @@ export class StudioStore {
           id,
           state: 'building',
           manifest,
-          source: structuredClone(result.selected) as Image[],
+          source: structuredClone(selected) as Image[],
           files: [],
         });
     });
