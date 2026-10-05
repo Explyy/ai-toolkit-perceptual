@@ -147,15 +147,25 @@ async function unlinkedLegacyCollision(
   }
 }
 // The sole user command boundary. Reads, target drafts and image edits never call this.
-export async function executeAnalysisCommand(st: StudioStore, db: any, sqlite: string, host: CaptionHost,
-  input: { revision: number; count?: number; retry?: boolean }) {
+export async function executeAnalysisCommand(
+  st: StudioStore,
+  db: any,
+  sqlite: string,
+  host: CaptionHost,
+  input: { revision: number; count?: number; retry?: boolean },
+) {
   if (input.count !== undefined) {
     ensure(Number.isInteger(input.count) && input.count >= 1 && input.count <= 1000, 'Numero immagini non valido');
     const before = await st.read();
     if (before.settings.count !== input.count) {
       await st.mutate(input.revision, current => {
-        ensure(!current.jobs.some(j => j.kind === 'analysis' && ['prepared', 'enqueue-intent', 'active'].includes(j.automatic?.phase ?? '')),
-          'Attendi la fine dell’analisi prima di applicare un nuovo obiettivo', 409);
+        ensure(
+          !current.jobs.some(
+            j => j.kind === 'analysis' && ['prepared', 'enqueue-intent', 'active'].includes(j.automatic?.phase ?? ''),
+          ),
+          'Attendi la fine dell’analisi prima di applicare un nuovo obiettivo',
+          409,
+        );
         current.settings.count = input.count!;
       });
     }
@@ -315,6 +325,7 @@ export type ProcessProbe = {
   boot: () => Promise<string>;
   namespace: () => Promise<string>;
   stat: (pid: number) => Promise<string>;
+  now?: () => number;
 };
 const processProbe: ProcessProbe = {
   platform: os.platform(),
@@ -328,11 +339,12 @@ export async function analysisProcessState(
   link: JobLink,
   row: any,
   probe: ProcessProbe = processProbe,
-): Promise<'alive' | 'dead' | 'unknown'> {
-  if (probe.platform !== 'linux' || !row.pid || !Number.isInteger(row.pid)) return 'unknown';
+): Promise<'alive' | 'dead' | 'unknown' | 'starting'> {
+  if (probe.platform !== 'linux') return 'unknown';
   try {
     const file = await contained(st.folder, path.join(link.folder!, 'runtime.json'));
     const receipt = JSON.parse(await fs.readFile(file, 'utf8'));
+    if (!row.pid || !Number.isInteger(row.pid)) return 'unknown';
     if (
       receipt.pid !== row.pid ||
       receipt.host !== probe.host ||
@@ -352,7 +364,19 @@ export async function analysisProcessState(
     } catch (e: any) {
       return e.code === 'ENOENT' ? 'dead' : 'unknown';
     }
-  } catch {
+  } catch (e: any) {
+    // The native launcher marks its exactly owned row running before Python
+    // can write runtime.json. This bounded wait makes no liveness/death claim.
+    const launched = new Date(row.updated_at).getTime(),
+      now = probe.now?.() ?? Date.now();
+    if (
+      e.code === 'ENOENT' &&
+      row.status === 'running' &&
+      Number.isFinite(launched) &&
+      launched <= now &&
+      now - launched <= 120000
+    )
+      return 'starting';
     return 'unknown';
   }
 }
@@ -413,7 +437,14 @@ export async function applyAnalysisResults(st: StudioStore, link: JobLink, confi
     return state;
   });
 }
-export async function reconcileAnalysis(st: StudioStore, id: string, db: any, host: CaptionHost, retry = false) {
+export async function reconcileAnalysis(
+  st: StudioStore,
+  id: string,
+  db: any,
+  host: CaptionHost,
+  retry = false,
+  probe: ProcessProbe = processProbe,
+) {
   let state = await st.read(),
     link = state.jobs.find(x => x.kind === 'analysis' && x.automatic?.id === id);
   ensure(link?.automatic, 'Analysis request missing', 404);
@@ -470,8 +501,10 @@ export async function reconcileAnalysis(st: StudioStore, id: string, db: any, ho
       return setPhase('applied');
     }
     if (['running', 'stopping'].includes(row.status)) {
-      const processState = await analysisProcessState(st, link, row);
+      const processState = await analysisProcessState(st, link, row, probe);
       if (processState === 'alive') return setPhase('active');
+      if (processState === 'starting')
+        return setPhase('active', 'Avvio del processo di analisi: attendiamo la conferma, senza riavviare il lavoro.');
       if (processState === 'unknown')
         return setPhase(
           'blocked',
@@ -538,4 +571,21 @@ export async function reconcileAnalysis(st: StudioStore, id: string, db: any, ho
   } catch (e: any) {
     return setPhase('failed', e.message ?? 'Analisi non confermata; nessun nuovo lavoro duplicato.');
   }
+}
+
+// Background evidence reconciliation follows only already persisted owned intents.
+// Including blocked analysis links permits late runtime receipts/results to clear
+// startup uncertainty after the browser closes; it never requests an explicit retry.
+export async function reconcilePendingAnalysis(st: StudioStore, db: any, host: CaptionHost, probe?: ProcessProbe) {
+  let state = await st.raw();
+  for (const link of state.jobs) {
+    if (
+      link.kind !== 'analysis' ||
+      !link.automatic ||
+      ['applied', 'dismissed', 'failed', 'unknown', 'conflict'].includes(link.automatic.phase)
+    )
+      continue;
+    state = await reconcileAnalysis(st, link.automatic.id, db, host, false, probe);
+  }
+  return state;
 }

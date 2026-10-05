@@ -22,6 +22,17 @@ export function hubPath(value: unknown): string {
   return value;
 }
 const encodePath = (value: string) => value.split('/').map(encodeURIComponent).join('/');
+function retryDelay(headers: Headers) {
+  const value = headers.get('retry-after');
+  if (value) {
+    const seconds = Number(value),
+      date = Date.parse(value);
+    if (Number.isFinite(seconds) && seconds >= 0) return { retryAfterMs: Math.max(1000, seconds * 1000) };
+    if (Number.isFinite(date)) return { retryAfterAt: date };
+  }
+  const reset = headers.get('ratelimit')?.match(/(?:^|;)\s*t=(\d+)/);
+  return reset ? { retryAfterMs: Math.max(1000, Number(reset[1]) * 1000) } : {};
+}
 export class Hub {
   constructor(
     private token: string | undefined,
@@ -45,7 +56,7 @@ export class Hub {
             ? 'Hugging Face changed since this export started. Reconcile before retrying.'
             : 'Hugging Face request failed (' + r.status + ').',
         ),
-        { remoteStatus: r.status },
+        { remoteStatus: r.status, ...retryDelay(r.headers) },
       );
     return r;
   }
@@ -94,6 +105,45 @@ export class Hub {
     }
     ensure(!next, 'Catalog pagination limit reached', 413);
     return rows;
+  }
+  // Pinned current-branch ancestry, stopped at the original CAS parent.
+  // A truncated/error/foreign pagination result never proves historical absence.
+  async historyTo(repo: string, head: string, parent: string) {
+    repoId(repo);
+    revision(head);
+    revision(parent);
+    const endpoint = '/api/datasets/' + repo + '/commits/' + head,
+      commits: string[] = [],
+      seen = new Set<string>();
+    let next = endpoint;
+    while (next && commits.length < 200) {
+      ensure(!seen.has(next), 'Repeated Hub history cursor', 409);
+      seen.add(next);
+      const response = await this.request(next),
+        rows = await response.json();
+      ensure(Array.isArray(rows) && rows.length > 0, 'Incomplete Hub history', 409);
+      for (const row of rows) {
+        const id = revision(row.id);
+        ensure(!commits.includes(id), 'Repeated Hub history revision', 409);
+        if (!commits.length) ensure(id === head, 'Hub history head differs', 409);
+        commits.push(id);
+        if (id === parent) return commits;
+        ensure(commits.length < 200, 'Hub history exceeds200 revisions', 409);
+      }
+      const match = response.headers.get('link')?.match(/<([^>]+)>;\s*rel="next"/);
+      next = '';
+      if (match) {
+        const url = new URL(match[1], ORIGIN);
+        ensure(
+          url.origin === ORIGIN && url.pathname === endpoint && !url.username && !url.password,
+          'Untrusted Hub history pagination',
+          409,
+        );
+        next = url.pathname + url.search;
+      }
+    }
+    ensure(false, 'Original CAS parent missing from bounded Hub history', 409);
+    return commits;
   }
   async repositories() {
     const owner = await this.owner(),

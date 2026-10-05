@@ -56,6 +56,21 @@ function server() {
         { id: 'daverave/Public', private: false },
       ]);
     }
+    if (p.includes('/commits/')) {
+      const rev = p.split('/commits/')[1],
+        ids = [...versions.keys()].slice(0, [...versions.keys()].indexOf(rev) + 1).reverse();
+      const offset = Number(u.searchParams.get('cursor') ?? 0),
+        page = ids.slice(offset, offset + 50);
+      return Response.json(
+        page.map(id => ({ id })),
+        {
+          headers:
+            offset + 50 < ids.length
+              ? { link: '<https://huggingface.co' + u.pathname + '?cursor=' + (offset + 50) + '>; rel="next"' }
+              : {},
+        },
+      );
+    }
     if (p.includes('/tree/')) {
       const tail = p.split('/tree/')[1],
         rev = tail.slice(0, 40),
@@ -144,21 +159,21 @@ function server() {
     bump,
   };
 }
-async function fixture() {
+async function fixture(name = 'native') {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'studio-managed-')),
     datasets = path.join(root, 'datasets'),
     data = path.join(root, 'data');
-  await fs.mkdir(path.join(datasets, 'native'), { recursive: true });
+  await fs.mkdir(path.join(datasets, name), { recursive: true });
   for (let i = 0; i < 3; i++) {
     const b = await sharp({
       create: { width: 128, height: 128, channels: 3, background: ['#ff0000', '#00ff00', '#0000ff'][i] },
     })
       .png()
       .toBuffer();
-    await fs.writeFile(path.join(datasets, 'native', i + '.png'), b);
-    await fs.writeFile(path.join(datasets, 'native', i + '.txt'), 'original ' + i);
+    await fs.writeFile(path.join(datasets, name, i + '.png'), b);
+    await fs.writeFile(path.join(datasets, name, i + '.txt'), 'original ' + i);
   }
-  const st = await new StudioStore(data, datasets, 'native').init();
+  const st = await new StudioStore(data, datasets, name).init();
   await st.read();
   return { st, root, data, datasets, cleanup: () => fs.rm(root, { recursive: true, force: true }) };
 }
@@ -449,7 +464,7 @@ test('raw UTF-8/spaced image names and folders preserve exact original bytes wit
   }
 });
 
-test('unknown original not yet visible blocks later POSTs across restart; local bytes never enter outbox', async () => {
+test('unapplied unknown original recovers once at the exact parent after restart; local bytes never enter outbox', async () => {
   const f = await fixture(),
     h = server();
   try {
@@ -466,9 +481,13 @@ test('unknown original not yet visible blocks later POSTs across restart; local 
     assert.equal((await readOutbox(f.st))!.active?.blob?.phase, 'commit_started');
     const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
     await drainManaged(restarted, h.hub, Date.now() + 10000);
-    assert.equal(h.commits, 0, 'unconfirmed first blob prevents every subsequent commit');
-    assert.equal((await readOutbox(restarted))!.active?.blob?.phase, 'commit_started');
-    assert.match((await readOutbox(restarted))!.reason!, /attesa/);
+    assert.equal(h.commits, 4, 'one CAS recovery plus remaining originals and final pointer');
+    const recovered = (await readOutbox(restarted))!;
+    assert.equal(recovered.phase, 'synced');
+    const proof = Object.values(recovered.blobRecoveries!)[0];
+    assert.equal(proof.original.parent, proof.parent);
+    await drainManaged(restarted, h.hub, Date.now() + 10000);
+    assert.equal(h.commits, 4, 'repeated drain never replays again');
     const raw = await fs.readFile(path.join(f.st.folder, 'managed-outbox.json'), 'utf8');
     assert.doesNotMatch(raw, /"operations"|"encoding"|"content"/);
   } finally {
@@ -496,6 +515,244 @@ test('large originals remain separate bounded commits and private legacy model p
     assert.doesNotMatch(raw, /private\/model|"operations"|"content"/);
     assert.equal(managedProjection(await f.st.read()).settings.model, '');
     assert.equal((await f.st.read()).settings.model, '/workspace/private/model.safetensors');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('known429 rejection persists status/retry deadline across restart and sends no commit before Retry-After', async () => {
+  const f = await fixture(),
+    h = server();
+  let rejected = false,
+    posts = 0;
+  const now = Math.floor(Date.now() / 1000) * 1000 + 10000;
+  let clockTime = now;
+  const clock = () => clockTime;
+  try {
+    const transport = (async (url: any, init: any) => {
+      if (String(url).endsWith('/commit/main')) {
+        posts++;
+        if (!rejected) {
+          rejected = true;
+          clockTime = now + 150000;
+          return new Response('', {
+            status: 429,
+            headers: { 'Retry-After': new Date(clockTime + 90000).toUTCString() },
+          });
+        }
+      }
+      return h.transport(url, init);
+    }) as typeof fetch;
+    const hub = new Hub('fixture', transport);
+    await drainManaged(f.st, hub, clock);
+    let o = (await readOutbox(f.st))!;
+    assert.equal(o.phase, 'error');
+    assert.equal(o.lastRemoteFailure?.status, 429);
+    assert.equal(o.retryAt, now + 240000);
+    assert.equal(o.active?.blob?.phase, 'uploading');
+    const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
+    assert.equal(o.lastRemoteFailure?.at, now + 150000);
+    clockTime = now + 239999;
+    await drainManaged(restarted, hub, clock);
+    assert.equal(posts, 1);
+    clockTime = now + 240000;
+    await drainManaged(restarted, hub, clock);
+    o = (await readOutbox(restarted))!;
+    assert.equal(o.phase, 'synced');
+    assert.equal(o.lastRemoteFailure?.status, 429);
+    assert.equal(posts, 5);
+    assert.equal(Object.keys(o.blobRecoveries ?? {}).length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+test('original and once-only recovery share identical parent/content; concurrent original wins CAS with one application', async () => {
+  const f = await fixture(),
+    h = server();
+  let pending: any,
+    attempts = 0;
+  try {
+    const transport = (async (url: any, init: any) => {
+      if (String(url).endsWith('/commit/main')) {
+        attempts++;
+        if (!pending) {
+          pending = { url, init };
+          throw Error('original response unavailable');
+        }
+        if (attempts === 2) {
+          assert.equal(init.body, pending.init.body);
+          await h.transport(pending.url, pending.init);
+        }
+      }
+      return h.transport(url, init);
+    }) as typeof fetch;
+    const hub = new Hub('fixture', transport);
+    await drainManaged(f.st, hub, Date.now() + 10000);
+    const original = (await readOutbox(f.st))!.active!.blob!;
+    const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
+    await drainManaged(restarted, hub, Date.now() + 10000);
+    const o = (await readOutbox(restarted))!;
+    assert.equal(o.phase, 'synced');
+    assert.deepEqual(o.blobRecoveries![original.sha].original, original);
+    assert.equal(h.commits, 5, 'original apply, rejected recovery, two remaining originals and pointer');
+    assert.equal(h.files.size, 5);
+    await drainManaged(restarted, hub, Date.now() + 10000);
+    assert.equal(h.commits, 5);
+  } finally {
+    await f.cleanup();
+  }
+});
+test('three original unknowns at one parent recover sequentially through bounded complete historical absence proof', async () => {
+  const all = await Promise.all(['a', 'b', 'c'].map(fixture)),
+    h = server();
+  try {
+    const lost = new Hub('fixture', (async (url: any, init: any) => {
+      if (String(url).endsWith('/commit/main')) throw Error('unapplied original');
+      return h.transport(url, init);
+    }) as typeof fetch);
+    for (const f of all) await drainManaged(f.st, lost, Date.now() + 10000);
+    const parent = h.head;
+    for (const f of all) {
+      await drainManaged(f.st, h.hub, Date.now() + 10000);
+      const o = (await readOutbox(f.st))!;
+      assert.equal(o.phase, 'synced');
+      assert.equal(Object.values(o.blobRecoveries!)[0].original.parent, parent);
+    }
+    assert.equal(h.commits, 12);
+    assert.ok(Object.values((await readOutbox(all[1].st))!.blobRecoveries!)[0].commits.length > 1);
+    assert.ok(Object.values((await readOutbox(all[2].st))!.blobRecoveries!)[0].commits.length > 5);
+  } finally {
+    for (const f of all) await f.cleanup();
+  }
+});
+test('historical blob existence followed by deletion is a conflict; missing parent, bounds and readerrors never prove absence', async () => {
+  const f = await fixture(),
+    h = server();
+  let pending: any;
+  try {
+    const lost = new Hub('fixture', (async (url: any, init: any) => {
+      if (String(url).endsWith('/commit/main')) {
+        pending = { url, init };
+        throw Error('unknown');
+      }
+      return h.transport(url, init);
+    }) as typeof fetch);
+    await drainManaged(f.st, lost, Date.now() + 10000);
+    const original = (await readOutbox(f.st))!.active!.blob!;
+    await h.transport(pending.url, pending.init);
+    h.bump();
+    h.files.delete(original.path);
+    const posts = h.commits;
+    await drainManaged(f.st, h.hub, Date.now() + 10000);
+    let o = (await readOutbox(f.st))!;
+    assert.equal(o.phase, 'conflict');
+    assert.match(o.reason!, /history/);
+    assert.deepEqual(o.active!.blob, original);
+    assert.equal(h.commits, posts);
+    await assert.rejects(h.hub.historyTo('daverave/Personal', h.head, 'f'.repeat(40)), /missing/);
+    for (let i = 0; i < 201; i++) h.bump();
+    await assert.rejects(h.hub.historyTo('daverave/Personal', h.head, original.parent), /200/);
+  } finally {
+    await f.cleanup();
+  }
+  const g = await fixture('read-error'),
+    s = server();
+  try {
+    const lost = new Hub('fixture', (async (url: any, init: any) => {
+      if (String(url).endsWith('/commit/main')) throw Error('unknown');
+      return s.transport(url, init);
+    }) as typeof fetch);
+    await drainManaged(g.st, lost, Date.now() + 10000);
+    s.bump();
+    const blob = (await readOutbox(g.st))!.active!.blob!,
+      head = s.head;
+    const errors = new Hub('fixture', (async (url: any, init: any) => {
+      if (String(url).endsWith('/paths-info/' + blob.parent) && JSON.parse(init.body).paths[0] === blob.path)
+        return new Response('', { status: 503 });
+      return s.transport(url, init);
+    }) as typeof fetch);
+    await drainManaged(g.st, errors, Date.now() + 10000);
+    const o = (await readOutbox(g.st))!;
+    assert.equal(s.commits, 0);
+    assert.equal(s.head, head);
+    assert.deepEqual(o.active!.blob, blob);
+    assert.equal(o.lastRemoteFailure?.status, 503);
+    assert.equal(Object.keys(o.blobRecoveries ?? {}).length, 0);
+  } finally {
+    await g.cleanup();
+  }
+});
+test('a second unknown recovery response remains bounded after restart; no third POST or metadata reset', async () => {
+  const f = await fixture(),
+    h = server();
+  let calls = 0;
+  try {
+    const lost = new Hub('fixture', (async (url: any, init: any) => {
+      if (String(url).endsWith('/commit/main')) {
+        calls++;
+        throw Error('unknown');
+      }
+      return h.transport(url, init);
+    }) as typeof fetch);
+    await drainManaged(f.st, lost, Date.now() + 10000);
+    await drainManaged(f.st, lost, Date.now() + 10000);
+    assert.equal(calls, 2);
+    const old = (await readOutbox(f.st))!;
+    const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
+    await drainManaged(restarted, lost, Date.now() + 10000);
+    assert.equal(calls, 2);
+    assert.deepEqual((await readOutbox(restarted))!.blobRecoveries, old.blobRecoveries);
+    assert.equal((await readOutbox(restarted))!.active!.blob!.phase, 'commit_started');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('confirmed429 during unknown recovery retains audit and cooldown, then revalidates proof after restart', async () => {
+  const f = await fixture(),
+    h = server();
+  let calls = 0;
+  const now = Date.now() + 10000;
+  let clockTime = now;
+  const clock = () => clockTime;
+  try {
+    const transport = (async (url: any, init: any) => {
+      if (String(url).endsWith('/commit/main')) {
+        calls++;
+        if (calls === 1) throw Error('original unavailable');
+        if (calls === 2) {
+          clockTime = now + 150000;
+          return new Response('', { status: 429, headers: { 'Retry-After': '90' } });
+        }
+      }
+      return h.transport(url, init);
+    }) as typeof fetch;
+    const hub = new Hub('fixture', transport);
+    await drainManaged(f.st, hub, clock);
+    const original = (await readOutbox(f.st))!.active!.blob!;
+    await drainManaged(f.st, hub, clock);
+    let o = (await readOutbox(f.st))!;
+    assert.equal(o.lastRemoteFailure?.status, 429);
+    assert.equal(o.lastRemoteFailure?.at, now + 150000);
+    assert.equal(o.retryAt, now + 240000);
+    assert.equal(o.blobRecoveries![original.sha].attempts![0].retryAt, now + 240000);
+    assert.equal(o.blobRecoveries![original.sha].attempts![0].responseAt, now + 150000);
+    assert.equal(o.blobRecoveries![original.sha].retryableReject, true);
+    assert.equal(calls, 2);
+    const restarted = await new StudioStore(f.data, f.datasets, 'native').init();
+    clockTime = now + 239999;
+    await drainManaged(restarted, hub, clock);
+    assert.equal(calls, 2);
+    clockTime = now + 240000;
+    await drainManaged(restarted, hub, clock);
+    o = (await readOutbox(restarted))!;
+    assert.equal(o.phase, 'synced');
+    assert.equal(calls, 6);
+    const proof = o.blobRecoveries![original.sha];
+    assert.deepEqual(proof.original, original);
+    assert.equal(proof.attempts!.length, 2);
+    assert.equal(proof.attempts![0].status, 429);
+    assert.equal(proof.retryableReject, undefined);
   } finally {
     await f.cleanup();
   }

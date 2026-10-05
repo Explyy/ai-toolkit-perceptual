@@ -6,7 +6,7 @@ import { StudioStore, contained } from './store';
 import { ownedLock } from './ownerLock';
 import { Hub } from './hf';
 import { drainManaged } from './managedSync';
-import { reconcileAnalysis } from './analysisFlow';
+import { reconcilePendingAnalysis } from './analysisFlow';
 import { reconcileCaption, captionHost } from './captionFlow';
 let running = false,
   timer: ReturnType<typeof setInterval> | undefined;
@@ -27,15 +27,15 @@ export async function serviceTick() {
           try {
             if (await fs.lstat(path.join(datasets, d.name, '.studio-materializing.json')).catch(() => null)) continue;
             const st = await new StudioStore(data, datasets, d.name).init();
-            let s = await st.read();
+            let s = await reconcilePendingAnalysis(st, prisma, host);
             for (const link of s.jobs) {
               if (
+                link.kind !== 'caption' ||
                 !link.automatic ||
                 ['applied', 'dismissed', 'failed', 'unknown', 'conflict', 'blocked'].includes(link.automatic.phase)
               )
                 continue;
               // Only persisted user-created intents are replayed. Never prepareAnalysis.
-              if (link.kind === 'analysis') s = await reconcileAnalysis(st, link.automatic.id, prisma, host);
               if (link.kind === 'caption') s = await reconcileCaption(st, link.automatic.id, prisma, host);
             }
             if (token) await drainManaged(st, new Hub(token));

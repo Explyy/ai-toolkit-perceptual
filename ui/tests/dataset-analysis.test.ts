@@ -14,6 +14,8 @@ import {
   prepareAnalysis,
   applyAnalysisResults,
   applyProposal,
+  reconcilePendingAnalysis,
+  analysisProcessState,
 } from '../src/datasetStudio/analysisFlow';
 import { ownedLock } from '../src/datasetStudio/ownerLock';
 const sha = 'a'.repeat(64),
@@ -427,6 +429,50 @@ test('real native SQLite analysis queue persists one job, preserves paused capti
     assert.equal((await db.job.findUnique({ where: { id: managed.jobId } })).status, 'running');
     assert.equal(await db.job.count({ where: { job_type: 'analysis' } }), 1);
 
+    // The production background seam receives a native row before Python's receipt.
+    const now = Date.now(),
+      stat = '12345 (fixture) ' + Array.from({ length: 22 }, (_, i) => (i === 19 ? '999' : '0')).join(' ');
+    const probe = {
+      platform: 'linux',
+      host: 'fixture-host',
+      boot: async () => 'fixture-boot',
+      namespace: async () => 'pid:[fixture]',
+      stat: async () => stat,
+      now: () => now,
+    };
+    const nativeBefore = await db.job.findUnique({ where: { id: managed.jobId } }),
+      queueBefore = await db.queue.findUnique({ where: { gpu_ids: '0' } });
+    s = await reconcilePendingAnalysis(f.st, db, host, probe);
+    assert.equal(s.jobs.find(x => x.kind === 'analysis')!.automatic!.phase, 'active');
+    assert.match(s.jobs.find(x => x.kind === 'analysis')!.automatic!.reason!, /Avvio/);
+    assert.deepEqual(await db.job.findUnique({ where: { id: managed.jobId } }), nativeBefore);
+    assert.deepEqual(await db.queue.findUnique({ where: { gpu_ids: '0' } }), queueBefore);
+    assert.equal(
+      await analysisProcessState(f.st, managed, { ...nativeBefore, updated_at: new Date(now - 120001) }, probe),
+      'unknown',
+    );
+    assert.equal(await analysisProcessState(f.st, managed, { ...nativeBefore, status: 'completed' }, probe), 'unknown');
+    const receipt = {
+      pid: 12345,
+      start: '999',
+      host: 'fixture-host',
+      boot: 'fixture-boot',
+      namespace: 'pid:[fixture]',
+      name: managed.name,
+    };
+    await fs.writeFile(path.join(folder, 'runtime.json'), JSON.stringify({ ...receipt, host: 'foreign-host' }));
+    s = await reconcilePendingAnalysis(f.st, db, host, probe);
+    assert.equal(s.jobs.find(x => x.kind === 'analysis')!.automatic!.phase, 'blocked');
+    await fs.writeFile(path.join(folder, 'runtime.json'), 'invalid-json');
+    s = await reconcilePendingAnalysis(f.st, db, host, probe);
+    assert.equal(s.jobs.find(x => x.kind === 'analysis')!.automatic!.phase, 'blocked');
+    await fs.writeFile(path.join(folder, 'runtime.json'), JSON.stringify(receipt));
+    s = await reconcilePendingAnalysis(f.st, db, host, probe);
+    assert.equal(s.jobs.find(x => x.kind === 'analysis')!.automatic!.phase, 'active');
+    assert.equal(s.jobs.find(x => x.kind === 'analysis')!.automatic!.reason, undefined);
+    assert.deepEqual(await db.job.findUnique({ where: { id: managed.jobId } }), nativeBefore);
+    assert.deepEqual(await db.queue.findUnique({ where: { gpu_ids: '0' } }), queueBefore);
+
     const output = path.join(folder, 'result-000000');
     await fs.mkdir(output, { recursive: true });
     const depth = await sharp({ create: { width: 8, height: 8, channels: 3, background: '#333333' } })
@@ -446,7 +492,7 @@ test('real native SQLite analysis queue persists one job, preserves paused capti
     s = await f.st.read();
     await f.st.edit(s.revision, [original.id], { excluded: 1 });
     await db.job.update({ where: { id: managed.jobId }, data: { status: 'completed', step: 1, total_steps: 1 } });
-    s = await reconcileAnalysis(f.st, 'queue-fixture', db, host);
+    s = await reconcilePendingAnalysis(f.st, db, host, probe);
     assert.equal(s.jobs.find(x => x.kind === 'analysis')!.automatic!.phase, 'applied');
     assert.equal(s.images[0].excluded, 1);
     assert.equal(s.images[0].category, 'face');
@@ -654,4 +700,5 @@ test('independent identical imports use distinct native SQLite identities and pr
 test('explicit retry recovers only a proven unlinked legacy collision; old own and unknown identities remain intact', () =>
   importIdentityRegression('legacy'));
 
-test('explicit analysis command persists target once; reads/drafts/edits do not enqueue, duplicate/cache commands preserve review', () => importIdentityRegression('command'));
+test('explicit analysis command persists target once; reads/drafts/edits do not enqueue, duplicate/cache commands preserve review', () =>
+  importIdentityRegression('command'));

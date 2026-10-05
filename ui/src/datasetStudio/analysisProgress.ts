@@ -51,7 +51,7 @@ export function progressState(s: State, row: any, config: string, receipt?: any)
   else if (s.analysisFlow?.phase === 'unavailable' && !link) phase = 'unavailable';
   else if (link && ['blocked', 'failed', 'unknown'].includes(link.automatic!.phase)) phase = 'blocked';
   else if (link && !['applied', 'dismissed'].includes(link.automatic!.phase))
-    phase = row?.status === 'queued' ? 'queued' : row?.status === 'running' ? 'running' : 'waiting';
+    phase = row?.status === 'queued' ? 'queued' : row?.status === 'running' && receipt ? 'running' : 'waiting';
   const done = valid.length;
   return {
     phase,

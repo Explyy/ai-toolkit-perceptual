@@ -26,6 +26,28 @@ export type Outbox = {
   remoteRevision?: string;
   phase: 'pending' | 'uploading' | 'commit_started' | 'verifying' | 'synced' | 'error' | 'conflict';
   reason?: string;
+  retryAt?: number;
+  lastRemoteFailure?: { status: number; at: number; retryAt: number };
+  blobRecoveries?: Record<
+    string,
+    {
+      original: NonNullable<NonNullable<Outbox['active']>['blob']>;
+      parent: string;
+      commits: string[];
+      proofDigest: string;
+      attemptedAt: number;
+      retryableReject?: boolean;
+      attempts?: Array<{
+        at: number;
+        parent: string;
+        proofDigest: string;
+        status?: number;
+        responseAt?: number;
+        retryAt?: number;
+      }>;
+      revision?: string;
+    }
+  >;
   verifiedObjects?: Record<string, { size: number; oid: string }>;
   active?: {
     digest: string;
@@ -36,6 +58,7 @@ export type Outbox = {
     revision?: string;
   };
 };
+const definiteReject = (e: any) => [400, 401, 403, 404, 409, 412, 413, 422, 429].includes(e.remoteStatus);
 const root = (key: string) => 'dataset-studio/managed/' + key;
 export function managedProjection(s: State): ManagedProjection {
   const key = s.managedBinding?.key ?? hash(s.dataset);
@@ -89,6 +112,7 @@ export async function readOutbox(st: StudioStore): Promise<Outbox | undefined> {
   }
 }
 async function save(st: StudioStore, o: Outbox) {
+  ensure(Buffer.byteLength(stableJSON(o)) <= LIMIT * 2 + 100000, 'Outbox recovery evidence exceeds limit', 413);
   await atomic(await outboxFile(st), stableJSON(o));
 }
 // Invoked after local state durability, under the dataset lock. Metadata only;
@@ -164,7 +188,24 @@ async function readback(hub: Hub, o: Outbox, rev: string) {
 }
 // The service claim is separate from the edit lock and survives process crashes
 // through SQLite locking. No browser lifetime or JS-only singleton is trusted.
-export async function drainManaged(st: StudioStore, hub: Hub, now = Date.now()) {
+export async function drainManaged(st: StudioStore, hub: Hub, clock: number | (() => number) = Date.now) {
+  const observeTime = typeof clock === 'function' ? clock : () => clock,
+    now = observeTime();
+  const observedFailures = new WeakMap<object, number>();
+  const responseTime = (e: any) => {
+    if (!e || typeof e !== 'object') return observeTime();
+    const at = observedFailures.get(e) ?? observeTime();
+    observedFailures.set(e, at);
+    return at;
+  };
+  const deadline = (e: any, at: number) =>
+    at +
+    Math.max(
+      1000,
+      Number.isFinite(e.retryAfterAt)
+        ? e.retryAfterAt - at
+        : (e.retryAfterMs ?? (e.remoteStatus === 409 || e.remoteStatus === 412 ? 5000 : 60000)),
+    );
   const seed = await st.raw(),
     claim = await contained(
       st.root,
@@ -180,7 +221,12 @@ export async function drainManaged(st: StudioStore, hub: Hub, now = Date.now()) 
     const state = await st.read();
     await st.locked(() => recordLocal(st, state, now));
     let o = await readOutbox(st);
-    if (!o || o.phase === 'conflict' || (!o.active && (o.desired === o.baseDigest || now - o.changedAt < DEBOUNCE)))
+    if (
+      !o ||
+      (o.retryAt ?? 0) > now ||
+      o.phase === 'conflict' ||
+      (!o.active && (o.desired === o.baseDigest || now - o.changedAt < DEBOUNCE))
+    )
       return;
     const update = async (fn: (x: Outbox) => void) =>
       st.locked(async () => {
@@ -228,20 +274,114 @@ export async function drainManaged(st: StudioStore, hub: Hub, now = Date.now()) 
       }
       const active = o.active!;
       if (active.blob?.phase === 'commit_started') {
-        const blob = active.blob,
-          bytes = await hub.optional(o.repo, info.sha, blob.path, blob.size + 1);
+        const blob = active.blob;
+        let bytes = await hub.optional(o.repo, info.sha, blob.path, blob.size + 1);
+        let verifiedRevision = info.sha;
         if (!bytes) {
+          const previous = o.blobRecoveries?.[blob.sha];
+          if (previous && !previous.retryableReject) {
+            await update(x => {
+              x.reason = 'Esito del recupero HF in attesa; nessun ulteriore invio.';
+            });
+            return;
+          }
+          const image = active.projection.images.find(x => x.sha === blob.sha && x.size === blob.size),
+            source = image && state.images.find(x => x.sha === image.sha && x.relative === image.relative);
+          ensure(
+            image && source && blob.path === root(o.key) + '/blobs/' + blob.sha,
+            'Unknown original identity differs',
+            409,
+          );
+          ensure(
+            (await pointer(hub, o.repo, info.sha, o.key))?.digest === active.baseDigest,
+            'Remote dataset divergence; both versions preserved',
+            409,
+          );
+          const sourceBytes = await st.source(source);
+          ensure(
+            sourceBytes.length === blob.size && hash(sourceBytes) === blob.sha,
+            'Unknown original source differs',
+            409,
+          );
+          const commits = info.sha === blob.parent ? [info.sha] : await hub.historyTo(o.repo, info.sha, blob.parent);
+          for (const rev of commits) {
+            if (rev === info.sha) continue;
+            ensure(
+              !(await hub.optional(o.repo, rev, blob.path, blob.size + 1)),
+              'Original existed in history but is now missing; both versions preserved',
+              409,
+            );
+          }
+          const operation = await hub.upload(o.repo, blob.path, sourceBytes);
+          ensure(
+            Buffer.byteLength(stableJSON(operation)) <= 34 * 1024 * 1024,
+            'Original recovery payload exceeds bound',
+            413,
+          );
+          const fresh = await hub.info(o.repo);
+          ensure(
+            fresh.sha === info.sha && (await pointer(hub, o.repo, fresh.sha, o.key))?.digest === active.baseDigest,
+            'HF changed during unknown-outcome proof; reconcile before recovery',
+            409,
+          );
+          // Retain the original receipt and proof before exactly one CAS replay.
+          // The old POST cannot apply after a proven descendant; at the same
+          // parent, strict CAS permits at most one of original/recovery to apply.
+          const proof = {
+            original: structuredClone(blob),
+            parent: info.sha,
+            commits,
+            proofDigest: hash(
+              stableJSON({ blob, head: info.sha, commits, sourceSHA: blob.sha, base: active.baseDigest }),
+            ),
+            attemptedAt: observeTime(),
+          };
+          const attempts = [
+            ...(previous?.attempts ?? []),
+            { at: proof.attemptedAt, parent: info.sha, proofDigest: proof.proofDigest },
+          ];
           await update(x => {
-            x.reason = 'Conferma originale HF in attesa; nessun invio successivo.';
+            (x.blobRecoveries ??= {})[blob.sha] = { ...proof, attempts };
           });
-          return;
+          try {
+            verifiedRevision = await hub.commit(o.repo, info.sha, [operation], blob.sha);
+            await update(x => {
+              x.blobRecoveries![blob.sha].revision = verifiedRevision;
+            });
+          } catch (e: any) {
+            const receivedAt = responseTime(e);
+            if (e.remoteStatus === 429) {
+              // Confirmed non-application does not spend the one uncertain
+              // replay allowance. Retain its audit and freshly reprove safety
+              // after the durable Retry-After deadline before another attempt.
+              await update(x => {
+                const proof = x.blobRecoveries![blob.sha];
+                proof.retryableReject = true;
+                const attempt = proof.attempts!.at(-1)!;
+                attempt.status = 429;
+                attempt.responseAt = receivedAt;
+                attempt.retryAt = deadline(e, receivedAt);
+              });
+              throw e;
+            }
+            if (!definiteReject(e)) throw e;
+            // A competing original may have won CAS. Adopt only exact readback;
+            // no rebase/repeat of this already attempted recovery is permitted.
+            const current = await hub.info(o.repo);
+            bytes = await hub.optional(o.repo, current.sha, blob.path, blob.size + 1);
+            verifiedRevision = current.sha;
+            if (!bytes) throw e;
+          }
+          bytes ??= await hub.optional(o.repo, verifiedRevision, blob.path, blob.size + 1);
+          ensure(bytes, 'Unknown original recovery not yet readable', 502);
         }
         ensure(bytes.length === blob.size && hash(bytes) === blob.sha, 'Unknown original commit readback differs', 409);
-        const meta = await hub.metadata(o.repo, info.sha, blob.path);
+        const meta = await hub.metadata(o.repo, verifiedRevision, blob.path);
         await update(x => {
           (x.verifiedObjects ??= {})[blob.sha] = { size: blob.size, oid: meta.lfs?.oid ?? meta.oid };
           delete x.active!.blob;
           delete x.reason;
+          delete x.retryAt;
         });
       }
       // Each original is one bounded immutable commit. Only identity/projection
@@ -286,12 +426,17 @@ export async function drainManaged(st: StudioStore, hub: Hub, now = Date.now()) 
           try {
             committed = await hub.commit(o.repo, latest.sha, [operation], image.sha);
           } catch (e: any) {
+            responseTime(e);
             if (e.remoteStatus === 409 || e.remoteStatus === 412) {
               await update(x => {
                 x.active!.blob!.phase = 'uploading';
               });
               if (attempt === 0) continue;
             }
+            if (definiteReject(e))
+              await update(x => {
+                x.active!.blob!.phase = 'uploading';
+              });
             throw e;
           }
           const verified = await verifyBlob(hub, o, committed, image);
@@ -347,12 +492,17 @@ export async function drainManaged(st: StudioStore, hub: Hub, now = Date.now()) 
         try {
           committed = await hub.commit(o.repo, current.sha, operations, active.digest);
         } catch (e: any) {
+          responseTime(e);
           if (e.remoteStatus === 409 || e.remoteStatus === 412) {
             await update(x => {
               x.phase = 'uploading';
             });
             if (attempt === 0) continue;
           }
+          if (definiteReject(e))
+            await update(x => {
+              x.phase = 'uploading';
+            });
           throw e;
         }
         await update(x => {
@@ -361,6 +511,7 @@ export async function drainManaged(st: StudioStore, hub: Hub, now = Date.now()) 
         });
         await readback(hub, o, committed);
         await update(x => {
+          delete x.retryAt;
           x.baseDigest = active.digest;
           x.remoteRevision = committed;
           delete x.active;
@@ -370,9 +521,21 @@ export async function drainManaged(st: StudioStore, hub: Hub, now = Date.now()) 
         break;
       }
     } catch (e: any) {
+      const receivedAt = responseTime(e);
       await update(x => {
+        if (Number.isInteger(e.remoteStatus)) {
+          x.retryAt = deadline(e, receivedAt);
+          x.lastRemoteFailure = { status: e.remoteStatus, at: receivedAt, retryAt: x.retryAt };
+        }
         if (x.phase === 'commit_started' || x.active?.blob?.phase === 'commit_started') {
-          x.reason = 'Conferma HF in attesa; nessun reinvio automatico.';
+          if (e.status === 409 && !e.remoteStatus) {
+            x.phase = 'conflict';
+            x.reason = e.message;
+            return;
+          }
+          x.reason = e.remoteStatus
+            ? 'HF (' + e.remoteStatus + '): conferma in attesa; nessun invio duplicato.'
+            : 'Conferma HF in attesa; nessun reinvio automatico.';
           return;
         }
         if (e.localSuperseded && x.active && x.desired !== x.active.digest) {
