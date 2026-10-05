@@ -44,12 +44,13 @@ export function captionTextSources(
   drafts: Record<string, { caption: string }>,
   scope: 'selected' | 'visible',
   search: string,
+  visibleIds?: readonly string[],
 ): CaptionSource[] {
   return images
     .filter(x => !x.discarded)
     .map(x => ({ ...x, caption: drafts[x.id]?.caption ?? x.caption }))
     .filter(x =>
-      scope === 'selected' ? !x.excluded : (x.filename + ' ' + x.caption).toLowerCase().includes(search.toLowerCase()),
+      scope === 'selected' ? !x.excluded : visibleIds ? visibleIds.includes(x.id) : (x.filename + ' ' + x.caption).toLowerCase().includes(search.toLowerCase()),
     )
     .map(({ id, caption, revision }) => ({ id, caption, revision }));
 }

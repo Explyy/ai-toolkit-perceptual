@@ -1,10 +1,12 @@
 'use client';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { apiClient } from '@/utils/api';
 import { TopBar, MainContent } from '@/components/layout';
 import AdvancedWorkspace from './AdvancedWorkspace';
 import { ActionLane } from './actionLane';
+import GalleryImageCard from './GalleryImageCard';
+import { MembershipController, membershipFailure, rebaseGalleryDrafts, galleryVisible, gallerySections, galleryCategories, categoryLabels, MembershipFilter } from './gallerySelection';
 import { captionModels, defaultCaptionModel, CaptionPreferences } from './captionModels';
 import type { Image, State, JobLink } from './store';
 import type { AnalysisProgress } from './analysisProgress';
@@ -34,76 +36,15 @@ function initialPreferences(s: State): CaptionPreferences {
     instructions: old?.instructions ?? s.settings.instructions,
   };
 }
-function PreviewImage({ dataset, image, height }: { dataset: string; image: Image; height: number }) {
-  const holder = useRef<HTMLDivElement>(null),
-    [url, setUrl] = useState(''),
-    [failed, setFailed] = useState(false),
-    [attempt, setAttempt] = useState(0);
-  useEffect(() => {
-    let dead = false,
-      created = '',
-      started = false;
-    const observer = new IntersectionObserver(
-      entries => {
-        if (started || !entries.some(x => x.isIntersecting)) return;
-        started = true;
-        observer.disconnect();
-        setFailed(false);
-        apiClient
-          .get('/api/dataset-studio', { params: { dataset, image: image.id }, responseType: 'blob' })
-          .then(r => {
-            created = URL.createObjectURL(r.data);
-            if (!dead) setUrl(created);
-          })
-          .catch(() => {
-            if (!dead) setFailed(true);
-          });
-      },
-      { rootMargin: '400px' },
-    );
-    if (holder.current) observer.observe(holder.current);
-    return () => {
-      dead = true;
-      observer.disconnect();
-      if (created) URL.revokeObjectURL(created);
-    };
-  }, [dataset, image.id, attempt]);
-  return (
-    <div ref={holder} style={{ height }} className="w-full flex items-center justify-center rounded bg-gray-950">
-      {url ? (
-        <img
-          src={url}
-          draggable={false}
-          alt={image.filename}
-          style={{
-            opacity: image.excluded ? 0.35 : 1,
-            width: '100%',
-            height: '100%',
-            maxWidth: '100%',
-            maxHeight: height,
-            minHeight: 0,
-            objectFit: 'contain',
-          }}
-        />
-      ) : failed ? (
-        <button onClick={() => setAttempt(x => x + 1)}>Immagine non disponibile · Riprova</button>
-      ) : (
-        <span className="text-gray-400">Caricamento immagine…</span>
-      )}
-    </div>
-  );
-}
 export default function Workspace({ dataset, onNativeView }: { dataset: string; onNativeView: () => void }) {
   const [state, setState] = useState<View | null>(null),
     [error, setError] = useState(''),
     [busy, setBusy] = useState(''),
     [search, setSearch] = useState(''),
     [target, setTarget] = useState('3'),
-    [categoryFilter, setCategoryFilter] = useState('all'),
-    [membershipFilter, setMembershipFilter] = useState('all'),
-    [tagFilter, setTagFilter] = useState(''),
+    [categoryFilters, setCategoryFilters] = useState<string[]>([...galleryCategories]),
+    [membershipFilter, setMembershipFilter] = useState<MembershipFilter>('all'),
     [minQuality, setMinQuality] = useState(0),
-    [tagDrafts, setTagDrafts] = useState<Record<string,string>>({}),
     [size, setSize] = useState(460),
     [advanced, setAdvanced] = useState(false),
     [advancedMounted, setAdvancedMounted] = useState(false),
@@ -139,6 +80,43 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
   activeDataset.current = dataset;
   if (scope.current.dataset !== dataset) scope.current = { dataset, epoch: scope.current.epoch + 1 };
   draftRef.current = drafts;
+  const [, repaintMembership] = useState(0);
+  const membershipOwner = useRef<{scope: object; controller: MembershipController<View>} | null>(null);
+  if (membershipOwner.current?.scope !== scope.current) {
+    const owner = scope.current;
+    membershipOwner.current = {scope: owner, controller: new MembershipController<View>({
+      lane: lane.current, key: 'membership:'+owner.epoch+':'+dataset,
+      valid: () => scope.current === owner,
+      current: () => current.current!,
+      post: (ids, excluded) => request('edit', {ids, patch: {excluded}}),
+      reconcile: async () => {
+        const r = await apiClient.get('/api/dataset-studio', {params: {dataset}});
+        if (scope.current !== owner) throw new Error('Dataset cambiato');
+        accept(r.data); return r.data;
+      },
+      changed: () => repaintMembership(x => x + 1),
+    })};
+  }
+  const membership = membershipOwner.current.controller;
+  const cardHandlers = useRef<{toggle: (id:string)=>void; category:(id:string,c:string)=>void; caption:(image:Image,value:string)=>void; discard:(id:string)=>void} | null>(null);
+  cardHandlers.current = {
+    toggle: id => {
+      const image = membership.overlay(current.current?.images ?? []).find(x => x.id === id);
+      if (image) membership.set([id], image.excluded ? 0 : 1);
+    },
+    category: (id, category) => {void run('Categoria',()=>request('edit',{ids:[id],patch:{category}}));},
+    caption: changeCaption,
+    discard: id => {void run('Scarto modifica', async () => {
+      const draft = draftRef.current[id]; if (!draft) return;
+      if (current.current?.images.find(x => x.id === id)?.captionDraft)
+        await request('captionDraft',{id,draft:null,draftRevision:draft.draftRevision});
+      const copy = {...draftRef.current};delete copy[id];draftRef.current=copy;setDrafts(copy);
+    });},
+  };
+  const toggleCard = useCallback((id:string)=>cardHandlers.current!.toggle(id),[]);
+  const categoryCard = useCallback((id:string,c:string)=>cardHandlers.current!.category(id,c),[]);
+  const captionCard = useCallback((image:Image,value:string)=>cardHandlers.current!.caption(image,value),[]);
+  const discardCard = useCallback((id:string)=>cardHandlers.current!.discard(id),[]);
   function accept(s: View) {
     if (s.dataset !== activeDataset.current) return;
     current.current = s;
@@ -174,7 +152,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
       if (scope.current === owner) accept(r.data);
     } catch {
       if (scope.current !== owner) return;
-      setError('Non riusciamo a leggere il dataset. Le bozze restano qui; riprova.');
+      setError('Dataset non disponibile. Controlla la connessione e ricarica.');
     }
   }
   async function request(action: string, payload: any = {}) {
@@ -186,17 +164,11 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     if (scope.current !== owner) throw new Error('Dataset cambiato: risposta precedente ignorata');
     accept(r.data);
     if (action === 'edit' && payload.patch.caption === undefined && activeDataset.current === dataset) {
-      setDrafts(old =>
-        Object.fromEntries(
-          Object.entries(old).map(([id, draft]) => {
-            const image = r.data.images.find((x: Image) => x.id === id);
-            return [
-              id,
-              payload.ids.includes(id) && image ? { ...draft, revision: image.revision, persisted: undefined } : draft,
-            ];
-          }),
-        ),
-      );
+      const membershipOnly = Object.keys(payload.patch).length === 1 && payload.patch.excluded !== undefined;
+      const update = (old: Record<string,Draft>) =>
+        rebaseGalleryDrafts(old, payload.ids, s.images, r.data.images, membershipOnly);
+      draftRef.current = update(draftRef.current);
+      setDrafts(update);
     }
     return r.data as View;
   }
@@ -215,7 +187,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     } catch (e: any) {
       if (valid())
         setError(
-          e.response?.data?.error ?? 'Operazione non confermata. Le caption e gli originali restano preservati.',
+          e.response?.data?.error ?? 'Salvataggio non confermato. Controlla la connessione e ricarica.',
         );
     } finally {
       if (valid()) {
@@ -229,7 +201,6 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     initialized.current = '';
     setState(null);
     setDrafts({});
-    setTagDrafts({});
     cancelSelection();
     setTextPreview(null);
     setTextToolsOpen(false);
@@ -270,7 +241,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
         if (!advanced && scope.current === owner) await refresh();
       } catch {
         if (scope.current === owner)
-          setError('Connessione interrotta: mostriamo gli ultimi dati confermati. Il lavoro già avviato continua sul server; aggiorniamo appena torna la connessione.');
+          setError('Connessione interrotta. I lavori avviati continuano sul server.');
       } finally {
         release();
       }
@@ -279,7 +250,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
   }, [dataset, advanced]);
   useEffect(() => {
     const leave = (e: BeforeUnloadEvent) => {
-      if (Object.keys(draftRef.current).length || prefDirty.current) {
+      if (Object.keys(draftRef.current).length || prefDirty.current || membershipOwner.current?.controller.pending) {
         e.preventDefault();
         e.returnValue = '';
       }
@@ -369,11 +340,11 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
           draftRef.current = update(draftRef.current);
           setDrafts(update);
         }
-        if (scope.current === owner) setSaveStatus('Bozze protette; premi Salva caption per applicarle');
+        if (scope.current === owner) setSaveStatus('Modifiche salvate in bozza');
       } catch (e: any) {
         if (scope.current !== owner) return;
         draftFailure.current = true;
-        setError(e.response?.data?.error ?? 'Bozza non protetta sul server; resta aperta qui.');
+        setError(e.response?.data?.error ?? 'Bozza non salvata. Controlla la connessione.');
       } finally {
         release();
       }
@@ -457,14 +428,12 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
       if (failures.length) setError(failures.join('\n'));
     });
   }
-  const images = (state?.images ?? []).filter(x => !x.discarded),
-    visible = images.filter(x =>
-      (x.filename + ' ' + (drafts[x.id]?.caption ?? x.caption)).toLowerCase().includes(search.toLowerCase()) &&
-      (categoryFilter === 'all' || x.category === categoryFilter) &&
-      (membershipFilter === 'all' || (membershipFilter === 'included' ? !x.excluded : !!x.excluded)) &&
-      (!tagFilter || x.tags.some(t=>t.toLowerCase().includes(tagFilter.toLowerCase()))) &&
-      (!minQuality || (x.analysis && x.analysis.quality>=minQuality)),
-    ),
+  const images = membership.overlay(state?.images ?? []).filter(x => !x.discarded),
+    filters = {search, membership: membershipFilter, categories: categoryFilters, minQuality},
+    visible = galleryVisible(images, drafts, filters),
+    sections = gallerySections(visible),
+    ordered = sections.flatMap(x => x.items),
+    categoryCounts = galleryVisible(images, drafts, {...filters, categories: galleryCategories}),
     selected = images.filter(x => !x.excluded),
     automatic = state?.jobs.filter(x => x.kind === 'caption' && x.automatic) ?? [],
     unresolved = automatic.some(x =>
@@ -502,9 +471,11 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
   }, []);
   useEffect(() => {
     cancelSelection();
-  }, [search, size, selectionMode]);
+  }, [search, size, selectionMode, categoryFilters, membershipFilter, minQuality, ordered.map(x=>x.id).join('|')]);
   function captionSources() {
-    return captionTextSources(current.current?.images ?? [], draftRef.current, textScope, search);
+    const images = membership.overlay(current.current?.images ?? []);
+    const visible = galleryVisible(images, draftRef.current, {search,membership:membershipFilter,categories:categoryFilters,minQuality});
+    return captionTextSources(images, draftRef.current, textScope, search, visible.map(x=>x.id));
   }
 
   const textPreviewFresh =
@@ -527,7 +498,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     }
     setTextPreview(null);
   }
-  function gallery(items: Image[]) {
+  function gallery() {
     const hits = new Set(drag ? selectionHits(drag) : []);
     const rectangle = drag ? selectionRectangle(drag.start, drag.end) : null;
     return (
@@ -544,7 +515,6 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
           if (
             event.pointerType !== 'mouse' ||
             event.button !== 0 ||
-            busy ||
             !state ||
             (event.target as Element).closest('input,textarea,button,a,label,select,summary,[contenteditable]')
           )
@@ -593,11 +563,11 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
           const ids = selectionCommit(
             ended,
             scope.current,
-            visible.map(x => x.id),
+            ordered.map(x => x.id),
           );
           cancelSelection();
           if (ids.length)
-            void run('Salvataggio selezione', () => request('edit', { ids, patch: { excluded: ended.excluded } }));
+            membership.set(ids, ended.excluded);
           else if (
             Math.hypot(ended.end.x - ended.start.x, ended.end.y - ended.start.y) < 5 &&
             ended.scope === scope.current
@@ -609,11 +579,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                 old.start.y >= x.rect.top &&
                 old.start.y <= x.rect.bottom,
             );
-            const image = current.current?.images.find(x => x.id === target?.id);
-            if (image)
-              void run('Salvataggio selezione', () =>
-                request('edit', { ids: [image.id], patch: { excluded: image.excluded ? 0 : 1 } }),
-              );
+            if (target) toggleCard(target.id);
           }
         }}
         onPointerCancel={() => {
@@ -641,117 +607,16 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
             }}
           />
         )}
-        {items.map(image => (
-          <article
-            key={image.id}
-            style={{ minWidth: 0, padding: 12, background: '#111827', border: hits.has(image.id) ? '2px solid #60a5fa' : '2px solid transparent' }}
-            className="min-w-0 rounded-xl space-y-3"
-          >
-            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, minWidth: 0 }}>
-              <input
-                type="checkbox"
-                aria-label={'Seleziona ' + image.filename}
-                className="h-5 w-5"
-                checked={!image.excluded}
-                disabled={!!busy}
-                onChange={() =>
-                  void run('Salvataggio selezione', () =>
-                    request('edit', { ids: [image.id], patch: { excluded: image.excluded ? 0 : 1 } }),
-                  )
-                }
-              />
-              <span title={image.filename} style={{ flex: '1 1 120px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{image.filename}</span>
-              {image.analysisStatus?.phase === 'complete' && (
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap', flexShrink: 0 }} className="text-sm">
-                  <select
-                    aria-label={'Categoria ' + image.filename}
-                    className="rounded border border-gray-600 bg-gray-950 p-1"
-                    value={image.category}
-                    disabled={!!busy}
-                    onChange={e =>
-                      void run('Revisione categoria', () =>
-                        request('edit', { ids: [image.id], patch: { category: e.target.value } }),
-                      )
-                    }
-                  >
-                    <option value="face">Volto</option>
-                    <option value="body">Corpo</option>
-                    <option value="variety">Varietà</option>
-                    <option value="unclassified">Non classificata</option>
-                  </select>
-                  <span className="text-gray-400">{image.categorySource === 'manual' ? 'Rivista' : 'Automatica'}</span>
-                </label>
-              )}
-            </div>
-            {['queued','running','waiting'].includes(state?.analysisProgress.phase ?? '') && (
-              <p className="text-xs text-amber-200" style={{ margin: '6px 0', minHeight: 16 }}>
-                {image.analysisStatus?.phase !== 'complete' ? 'Analisi in attesa' :
-                  state?.analysisProgress.tentative.includes(image.id) ? 'Proposta provvisoria: includi' : 'Proposta provvisoria: escludi'}
-                {(image.reviewRevision ?? 0) > 0 ? ' · revisione protetta' : ''}
-              </p>
-            )}
-            <div
-              data-selection-image={image.id}
-              style={{ cursor: 'crosshair' }}
-              onClick={event => {
-                if (
-                  (event.nativeEvent as PointerEvent).pointerType === 'mouse' ||
-                  (event.target as Element).closest('button')
-                )
-                  return;
-                if (!busy)
-                  void run('Salvataggio selezione', () =>
-                    request('edit', { ids: [image.id], patch: { excluded: image.excluded ? 0 : 1 } }),
-                  );
-              }}
-            >
-              <PreviewImage dataset={dataset} image={image} height={Math.min(520, Math.max(220, size * .76))} />
-            </div>
-            <div className="my-2 flex flex-wrap items-center gap-2 text-xs" aria-label={'Qualità e tag '+image.filename}>
-              <span className="rounded bg-gray-800 px-2 py-1">{image.analysis && Number.isFinite(image.analysis.quality) ? `Qualità ${Math.round(image.analysis.quality)}/100` : 'Qualità in attesa'}</span>
-              {image.tags.map(tag=><span key={tag} className="rounded bg-gray-800 px-2 py-1">{tag}</span>)}
-            </div>
-            <label className="block text-sm">
-              Caption
-              <textarea
-                aria-label={'Caption ' + image.filename}
-                className={field + ' mt-2 text-base'}
-                rows={5}
-                value={drafts[image.id]?.caption ?? image.caption}
-                onChange={e => changeCaption(image, e.target.value)}
-              />
-            </label>
-            <label className="block text-xs mt-2">Tag
-              <input aria-label={'Tag '+image.filename} className={field+' mt-1'} value={tagDrafts[image.id] ?? image.tags.join(', ')}
-                onChange={e=>setTagDrafts(old=>({...old,[image.id]:e.target.value}))} placeholder="Tag separati da virgole" />
-            </label>
-            {tagDrafts[image.id] !== undefined && <button className="text-sm underline" disabled={!!busy}
-              onClick={()=>void run('Salvataggio tag',async()=>{const value=tagDrafts[image.id];await request('edit',{ids:[image.id],patch:{tags:value.split(',').map(x=>x.trim()).filter(Boolean)}});
-                setTagDrafts(old=>{if(old[image.id]!==value)return old;const copy={...old};delete copy[image.id];return copy;});})}>Salva tag</button>}
-            {drafts[image.id] && (
-              <div className="flex items-center gap-3 text-sm">
-                <span className="text-amber-200">{drafts[image.id].persisted===drafts[image.id].caption?'Bozza salvata sul server · da applicare':'Bozza da salvare'}</span>
-                <button
-                  className="underline"
-                  onClick={() =>
-                    void run('Scarto bozza', async () => {
-                      const d = draftRef.current[image.id];
-                      if (current.current?.images.find(x => x.id === image.id)?.captionDraft)
-                        await request('captionDraft', { id: image.id, draft: null, draftRevision: d.draftRevision });
-                      setDrafts(old => {
-                        const copy = { ...old };
-                        delete copy[image.id];
-                        return copy;
-                      });
-                    })
-                  }
-                >
-                  Scarta bozza
-                </button>
-              </div>
-            )}
-          </article>
-        ))}
+        {sections.flatMap((section,index) => [
+          ...(index===0 || sections[index-1].excluded!==section.excluded ? [
+            <h3 key={'membership-'+section.excluded} className="text-xl font-semibold" style={{gridColumn:'1 / -1'}}>{section.excluded ? 'Non selezionate' : 'Selezionate'} · {visible.filter(x=>!!x.excluded===!!section.excluded).length}</h3>,
+          ] : []),
+          <h4 key={'category-'+section.excluded+'-'+section.category} className="text-gray-300" style={{gridColumn:'1 / -1'}}>{categoryLabels[section.category]} · {section.items.length}</h4>,
+          ...section.items.map(image => <GalleryImageCard key={image.id} dataset={dataset} image={image} draft={drafts[image.id]}
+            height={Math.min(520,Math.max(220,size*.76))} membership={membershipFilter} pending={membership.has(image.id)} hit={hits.has(image.id)}
+            tentative={['queued','running','waiting'].includes(state?.analysisProgress.phase??'') ? state?.analysisProgress.tentative.includes(image.id) : undefined}
+            onToggle={toggleCard} onCategory={categoryCard} onCaption={captionCard} onDiscardDraft={discardCard} />),
+        ])}
       </div>
     );
   }
@@ -787,31 +652,18 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
               />
             </label>
           </header>
-          <details
-            className="rounded-xl border border-gray-700 p-4"
-            open={advanced}
-            onToggle={e => {
-              (() => {
-                setAdvanced(e.currentTarget.open);
-                if (e.currentTarget.open) setAdvancedMounted(true);
-              })();
-              if (!e.currentTarget.open) void refresh();
-            }}
-          >
-            <summary className="cursor-pointer text-lg">Avanzate</summary>
-            {state && <p className="my-3 text-sm text-gray-400">Spazio: {(state.space.free/1e9).toFixed(2)} GB liberi · {(state.space.missingBytes/1e6).toFixed(1)} MB di copie mancanti · {(state.space.outputBytes/1e6).toFixed(1)} MB per risultati · riserva {(state.space.reserve/1e9).toFixed(0)} GB. Le copie derivate duplicate completate vengono consolidate quando necessario; gli originali restano separati.</p>}
-            {advancedMounted && <AdvancedWorkspace dataset={dataset} onNativeView={onNativeView} />}
-          </details>
+
           <section className="rounded-xl border border-gray-700 bg-gray-900 p-4 sm:p-5 space-y-4">
             {state && images.length > 0 && (
               <section aria-label="Analisi immagini" className="space-y-3">
+                <h3 className="text-lg font-semibold">Analisi e selezione</h3>
                 <div style={{ display:'flex', flexWrap:'wrap', alignItems:'end', gap:12 }}>
                   <label className="text-sm" style={{ whiteSpace:'nowrap' }}>Immagini per training
                     <input aria-label="Immagini per training" type="number" min={1} max={1000}
                       className="rounded bg-gray-950 p-2 ml-2" style={{ width:90 }} value={target} onChange={e=>setTarget(e.target.value)} />
                   </label>
                   <button className={button+' bg-blue-700'}
-                    disabled={!!busy || ['queued','running','waiting'].includes(state.analysisProgress?.phase) || !Number.isInteger(Number(target)) || Number(target)<1 || Number(target)>1000}
+                    disabled={!!busy || !!membership.pending || ['queued','running','waiting'].includes(state.analysisProgress?.phase) || !Number.isInteger(Number(target)) || Number(target)<1 || Number(target)>1000}
                     onClick={()=>void run('Analisi',()=>request('automaticAnalysis',{ count:Number(target), retry:state.analysisProgress?.phase==='blocked' }), 'explicit-analysis')}>
                     {state.analysisProgress?.phase==='blocked' ? 'Riprova analisi' : 'Analisi'}
                   </button>
@@ -836,6 +688,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                 </div>
               </section>
             )}
+            <h3 className="text-lg font-semibold border-t border-gray-700 pt-4">Caption</h3>
             <label className="block text-sm">
               Modello locale
               <select
@@ -875,13 +728,14 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                   !!busy ||
                   !state ||
                   !selected.length ||
+                  !!membership.pending ||
                   unresolved ||
                   !!Object.keys(drafts).length ||
                   !state.captionHostSupported
                 }
                 onClick={() => void generate()}
               >
-                Genera caption · {selected.length} immagini
+                Genera caption · {selected.length} {selected.length===1 ? "immagine" : "immagini"}
               </button>
               <span aria-live="polite" className="text-sm text-gray-400">
                 {prefStatus}
@@ -935,7 +789,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
               <div role="alert" className="rounded-lg bg-red-950/60 text-red-200 p-4 whitespace-pre-wrap break-words">
                 {error}
                 <button className={button + ' mt-3 block'} onClick={() => void refresh()}>
-                  Aggiorna dati confermati
+                  Ricarica dataset
                 </button>
               </div>
             )}
@@ -1000,38 +854,43 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
               <div className="min-w-0">
                 <h3 className="text-lg">{selected.length} {selected.length === 1 ? "immagine selezionata" : "immagini selezionate"}</h3>
                 <p className="text-sm text-gray-400">
-                  La selezione è salvata e indica quali immagini saranno descritte.
+                  Scegli le immagini da descrivere.
                 </p>
               </div>
               <div className="flex gap-2 flex-wrap">
                 <button
                   className={button}
-                  disabled={!!busy || !visible.length}
+                  disabled={!visible.length}
                   onClick={() =>
-                    void run('Selezione immagini', () =>
-                      request('edit', { ids: visible.map(x => x.id), patch: { excluded: 0 } }),
-                    )
+                    membership.set(visible.map(x=>x.id),0)
                   }
                 >
                   Seleziona tutte visibili
                 </button>
                 <button
                   className={button}
-                  disabled={!!busy || !visible.length}
+                  disabled={!visible.length}
                   onClick={() =>
-                    void run('Deselezione immagini', () =>
-                      request('edit', { ids: visible.map(x => x.id), patch: { excluded: 1 } }),
-                    )
+                    membership.set(visible.map(x=>x.id),1)
                   }
                 >
                   Deseleziona tutte visibili
                 </button>
               </div>
             </div>
+            <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Categorie visibili">
+              {galleryCategories.map(category=><button key={category} className={button+(categoryFilters.includes(category)?' border-blue-400 text-blue-200':'')} aria-pressed={categoryFilters.includes(category)}
+                onClick={()=>setCategoryFilters(old=>old.includes(category)?old.filter(x=>x!==category):[...old,category])}>
+                {categoryLabels[category]} · {categoryCounts.filter(x=>x.category===category).length}
+              </button>)}
+              <button className="underline px-2" onClick={()=>setCategoryFilters([...galleryCategories])}>Mostra tutte</button>
+            </div>
+            {!!membership.pending && <div role="status" className="text-sm text-blue-200">
+              {membership.failed ? membershipFailure(membership.failed) : 'Salvataggio selezione…'}
+              {!!membership.failed && <button className="underline ml-3" onClick={()=>void membership.retry()}>Verifica e salva selezione</button>}
+            </div>}
             <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(min(100%,220px),1fr))', gap:12 }}>
-              <label className="text-sm">Categoria<select aria-label="Filtra categoria" className={field} value={categoryFilter} onChange={e=>setCategoryFilter(e.target.value)}><option value="all">Tutte le categorie</option><option value="face">Volto</option><option value="body">Corpo</option><option value="variety">Varietà</option><option value="unclassified">Da analizzare</option></select></label>
-              <label className="text-sm">Selezione<select aria-label="Filtra selezione" className={field} value={membershipFilter} onChange={e=>setMembershipFilter(e.target.value)}><option value="all">Incluse ed escluse</option><option value="included">Solo incluse</option><option value="excluded">Solo escluse</option></select></label>
-              <label className="text-sm">Tag<input aria-label="Filtra tag" className={field} value={tagFilter} onChange={e=>setTagFilter(e.target.value)} placeholder="Tutti i tag" /></label>
+              <label className="text-sm">Mostra<select aria-label="Filtra selezione" className={field} value={membershipFilter} onChange={e=>setMembershipFilter(e.target.value as MembershipFilter)}><option value="all">Tutte</option><option value="included">Selezionate</option><option value="excluded">Non selezionate</option></select></label>
               <label className="text-sm">Qualità minima: {minQuality}<input aria-label="Qualità minima" type="range" className="w-full" min={0} max={100} value={minQuality} onChange={e=>setMinQuality(Number(e.target.value))} /></label>
               <input
                 aria-label="Cerca immagini"
@@ -1184,13 +1043,28 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                 Trascina sulle immagini. Esc annulla; checkbox anche da touch e tastiera.
               </span>
             </div>
-            {gallery(visible)}
+            {gallery()}
             {state && <p role="status" className="mb-3 text-sm text-gray-400">
               Ultimo salvataggio sul server · {state.managedSync.phase==='synced'?'Sincronizzato su HF':state.managedSync.phase==='local'?'HF non configurato':state.managedSync.phase==='conflict'?'Conflitto HF: entrambe le versioni conservate':state.managedSync.phase==='error'?'Errore HF, salvataggio locale conservato':state.managedSync.phase==='pending'?'Sincronizzazione HF in attesa':'Sincronizzazione HF in corso'}
               {state.managedSync.reason ? ' · '+state.managedSync.reason : ''}
             </p>}
             {state && !images.length && <p className="text-gray-400">Carica le prime immagini per cominciare.</p>}
           </section>
+          <details
+            className="rounded-xl border border-gray-700 p-4"
+            open={advanced}
+            onToggle={e => {
+              (() => {
+                setAdvanced(e.currentTarget.open);
+                if (e.currentTarget.open) setAdvancedMounted(true);
+              })();
+              if (!e.currentTarget.open) void refresh();
+            }}
+          >
+            <summary className="cursor-pointer text-lg">Avanzate</summary>
+            {state && <p className="my-3 text-sm text-gray-400">Spazio: {(state.space.free/1e9).toFixed(2)} GB liberi · {(state.space.missingBytes/1e6).toFixed(1)} MB di copie mancanti · {(state.space.outputBytes/1e6).toFixed(1)} MB per risultati · riserva {(state.space.reserve/1e9).toFixed(0)} GB. Le copie derivate duplicate completate vengono consolidate quando necessario; gli originali restano separati.</p>}
+            {advancedMounted && <AdvancedWorkspace dataset={dataset} onNativeView={onNativeView} />}
+          </details>
 
         </div>
       </MainContent>

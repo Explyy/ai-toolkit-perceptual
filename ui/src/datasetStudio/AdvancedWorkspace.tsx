@@ -104,10 +104,8 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
     [category, setCategory] = useState('all'),
     [membership, setMembership] = useState('all'),
     [minScore, setMinScore] = useState(0),
-    [tag, setTag] = useState(''),
     [cardSize, setCardSize] = useState(320);
-  const [drafts, setDrafts] = useState<Record<string, { caption: string; tags: string; revision: number }>>({}),
-    [target, setTarget] = useState(3),
+  const [target, setTarget] = useState(3),
     [tier, setTier] = useState(1024),
     [crop, setCrop] = useState('fit'),
     [repo, setRepo] = useState('daverave/Personal'),
@@ -163,14 +161,13 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
       const r = await apiClient.get('/api/dataset-studio', { params: { dataset } });
       accept(r.data);
     } catch (e: any) {
-      setError(e.response?.data?.error ?? 'Unable to load dataset');
+      setError(e.response?.data?.error ?? 'Dataset non disponibile. Controlla la connessione.');
     }
   }
   useEffect(() => {
     setState(null);
     current.current = null;
     restoredDraft.current = '';
-    setDrafts({});
     void refresh();
   }, [dataset]);
   useEffect(() => {
@@ -195,16 +192,6 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
     state?.settings.testId,
     state?.settings.testPrompt,
   ]);
-  useEffect(() => {
-    const handler = (e: BeforeUnloadEvent) => {
-      if (Object.keys(drafts).length) {
-        e.preventDefault();
-        e.returnValue = '';
-      }
-    };
-    window.addEventListener('beforeunload', handler);
-    return () => window.removeEventListener('beforeunload', handler);
-  }, [drafts]);
   useOpenImagesModalOnDrag(dataset, refresh);
   async function request(action: string, payload: any = {}) {
     const r = await apiClient.post('/api/dataset-studio', {
@@ -229,17 +216,6 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
       mutation.current = false;
       setBusy('');
     }
-  }
-  function changeDraft(x: Image, field: 'caption' | 'tags', value: string) {
-    setDrafts(old => ({
-      ...old,
-      [x.id]: {
-        caption: old[x.id]?.caption ?? x.caption,
-        tags: old[x.id]?.tags ?? x.tags.join(', '),
-        revision: old[x.id]?.revision ?? x.revision,
-        [field]: value,
-      },
-    }));
   }
   async function settingsSave() {
     await request('settings', {
@@ -338,10 +314,9 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
         (membership === 'included' && !x.excluded && !x.discarded) ||
         (membership === 'excluded' && !!x.excluded) ||
         (membership === 'removed' && !!x.discarded)) &&
-      (!tag || x.tags.some(t => t.toLowerCase().includes(tag.toLowerCase()))) &&
       (!minScore || (!!x.analysis && x.analysis.quality >= minScore)) &&
       (!filter ||
-        (x.filename + ' ' + (drafts[x.id]?.caption ?? x.caption) + ' ' + x.tags.join(' '))
+        (x.filename + ' ' + x.caption)
           .toLowerCase()
           .includes(filter.toLowerCase())),
   );
@@ -366,15 +341,6 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
             <label className="block text-xs">
               Caption
               <p className="whitespace-pre-wrap mt-2 text-sm">{x.caption}</p>
-            </label>
-            <label className="block text-xs">
-              Tags
-              <input
-                aria-label={'Tags ' + x.filename}
-                className={inputClass + ' mt-1'}
-                value={drafts[x.id]?.tags ?? x.tags.join(', ')}
-                onChange={e => changeDraft(x, 'tags', e.target.value)}
-              />
             </label>
             <div className="flex flex-wrap gap-2">
               <select
@@ -402,49 +368,6 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
                 {x.pinned ? 'Unpin' : 'Pin'}
               </button>
             </div>
-            {drafts[x.id] && (
-              <div className="flex flex-wrap gap-2">
-                <button
-                  className={buttonClass}
-                  disabled={!!busy}
-                  onClick={() =>
-                    void run('Saving caption/tags', async () => {
-                      await request('edit', {
-                        ids: [x.id],
-                        patch: {
-                          baseRevision: drafts[x.id].revision,
-
-                          tags: drafts[x.id].tags
-                            .split(',')
-                            .map(x => x.trim())
-                            .filter(Boolean),
-                        },
-                      });
-                      setDrafts(d => {
-                        const copy = { ...d };
-                        delete copy[x.id];
-                        return copy;
-                      });
-                    })
-                  }
-                >
-                  Salva tag
-                </button>
-                <button
-                  className={buttonClass}
-                  onClick={() =>
-                    setDrafts(d => {
-                      const copy = { ...d };
-                      delete copy[x.id];
-                      return copy;
-                    })
-                  }
-                >
-                  Scarta bozza tag
-                </button>
-                <span className="text-xs text-amber-300">Unsaved draft retained</span>
-              </div>
-            )}
           </article>
         ))}
       </div>
@@ -485,20 +408,20 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
               <div role="alert" className="text-red-300 bg-red-950/50 p-3 rounded">
                 {error}
                 <button className={buttonClass + ' ml-3'} onClick={() => void refresh()}>
-                  Refresh server state
+                  Ricarica dataset
                 </button>
               </div>
             )}
-            {!state && !error && <p>Loading dataset…</p>}
+            {!state && !error && <p>Caricamento dataset…</p>}
           </div>
           {state && tab === 'Metadati' && (
             <>
               <section className="border border-gray-700 rounded-lg p-4 space-y-3">
-                <h3>View filters</h3>
+                <h3>Filtri immagini</h3>
                 <div className="grid gap-3 grid-cols-1 sm:grid-cols-3">
                   <input
                     className={inputClass}
-                    placeholder="Search filename / caption"
+                    placeholder="Cerca immagine o caption"
                     aria-label="Search"
                     value={filter}
                     onChange={e => setFilter(e.target.value)}
@@ -523,13 +446,6 @@ export default function AdvancedWorkspace({ dataset, onNativeView }: { dataset: 
                       <option key={c}>{c}</option>
                     ))}
                   </select>
-                  <input
-                    className={inputClass}
-                    placeholder="Filter tag"
-                    aria-label="Tag filter"
-                    value={tag}
-                    onChange={e => setTag(e.target.value)}
-                  />
                   <label className="text-sm">
                     Minimum measured score
                     <input

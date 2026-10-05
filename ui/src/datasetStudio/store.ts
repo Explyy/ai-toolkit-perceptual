@@ -366,7 +366,8 @@ export class StudioStore {
       Array.isArray(ids) && ids.length > 0 && ids.length <= 2500 && new Set(ids).size === ids.length,
       'Select valid unique image identities',
     );
-    return this.mutate(rev, s => {
+    const membershipOnly = patch && Object.keys(patch).length === 1 && Object.keys(patch)[0] === 'excluded';
+    const apply = (s: State) => {
       for (const id of ids) {
         const x = s.images.find(i => i.id === id);
         ensure(x, 'Image changed or disappeared', 409);
@@ -397,6 +398,43 @@ export class StudioStore {
           if (patch[k] !== undefined) x[k] = integer(patch[k], 0, 1);
         x.revision++;
       }
+    };
+    if (!membershipOnly) return this.mutate(rev, apply);
+    integer(patch.excluded, 0, 1);
+    return this.locked(async () => {
+      const s = await this.raw();
+      ensure(s.revision === rev, 'Stale dataset revision. Refresh selection before retrying.', 409);
+      // Membership edits are not discovery. Validate every targeted original
+      // before any application; authoritative read/export/analysis scans remain.
+      for (const id of ids) {
+        const image = s.images.find(x => x.id === id);
+        ensure(image, 'Image changed or disappeared', 409);
+        const original = await contained(this.datasetRoot, path.join(this.datasetRoot, image.relative));
+        const stat = await fs.stat(original);
+        ensure(stat.isFile() && stat.size === image.size && stat.size <= 24*1024*1024, 'Original image changed; refresh selection before retrying', 409);
+        await this.source(image);
+        {
+          const caption = await contained(this.datasetRoot, captionPath(path.join(this.datasetRoot, image.relative), 'txt'), true);
+          let value = '';
+          try {
+            const captionStat = await fs.stat(caption);
+            ensure(captionStat.isFile() && captionStat.size < 64000, 'Caption must be a regular file below64KB');
+            value = await fs.readFile(caption, 'utf8');
+          } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
+          ensure(image.captionOverride || value === image.caption, 'Original caption changed; refresh selection before retrying', 409);
+        }
+      }
+      const freshDrafts = s.images.filter(x => ids.includes(x.id) && x.captionDraft?.baseRevision === x.revision).map(x => x.id);
+      apply(s);
+      for (const id of freshDrafts) {
+        const image = s.images.find(x => x.id === id)!;
+        image.captionDraft!.baseRevision = image.revision;
+        image.captionDraftRevision = (image.captionDraftRevision ?? 0) + 1;
+        image.captionDraft!.revision = image.captionDraftRevision;
+      }
+      s.revision++;
+      await this.save(s);
+      return s;
     });
   }
   async analyze(rev: number, id: string) {

@@ -164,3 +164,17 @@ test('another editor protected revision wins CAS; rejected protection never reac
     await fs.rm(f.root, { recursive: true, force: true });
   }
 });
+
+test('visible find-replace uses exact intersected gallery filters, selected scope remains dataset-wide', () => {
+  const rich = images.map((x,i) => ({...x, category: i < 2 ? 'face' : 'body', analysis: {quality: i === 1 ? 80 : 40}}));
+  const drafts = {b: {caption: 'draft cat'}};
+  const ids = rich.filter(x => x.category === 'face' && !!x.excluded && x.analysis.quality >= 60 &&
+    (drafts[x.id as 'b']?.caption ?? x.caption).includes('draft')).map(x=>x.id);
+  const visible = captionTextSources(rich, drafts, 'visible', '', ids);
+  assert.deepEqual(visible.map(x=>x.id), ['b']);
+  assert.equal(previewCaptionText(visible, 'cat', 'dog').changes[0].next, 'draft dog');
+  assert.deepEqual(captionTextSources(rich, drafts, 'visible', '', []).map(x=>x.id), []);
+  assert.deepEqual(captionTextSources(rich, drafts, 'selected', '', ids).map(x=>x.id), ['a','c']);
+  const preview = previewCaptionText(visible, 'cat', 'dog');
+  assert.equal(captionPreviewCurrent(preview, captionTextSources(rich, drafts, 'visible', '', []), 'cat', 'dog'), false);
+});
