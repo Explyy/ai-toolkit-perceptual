@@ -1,0 +1,445 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import sharp from 'sharp';
+import { randomUUID } from 'node:crypto';
+import { StudioStore, State, JobLink, atomic, contained, hash } from './store';
+import { ensure, stableJSON, select, analyzePixels } from './domain';
+import { inferredCategory, validateSignals, MODEL_ANALYZER } from './analysisPolicy';
+import { reconcileJob } from './jobs';
+import type { CaptionHost } from './captionFlow';
+import { TOOLKIT_ROOT } from '@/paths';
+export type AnalysisSummary = {
+  config: string;
+  phase: 'unavailable' | 'pending' | 'active' | 'failed' | 'complete';
+  reason?: string;
+  count?: number;
+  deficits?: Record<string, number>;
+  conflicts?: string[];
+};
+export async function analysisConfiguration() {
+  const file = path.join(TOOLKIT_ROOT, 'extensions_built_in', 'dataset_studio_analysis', 'models.json');
+  const manifest = JSON.parse(await fs.readFile(file, 'utf8'));
+  ensure(manifest.version === MODEL_ANALYZER, 'Unsupported model manifest');
+  return { manifest, config: hash(stableJSON(manifest)) };
+}
+async function modelPrerequisite(manifest: any) {
+  ensure(
+    process.env.DATASET_STUDIO_ANALYSIS_ENABLED === '1',
+    'Analisi non disponibile: serve il cloud dedicato con modelli verificati.',
+    403,
+  );
+  const base = process.env.DATASET_STUDIO_ROOT;
+  ensure(base && path.isAbsolute(base), 'Storage cloud di analisi non configurato', 403);
+  const root = await contained(base!, path.join(base!, 'cache', 'analysis-models'));
+  for (const [key, model] of Object.entries(manifest.models) as [string, any][]) {
+    for (const [name, expected] of Object.entries(model.files) as [string, any][]) {
+      const file = await contained(root, path.join(root, key, name));
+      ensure(
+        (await fs.stat(file)).size === expected.size && hash(await fs.readFile(file)) === expected.sha256,
+        'Modelli di analisi mancanti o checksum diverso: ' + key,
+        403,
+      );
+    }
+  }
+}
+function summarize(s: State, value: AnalysisSummary) {
+  if (stableJSON(s.analysisFlow) !== stableJSON(value)) {
+    s.analysisFlow = value;
+    s.revision++;
+    return true;
+  }
+  return false;
+}
+export function applyProposal(s: State, config: string) {
+  const pending = s.images.filter(x => !x.discarded && x.analysis?.model?.config !== config);
+  if (pending.length) return false;
+  const candidates = s.images.map(x => ({ ...x, excluded: (x.reviewRevision ?? 0) > 0 ? x.excluded : 0 }));
+  const proposal = select(candidates, s.settings.count, s.settings.testId),
+    chosen = new Set(proposal.selected.map(x => x.id));
+  let changed = false;
+  for (const image of s.images)
+    if (!image.discarded && (image.reviewRevision ?? 0) === 0) {
+      const excluded = chosen.has(image.id) ? 0 : 1;
+      if (image.excluded !== excluded) {
+        image.excluded = excluded;
+        changed = true;
+      }
+    }
+  const summaryChanged = summarize(s, {
+    config,
+    phase: 'complete',
+    count: proposal.selected.length,
+    deficits: proposal.deficits,
+    conflicts: proposal.conflicts,
+  });
+  if (changed && !summaryChanged) s.revision++;
+  return summaryChanged || changed;
+}
+export async function prepareAnalysis(st: StudioStore, db: any, sqlite: string, host: CaptionHost, retry = false) {
+  const { manifest, config } = await analysisConfiguration();
+  let s = await st.read();
+  const missing = s.images
+    .filter(x => !x.discarded && x.analysis?.model?.config !== config)
+    .sort((a, b) => a.sha.localeCompare(b.sha) || a.id.localeCompare(b.id));
+  if (!missing.length)
+    return st.locked(async () => {
+      const state = await st.scan(await st.raw());
+      if (applyProposal(state, config)) await st.save(state);
+      return state;
+    });
+  const digest = hash(stableJSON({ config, items: missing.map(x => ({ id: x.id, sha: x.sha })) }));
+  const previous = s.jobs.find(x => x.kind === 'analysis' && x.automatic?.digest === digest);
+  if (previous && !retry) return reconcileAnalysis(st, previous.automatic!.id, db, host);
+  try {
+    ensure(
+      host.platform === 'linux' && host.gpu0 && !host.preview,
+      'Analisi non disponibile qui: nessun modello viene eseguito sul Mac o nel preview.',
+      403,
+    );
+    await modelPrerequisite(manifest);
+  } catch (e: any) {
+    return st.locked(async () => {
+      const state = await st.scan(await st.raw());
+      let changed = false;
+      for (const x of state.images)
+        if (x.analysis?.model?.config !== config) {
+          const status = { config, phase: 'unavailable' as const, reason: 'Modelli o host dedicato non disponibili' };
+          if (stableJSON(x.analysisStatus) !== stableJSON(status)) {
+            x.analysisStatus = status;
+            changed = true;
+          }
+        }
+      if (
+        summarize(state, {
+          config,
+          phase: 'unavailable',
+          reason: e.code === 'ENOENT' ? 'Modelli verificati non ancora disponibili sul cloud.' : e.message,
+        })
+      )
+        changed = true;
+      if (changed) {
+        state.revision++;
+        await st.save(state);
+      }
+      return state;
+    });
+  }
+  let link: JobLink;
+  s = await st.locked(async () => {
+    const state = await st.scan(await st.raw());
+    const old = state.jobs.find(x => x.kind === 'analysis' && x.automatic?.digest === digest);
+    if (old) {
+      link = old;
+      return state;
+    }
+    const id = randomUUID(),
+      folder = path.join(st.folder, 'analysis', digest),
+      name = 'studio-analysis-' + digest.slice(0, 24);
+    const cfg = {
+      job: 'extension',
+      config: {
+        name,
+        process: [
+          { type: 'dataset_studio_analysis', request: path.join(folder, 'request.json'), sqlite_db_path: sqlite },
+        ],
+      },
+    };
+    link = {
+      kind: 'analysis',
+      name,
+      state: 'intent',
+      folder,
+      scope: structuredClone(missing),
+      config: cfg,
+      automatic: { id, digest, gpu: '0', phase: 'prepared', createdAt: new Date().toISOString() },
+    };
+    state.jobs.push(link);
+    for (const x of state.images) if (missing.some(m => m.id === x.id)) x.analysisStatus = { config, phase: 'pending' };
+    summarize(state, { config, phase: 'pending' });
+    state.revision++;
+    await st.save(state);
+    return state;
+  });
+  return reconcileAnalysis(st, link!.automatic!.id, db, host, retry);
+}
+function identity(row: any, link: JobLink, st: StudioStore) {
+  ensure(
+    row &&
+      row.id === link.jobId &&
+      row.name === link.name &&
+      row.job_type === 'analysis' &&
+      row.job_ref === st.datasetRoot &&
+      row.gpu_ids === '0' &&
+      stableJSON(JSON.parse(row.job_config)) === stableJSON(link.config),
+    'Analysis job identity changed; no queue mutation',
+    409,
+  );
+}
+async function stage(st: StudioStore, link: JobLink, config: string) {
+  const space = await fs.statfs(st.folder);
+  ensure(
+    space.bavail * space.bsize >=
+      Number(process.env.DATASET_STUDIO_MIN_FREE_BYTES ?? 24000000000) + link.scope!.reduce((n, x) => n + x.size, 0),
+    'Analisi sospesa: spazio riservato insufficiente; nessun originale eliminato',
+    409,
+  );
+  await contained(st.folder, link.folder!, true);
+  await fs.mkdir(link.folder!, { recursive: true });
+  const items = [];
+  for (const [i, image] of link.scope!.entries()) {
+    const input = 'input-' + String(i).padStart(6, '0') + path.extname(image.filename).toLowerCase(),
+      output = 'result-' + String(i).padStart(6, '0');
+    const file = await contained(st.folder, path.join(link.folder!, input), true),
+      bytes = await st.source(image);
+    try {
+      ensure(hash(await fs.readFile(file)) === image.sha, 'Staged analysis bytes changed', 409);
+    } catch (e: any) {
+      if (e.code !== 'ENOENT') throw e;
+      await atomic(file, bytes);
+    }
+    items.push({ id: image.id, sha: image.sha, input, output });
+  }
+  const value = { name: link.name, dataset: st.datasetRoot, config, items };
+  const request = await contained(st.folder, path.join(link.folder!, 'request.json'), true);
+  try {
+    ensure(
+      stableJSON(JSON.parse(await fs.readFile(request, 'utf8'))) === stableJSON(value),
+      'Analysis request changed',
+      409,
+    );
+  } catch (e: any) {
+    if (e.code !== 'ENOENT') throw e;
+    await atomic(request, stableJSON(value));
+  }
+}
+export type ProcessProbe = {
+  platform: string;
+  host: string;
+  boot: () => Promise<string>;
+  namespace: () => Promise<string>;
+  stat: (pid: number) => Promise<string>;
+};
+const processProbe: ProcessProbe = {
+  platform: os.platform(),
+  host: os.hostname(),
+  boot: async () => (await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(),
+  namespace: () => fs.readlink('/proc/self/ns/pid'),
+  stat: pid => fs.readFile('/proc/' + pid + '/stat', 'utf8'),
+};
+export async function analysisProcessState(
+  st: StudioStore,
+  link: JobLink,
+  row: any,
+  probe: ProcessProbe = processProbe,
+): Promise<'alive' | 'dead' | 'unknown'> {
+  if (probe.platform !== 'linux' || !row.pid || !Number.isInteger(row.pid)) return 'unknown';
+  try {
+    const file = await contained(st.folder, path.join(link.folder!, 'runtime.json'));
+    const receipt = JSON.parse(await fs.readFile(file, 'utf8'));
+    if (
+      receipt.pid !== row.pid ||
+      receipt.host !== probe.host ||
+      receipt.boot !== (await probe.boot()) ||
+      receipt.namespace !== (await probe.namespace()) ||
+      receipt.name !== link.name
+    )
+      return 'unknown';
+    try {
+      const current = await probe.stat(row.pid),
+        fields = current
+          .slice(current.lastIndexOf(')') + 1)
+          .trim()
+          .split(/\s+/);
+      if (fields[19] !== receipt.start || fields[0] === 'Z') return 'dead';
+      return 'alive';
+    } catch (e: any) {
+      return e.code === 'ENOENT' ? 'dead' : 'unknown';
+    }
+  } catch {
+    return 'unknown';
+  }
+}
+export async function provenAnalysisDeath(
+  st: StudioStore,
+  link: JobLink,
+  row: any,
+  probe: ProcessProbe = processProbe,
+) {
+  return (await analysisProcessState(st, link, row, probe)) === 'dead';
+}
+export async function applyAnalysisResults(st: StudioStore, link: JobLink, config: string) {
+  const results = new Map<string, any>();
+  for (const [i, image] of link.scope!.entries()) {
+    const folder = path.join(link.folder!, 'result-' + String(i).padStart(6, '0'));
+    const file = await contained(st.folder, path.join(folder, 'result.json'), true);
+    try {
+      const stat = await fs.stat(file);
+      ensure(stat.size <= 1000000, 'Analysis result too large');
+      const model = validateSignals(JSON.parse(await fs.readFile(file, 'utf8')), image.sha, config);
+      const depth = await contained(st.folder, path.join(folder, 'depth.png'));
+      ensure(hash(await fs.readFile(depth)) === model.depth.sha, 'Depth map checksum changed');
+      const pixels = await sharp(await st.source(image))
+        .rotate()
+        .resize(64, 64, { fit: 'fill' })
+        .ensureAlpha()
+        .raw()
+        .toBuffer();
+      results.set(image.id, {
+        ...analyzePixels(new Uint8ClampedArray(pixels), 64, 64, image.width, image.height),
+        model,
+      });
+    } catch (e: any) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+  }
+  return st.locked(async () => {
+    const state = await st.scan(await st.raw());
+    let changed = false;
+    for (const image of state.images) {
+      const result = results.get(image.id),
+        original = link.scope!.find(x => x.id === image.id);
+      if (!result || image.sha !== original?.sha || image.analysis?.model?.config === config) continue;
+      image.analysis = result;
+      image.pose = result.model.persons;
+      image.analysisStatus = { config, phase: 'complete' };
+      if (image.categorySource !== 'manual') {
+        image.category = inferredCategory(result.model).category;
+        image.categorySource = 'automatic';
+      }
+      changed = true;
+    }
+    if (applyProposal(state, config)) changed = true;
+    if (changed) {
+      state.revision++;
+      await st.save(state);
+    }
+    return state;
+  });
+}
+export async function reconcileAnalysis(st: StudioStore, id: string, db: any, host: CaptionHost, retry = false) {
+  let state = await st.read(),
+    link = state.jobs.find(x => x.kind === 'analysis' && x.automatic?.id === id);
+  ensure(link?.automatic, 'Analysis request missing', 404);
+  const { config } = await analysisConfiguration();
+  if (['applied', 'dismissed'].includes(link.automatic.phase)) return state;
+  if (['failed', 'unknown'].includes(link.automatic.phase) && !retry) return state;
+  const setPhase = async (phase: NonNullable<JobLink['automatic']>['phase'], reason?: string) =>
+    st.locked(async () => {
+      const s = await st.scan(await st.raw()),
+        current = s.jobs.find(x => x.automatic?.id === id)!;
+      current.automatic!.phase = phase;
+      current.automatic!.reason = reason;
+      if (phase === 'active') current.automatic!.queued = true;
+      if (phase !== 'applied')
+        summarize(s, {
+          config,
+          phase: phase === 'active' ? 'active' : phase === 'prepared' ? 'pending' : 'failed',
+          reason,
+        });
+      s.revision++;
+      await st.save(s);
+      return s;
+    });
+  try {
+    if (!link.jobId) {
+      await stage(st, link, config);
+      const row = await reconcileJob(db, link, '0', st.datasetRoot);
+      state = await st.locked(async () => {
+        const s = await st.scan(await st.raw()),
+          current = s.jobs.find(x => x.automatic?.id === id)!;
+        current.jobId = row.id;
+        current.state = 'linked';
+        s.revision++;
+        await st.save(s);
+        return s;
+      });
+      link = state.jobs.find(x => x.automatic?.id === id)!;
+    }
+    let recovered = false;
+    let row = await db.job.findUnique({ where: { id: link.jobId } });
+    identity(row, link, st);
+    state = await applyAnalysisResults(st, link, config);
+    if (row.status === 'completed') {
+      ensure(
+        row.step === link.scope!.length && row.total_steps === link.scope!.length,
+        'Analysis did not complete its full native scope',
+        409,
+      );
+      ensure(
+        link.scope!.every(x => state.images.find(y => y.id === x.id)?.analysis?.model?.config === config),
+        'Incomplete analysis results; no completed claim',
+        409,
+      );
+      return setPhase('applied');
+    }
+    if (['running', 'stopping'].includes(row.status)) {
+      const processState = await analysisProcessState(st, link, row);
+      if (processState === 'alive') return setPhase('active');
+      if (processState === 'unknown')
+        return setPhase(
+          'blocked',
+          'Proprietà del processo non verificabile in questo host/namespace: risultati conservati, nessuna ripresa automatica.',
+        );
+      ensure(!row.stop && !row.return_to_queue, 'Analysis explicitly stopped; completed cache retained', 409);
+      const changed = await db.job.updateMany({
+        where: { id: row.id, status: row.status, pid: row.pid },
+        data: { status: 'stopped', pid: null, info: 'Owned analysis process exited; resuming missing cache' },
+      });
+      ensure(changed.count === 1, 'Analysis process state changed', 409);
+      recovered = true;
+      row = await db.job.findUnique({ where: { id: row.id } });
+    }
+    if (['error', 'failed'].includes(row.status)) {
+      if (!retry) return setPhase('failed', 'Analisi non riuscita. Originali e risultati già completati conservati.');
+      await db.job.updateMany({
+        where: { id: row.id, status: row.status },
+        data: { status: 'stopped', pid: null, stop: false },
+      });
+      row = await db.job.findUnique({ where: { id: row.id } });
+    }
+    if (row.status === 'stopped' && retry) {
+      await db.job.updateMany({
+        where: { id: row.id, status: 'stopped' },
+        data: { stop: false, return_to_queue: false },
+      });
+      row = await db.job.findUnique({ where: { id: row.id } });
+    }
+    if (row.status === 'stopped' && link.automatic?.queued && !recovered && !retry)
+      return setPhase('failed', 'Analisi fermata nei controlli nativi; nessun riavvio automatico.');
+    ensure(host.platform === 'linux' && host.gpu0 && !host.preview, 'Dedicated GPU unavailable', 403);
+    await db.$transaction(async (tx: any) => {
+      const fresh = await tx.job.findUnique({ where: { id: row.id } });
+      identity(fresh, link!, st);
+      if (['running', 'stopping', 'completed'].includes(fresh.status)) return;
+      const queue = await tx.queue.findUnique({ where: { gpu_ids: '0' } });
+      if (!queue?.is_running)
+        ensure(
+          !(await tx.job.findFirst({
+            where: { id: { not: row.id }, gpu_ids: '0', status: { in: ['queued', 'running', 'stopping'] } },
+          })),
+          'Coda in pausa con altri lavori: riprendila nei controlli nativi.',
+          409,
+        );
+      ensure(['queued', 'stopped'].includes(fresh.status), 'Analysis is not queueable', 409);
+      if (fresh.status === 'stopped') {
+        ensure(!fresh.stop, 'Analysis was stopped explicitly; retry required', 409);
+        const maximum = await tx.job.aggregate({ _max: { queue_position: true } });
+        await tx.job.updateMany({
+          where: { id: row.id, status: 'stopped' },
+          data: {
+            status: 'queued',
+            queue_position: (maximum._max.queue_position ?? 0) + 1000,
+            stop: false,
+            return_to_queue: false,
+          },
+        });
+      }
+      if (!queue) await tx.queue.create({ data: { gpu_ids: '0', is_running: true } });
+      else if (!queue.is_running) await tx.queue.update({ where: { id: queue.id }, data: { is_running: true } });
+    });
+    return setPhase('active');
+  } catch (e: any) {
+    return setPhase('failed', e.message ?? 'Analisi non confermata; nessun nuovo lavoro duplicato.');
+  }
+}

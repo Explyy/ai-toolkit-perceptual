@@ -1,3 +1,4 @@
+import { prepareAnalysis, reconcileAnalysis } from '@/datasetStudio/analysisFlow';
 import { NextResponse } from 'next/server';
 import { getDataRoot, getDatasetsRoot, getHFToken, getTrainingFolder } from '@/server/settings';
 import { StudioStore } from '@/datasetStudio/store';
@@ -34,6 +35,7 @@ async function view(s: any, st: StudioStore) {
     selection: select(s.images, s.settings.count, s.settings.testId),
     hfConfigured: !!(await getHFToken()),
     preview: process.env.DATASET_STUDIO_PREVIEW === '1',
+    analysisEnabled: process.env.DATASET_STUDIO_ANALYSIS_ENABLED === '1',
     captionHostSupported: process.env.DATASET_STUDIO_PREVIEW !== '1' && os.platform() === 'linux',
   };
 }
@@ -120,6 +122,18 @@ export async function POST(request: Request) {
           s.settings = settings(x.settings);
         });
         break;
+      case 'automaticAnalysis':
+        s = await prepareAnalysis(
+          st,
+          prisma,
+          process.env.DATASET_STUDIO_DB_URL?.replace(/^file:/, '') ?? path.join(TOOLKIT_ROOT, 'aitk_db.db'),
+          await captionHost(),
+          x.retry === true,
+        );
+        break;
+      case 'reconcileAnalysis':
+        s = await reconcileAnalysis(st, x.id, prisma, await captionHost(), x.retry === true);
+        break;
       case 'analyze':
         s = await st.analyze(x.revision, x.id);
         break;
@@ -146,6 +160,8 @@ export async function POST(request: Request) {
             if (image) {
               Object.assign(image, {
                 category: saved.category,
+                categorySource: 'manual',
+                reviewRevision: (image.reviewRevision ?? 0) + 1,
                 tags: [...saved.tags],
                 pinned: saved.pinned,
                 excluded: saved.excluded,

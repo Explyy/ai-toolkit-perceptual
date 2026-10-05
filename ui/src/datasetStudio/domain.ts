@@ -1,3 +1,4 @@
+import { modelDuplicate, diversity, type ModelSignals } from './analysisPolicy';
 // Ported from approved Dataset Studio v1; native file storage is separate.
 export const CATEGORIES = ['face', 'body', 'variety'] as const;
 export type Category = (typeof CATEGORIES)[number] | 'unclassified';
@@ -10,6 +11,7 @@ export type Analysis = {
   clipped: number;
   resolution: number;
   quality: number;
+  model?: ModelSignals;
 };
 export type ImageRecord = {
   id: string;
@@ -30,6 +32,9 @@ export type ImageRecord = {
   pose: unknown;
   revision: number;
   created: number;
+  categorySource?: 'manual' | 'automatic';
+  reviewRevision?: number;
+  analysisStatus?: { phase: 'pending' | 'complete' | 'unavailable' | 'failed'; reason?: string; config: string };
 };
 export type Settings = {
   count: number;
@@ -189,7 +194,8 @@ export function groups(images: ImageRecord[], threshold = 6): Map<string, string
           a.analysis.sharpness > 1 &&
           b.analysis.sharpness > 1 &&
           Math.abs(a.width / a.height - b.width / b.height) < 0.15 &&
-          hamming(a.analysis.dhash, b.analysis.dhash) <= threshold)
+          hamming(a.analysis.dhash, b.analysis.dhash) <= threshold &&
+          (!(a.analysis.model || b.analysis.model) || modelDuplicate(a, b)))
       )
         parent.set(find(b.id), find(a.id));
     }
@@ -218,7 +224,15 @@ export function select(images: ImageRecord[], count: number, testId: string | nu
   for (const c of CATEGORIES) {
     const pinned = chosen.filter(x => x.category === c).length;
     if (pinned > quotas[c]) conflicts.push(`${c}: ${pinned} pins exceed quota ${quotas[c]}`);
-    for (const item of eligible.filter(x => x.category === c && !x.pinned).sort(rank)) {
+    const candidates = eligible.filter(x => x.category === c && !x.pinned);
+    while (candidates.length) {
+      candidates.sort(
+        (a, b) =>
+          (b.analysis?.quality ?? -1) +
+            30 * diversity(b, chosen) -
+            ((a.analysis?.quality ?? -1) + 30 * diversity(a, chosen)) || rank(a, b),
+      );
+      const item = candidates.shift()!;
       if (chosen.filter(x => x.category === c).length >= quotas[c]) break;
       const g = grouped.get(item.id)!;
       if (!used.has(g)) {

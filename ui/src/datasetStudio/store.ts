@@ -1,3 +1,5 @@
+import type { AnalysisSummary } from './analysisFlow';
+import { ownedLock } from './ownerLock';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -62,7 +64,7 @@ export type Snapshot = {
 };
 export type JobLink = {
   name: string;
-  kind: 'train' | 'caption';
+  kind: 'train' | 'caption' | 'analysis';
   state: 'intent' | 'linked' | 'unknown';
   jobId?: string;
   version?: string;
@@ -102,6 +104,7 @@ export type TemplateDraft = {
 };
 export type State = {
   schema: 1;
+  analysisFlow?: AnalysisSummary;
   templateDraft?: TemplateDraft;
   captionPreferences?: CaptionPreferences;
   captionPreferencesRevision?: number;
@@ -230,19 +233,9 @@ export class StudioStore {
     return this;
   }
   async locked<T>(action: () => Promise<T>) {
-    const lock = path.join(this.folder, 'lock');
-    try {
-      await fs.mkdir(lock);
-    } catch (e: any) {
-      ensure(e.code !== 'EEXIST', 'Dataset changed or an earlier operation needs reconciliation; refresh', 409);
-      throw e;
-    }
-    try {
-      return await action();
-    } finally {
-      await fs.rmdir(lock);
-    }
+    return ownedLock(this.folder, action);
   }
+
   async raw(): Promise<State> {
     const file = await contained(this.folder, path.join(this.folder, 'state.json'), true);
     try {
@@ -323,7 +316,13 @@ export class StudioStore {
           excluded: old?.excluded ?? 0,
           discarded: old?.discarded ?? 0,
           analysis: old?.analysis ?? null,
-          pose: null,
+          pose: old?.pose ?? null,
+          categorySource:
+            old?.categorySource ?? (old?.category && old.category !== 'unclassified' ? 'manual' : undefined),
+          reviewRevision:
+            old?.reviewRevision ??
+            (old && (old.category !== 'unclassified' || old.excluded || old.pinned || old.discarded || old.revision > (old.captionRevision ?? 0)) ? 1 : 0),
+          analysisStatus: old?.analysisStatus,
           revision: (old?.revision ?? 0) + (old && !old.captionOverride && old.caption !== originalCaption ? 1 : 0),
           captionRevision:
             (old?.captionRevision ?? 0) + (old && !old.captionOverride && old.caption !== originalCaption ? 1 : 0),
@@ -379,9 +378,12 @@ export class StudioStore {
             x.captionDraftRevision = (x.captionDraftRevision ?? 0) + 1;
           }
         }
+        if (['category', 'pinned', 'excluded', 'discarded'].some(k => patch[k] !== undefined))
+          x.reviewRevision = (x.reviewRevision ?? 0) + 1;
         if (patch.category !== undefined) {
           ensure([...CATEGORIES, 'unclassified'].includes(patch.category), 'Invalid category');
           x.category = patch.category;
+          x.categorySource = 'manual';
         }
         if (patch.tags !== undefined) {
           ensure(Array.isArray(patch.tags) && patch.tags.length <= 30, 'Invalid tags');
@@ -402,7 +404,8 @@ export class StudioStore {
     const pixels = await sharp(b).rotate().resize(64, 64, { fit: 'fill' }).ensureAlpha().raw().toBuffer();
     const analysis = analyzePixels(new Uint8ClampedArray(pixels), 64, 64, x.width, x.height);
     return this.mutate(rev, state => {
-      state.images.find(i => i.id === id)!.analysis = analysis;
+      const current = state.images.find(i => i.id === id)!;
+      current.analysis = { ...analysis, model: current.analysis?.model };
     });
   }
   async captionDraft(rev: number, id: string, value: any, base: number) {
@@ -512,7 +515,21 @@ export class StudioStore {
           filename: x.filename,
           caption: x.caption,
           category: x.category,
-          analysis: x.analysis,
+          analysis: x.analysis
+            ? {
+                ...x.analysis,
+                model: x.analysis.model
+                  ? {
+                      version: x.analysis.model.version,
+                      config: x.analysis.model.config,
+                      runtime: x.analysis.model.runtime,
+                      depthMapSha: x.analysis.model.depth.sha,
+                      faceCount: x.analysis.model.faces.length,
+                      personCount: x.analysis.model.persons.length,
+                    }
+                  : undefined,
+              }
+            : null,
         })),
         test: s.settings.testId ? { id: s.settings.testId, prompt: s.settings.testPrompt } : null,
         encoder: 'sharp-jpeg-92-v1',

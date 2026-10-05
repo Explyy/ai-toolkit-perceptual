@@ -21,6 +21,12 @@
 !ui/tests/**
 !scripts
 !scripts/dataset_studio_cloud.py
+!extensions_built_in
+!extensions_built_in/dataset_studio_analysis
+!extensions_built_in/dataset_studio_analysis/**
+!tests
+!tests/dataset_studio_analysis
+!tests/dataset_studio_analysis/**
 !docker
 !docker/dataset-studio
 !docker/dataset-studio/**

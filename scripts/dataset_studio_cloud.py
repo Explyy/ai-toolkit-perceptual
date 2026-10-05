@@ -146,6 +146,14 @@ def source_manifest(toolkit):
     files = []
     for directory in ['ui/src', 'ui/cron', 'ui/public', 'ui/tests', 'docker/dataset-studio']:
         files.extend(p for p in (toolkit / directory).rglob('*') if p.is_file())
+    analysis_roots = [Path('extensions_built_in/dataset_studio_analysis'), Path('tests/dataset_studio_analysis')]
+    for directory in analysis_roots:
+        source = toolkit / directory
+        for parent in [source, *source.parents]:
+            require(not parent.is_symlink(), 'Release source cannot contain symlinks')
+            if parent == toolkit:
+                break
+        files.extend(p for p in source.rglob('*') if p.is_file() or p.is_symlink())
     files.extend(toolkit / name for name in ['ui/package.json', 'ui/package-lock.json', 'ui/prisma/schema.prisma',
                  'ui/tsconfig.json', 'ui/tsconfig.worker.json', 'ui/next.config.ts', 'ui/next-env.d.ts',
                  'ui/postcss.config.mjs', 'ui/tailwind.config.ts', 'scripts/dataset_studio_cloud.py', '.github/workflows/dataset-studio.yml'])
@@ -155,6 +163,13 @@ def source_manifest(toolkit):
         require(not file.is_symlink(), 'Release source cannot contain symlinks')
         if '__pycache__' in file.parts or file.name.startswith('.env') or file.suffix in ['.db', '.pem']:
             continue
+        if any(file.relative_to(toolkit).is_relative_to(root) for root in analysis_roots):
+            parts = file.relative_to(toolkit).parts
+            if file.suffix not in ['.py', '.json'] or any(
+                part.startswith('.') or part in ['private', 'cache', 'data', 'datasets', 'output', 'artifacts', 'node_modules', 'dist']
+                for part in parts
+            ):
+                continue
         rows.append({'path': relative, 'sha256': hashlib.sha256(file.read_bytes()).hexdigest()})
     return {'schema': 1, 'files': rows}
 

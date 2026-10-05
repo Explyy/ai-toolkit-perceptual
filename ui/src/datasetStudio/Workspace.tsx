@@ -18,7 +18,7 @@ import {
 } from './captionTextTools';
 const button = 'rounded-lg border border-gray-600 bg-gray-800 px-4 py-2.5 disabled:opacity-40 hover:bg-gray-700';
 const field = 'w-full min-w-0 rounded-lg border border-gray-600 bg-gray-950 p-3';
-type View = State & { jobsLive: any[]; preview: boolean; captionHostSupported: boolean };
+type View = State & { jobsLive: any[]; preview: boolean; captionHostSupported: boolean; analysisEnabled: boolean };
 type Draft = { caption: string; revision: number; draftRevision: number; persisted?: string };
 const pollPhases = new Set(['prepared', 'enqueue-intent', 'active']);
 function initialPreferences(s: State): CaptionPreferences {
@@ -123,6 +123,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     prefBase = useRef(0),
     prefError = useRef(false),
     generationId = useRef<string | null>(null),
+    analysisStamp = useRef(''),
     prefCurrent = useRef(pref),
     prefEpoch = useRef(0);
   prefCurrent.current = pref;
@@ -229,6 +230,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     prefDirty.current = false;
     prefError.current = false;
     generationId.current = null;
+    analysisStamp.current = '';
     draftFailure.current = false;
     void refresh();
   }, [dataset]);
@@ -243,10 +245,17 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
         owner = scope.current;
       if (!release) return;
       try {
-        const automatic = current.current.jobs.filter(x => x.automatic && pollPhases.has(x.automatic.phase));
+        const automatic = current.current.jobs.filter(
+          x =>
+            x.automatic &&
+            (pollPhases.has(x.automatic.phase) || (x.kind === 'analysis' && x.automatic.phase === 'blocked')),
+        );
         for (const link of automatic) {
           if (scope.current !== owner) break;
-          await request('reconcileCaption', { id: link.automatic!.id, blockedIds: Object.keys(draftRef.current) });
+          await request(link.kind === 'analysis' ? 'reconcileAnalysis' : 'reconcileCaption', {
+            id: link.automatic!.id,
+            blockedIds: Object.keys(draftRef.current),
+          });
         }
         if (!advanced && scope.current === owner) await refresh();
       } catch {
@@ -258,6 +267,31 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
     }, 4000);
     return () => clearInterval(timer);
   }, [dataset, advanced]);
+  useEffect(() => {
+    if (!state?.images.length || busy) return;
+    const stamp =
+      dataset +
+      ':' +
+      state.images
+        .map(x => x.id)
+        .sort()
+        .join(',') +
+      ':' +
+      state.settings.count;
+    if (analysisStamp.current === stamp) return;
+    const release = lane.current.tryBackground(),
+      owner = scope.current;
+    if (!release) return;
+    analysisStamp.current = stamp;
+    void request('automaticAnalysis')
+      .catch(() => {
+        if (scope.current === owner) {
+          analysisStamp.current = '';
+          setError('Analisi non confermata: riprova. Originali e revisione manuale conservati.');
+        }
+      })
+      .finally(release);
+  }, [state, dataset, busy]);
   useEffect(() => {
     const leave = (e: BeforeUnloadEvent) => {
       if (Object.keys(draftRef.current).length || prefDirty.current) {
@@ -443,7 +477,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
       (x.filename + ' ' + (drafts[x.id]?.caption ?? x.caption)).toLowerCase().includes(search.toLowerCase()),
     ),
     selected = images.filter(x => !x.excluded),
-    automatic = state?.jobs.filter(x => x.automatic) ?? [],
+    automatic = state?.jobs.filter(x => x.kind === 'caption' && x.automatic) ?? [],
     unresolved = automatic.some(x =>
       ['prepared', 'enqueue-intent', 'active', 'blocked', 'unknown'].includes(x.automatic!.phase),
     );
@@ -638,6 +672,28 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
                 }
               />
               <span>{image.filename}</span>
+              {image.analysisStatus?.phase === 'complete' && (
+                <label className="flex items-center gap-2 text-sm">
+                  Categoria
+                  <select
+                    aria-label={'Categoria ' + image.filename}
+                    className="rounded border border-gray-600 bg-gray-950 p-1"
+                    value={image.category}
+                    disabled={!!busy}
+                    onChange={e =>
+                      void run('Revisione categoria', () =>
+                        request('edit', { ids: [image.id], patch: { category: e.target.value } }),
+                      )
+                    }
+                  >
+                    <option value="face">Volto</option>
+                    <option value="body">Corpo</option>
+                    <option value="variety">Varietà</option>
+                    <option value="unclassified">Non classificata</option>
+                  </select>
+                  <span className="text-gray-400">{image.categorySource === 'manual' ? 'Rivista' : 'Automatica'}</span>
+                </label>
+              )}
             </label>
             <div
               data-selection-image={image.id}
@@ -726,6 +782,65 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
             </label>
           </header>
           <section className="rounded-xl border border-gray-700 bg-gray-900 p-4 sm:p-5 space-y-4">
+            {state && images.length > 0 && (
+              <section aria-label="Preselezione automatica" className="rounded-lg border border-gray-700 p-3 space-y-2">
+                <div className="flex flex-wrap items-center gap-3">
+                  <strong>Preselezione automatica</strong>
+                  <label className="flex items-center gap-2 text-sm">
+                    N immagini
+                    <input
+                      aria-label="Numero immagini proposte"
+                      type="number"
+                      min={1}
+                      max={1000}
+                      className="rounded border border-gray-600 bg-gray-950 p-2"
+                      style={{ width: 90 }}
+                      value={state.settings.count}
+                      disabled={!!busy}
+                      onChange={e => {
+                        const count = Number(e.target.value);
+                        if (Number.isInteger(count) && count >= 1 && count <= 1000)
+                          void run('Salvataggio N', () =>
+                            request('settings', { settings: { ...current.current!.settings, count } }),
+                          );
+                      }}
+                    />
+                  </label>
+                </div>
+                <p aria-live="polite" className="text-sm text-gray-300">
+                  {state.analysisFlow?.phase === 'complete'
+                    ? `Proposta pronta · ${state.analysisFlow.count} immagini. Rivedi inclusioni e categorie; le tue modifiche restano salvate.`
+                    : state.analysisFlow?.phase === 'pending' || state.analysisFlow?.phase === 'active'
+                      ? 'Analisi di volti, profondità e pose in corso…'
+                      : (state.analysisFlow?.reason ?? 'Analisi automatica in preparazione…')}
+                </p>
+                {state.analysisFlow?.phase === 'complete' &&
+                  Object.entries(state.analysisFlow.deficits ?? {}).some(([, n]) => n > 0) && (
+                    <p className="text-sm text-amber-300">
+                      Quote incomplete ·{' '}
+                      {Object.entries(state.analysisFlow.deficits ?? {})
+                        .filter(([, n]) => n > 0)
+                        .map(([c, n]) => `${c}: mancano ${n}`)
+                        .join(' · ')}
+                      . Proposta migliore disponibile, senza inventare categorie.
+                    </p>
+                  )}
+                {!!state.analysisFlow?.conflicts?.length && (
+                  <p className="text-sm text-amber-300">
+                    Revisione necessaria · {state.analysisFlow.conflicts.join(' · ')}
+                  </p>
+                )}
+                {['failed', 'unavailable'].includes(state.analysisFlow?.phase ?? '') && (
+                  <button
+                    className={button}
+                    disabled={!!busy}
+                    onClick={() => void run('Ripresa analisi', () => request('automaticAnalysis', { retry: true }))}
+                  >
+                    Riprova analisi
+                  </button>
+                )}
+              </section>
+            )}
             <label className="block text-sm">
               Modello locale
               <select

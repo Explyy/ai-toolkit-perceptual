@@ -1,0 +1,133 @@
+{
+  "version": "arcface-depth-pose-v1",
+  "preprocessing": {
+    "orientation": "exif-transpose-rgb",
+    "faceSize": 640,
+    "faceThreshold": 0.7,
+    "faceNms": 0.3,
+    "recognitionSize": 112,
+    "recognitionNormalization": "insightface-v0.7-first8-SubMul:raw-rgb-if-embedded-else-minus127.5-div127.5",
+    "personThreshold": 0.5,
+    "depthMapSize": 128,
+    "depthGridSize": 8,
+    "precision": "float32",
+    "seed": 0,
+    "maxPeople": 32
+  },
+  "models": {
+    "face": {
+      "repo": "fal/AuraFace-v1",
+      "revision": "af6d057c9b0ec4071d4c49c80e3539258798b609",
+      "license": "Apache-2.0",
+      "files": {
+        "glintr100.onnx": {
+          "size": 260694151,
+          "sha256": "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60"
+        }
+      },
+      "notices": {
+        "LICENSE.md": {
+          "url": "https://huggingface.co/fal/AuraFace-v1/resolve/af6d057c9b0ec4071d4c49c80e3539258798b609/LICENSE.md",
+          "size": 12624,
+          "sha256": "609e2cb599f84aaa41d8ef29d8fdb04d164fab22e8d9292ca34a599d0f56a338"
+        }
+      }
+    },
+    "faceDetector": {
+      "repo": "opencv/opencv_zoo",
+      "revision": "47534e27c9851bb1128ccc0102f1145e27f23f98",
+      "license": "MIT",
+      "files": {
+        "face_detection_yunet_2023mar.onnx": {
+          "size": 232589,
+          "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+        }
+      },
+      "notices": {
+        "LICENSE": {
+          "url": "https://raw.githubusercontent.com/opencv/opencv_zoo/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet/LICENSE",
+          "size": 1085,
+          "sha256": "c83b8120c50ccbd4c4f96edf53141bdd566ebb8f8e9227e415326aa1b1aba958"
+        }
+      }
+    },
+    "depth": {
+      "repo": "depth-anything/Depth-Anything-V2-Small-hf",
+      "revision": "5426e4f0f36572d16453bbda7a8389317b1bef99",
+      "license": "Apache-2.0",
+      "files": {
+        "model.safetensors": {
+          "size": 99173660,
+          "sha256": "3152477ce0d8d6978d76b995120de97cb5b928701fd0f817769f59e249a16b70"
+        },
+        "config.json": {
+          "size": 950,
+          "sha256": "c56698d3643dde1f83ea2212759e6b31a22b8f827246a36dd007ee8a22b3ff75"
+        },
+        "preprocessor_config.json": {
+          "size": 775,
+          "sha256": "d41175c0d889477ca8fc67191e540faef14baf6275157b3fdecf78469e6bbf84"
+        }
+      },
+      "notices": {
+        "README.md": {
+          "url": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf/resolve/5426e4f0f36572d16453bbda7a8389317b1bef99/README.md",
+          "size": 4400,
+          "sha256": "319566441daaac0c5ed83e75a8fd19bae0863f3275e23f147c06fe0906edf6fb"
+        }
+      }
+    },
+    "person": {
+      "repo": "PekingU/rtdetr_r18vd",
+      "revision": "ac77a11ff0170a41b771c03264987f8ce2b0d753",
+      "license": "Apache-2.0",
+      "files": {
+        "model.safetensors": {
+          "size": 80904152,
+          "sha256": "fe87a5a30f5daf298d10794c7682a63b6107986f97d6a770ba948d89e4340093"
+        },
+        "config.json": {
+          "size": 5267,
+          "sha256": "8493be71f51a1c0a741f8f71ec151039227579379de7bcba047c0470d9320c3c"
+        },
+        "preprocessor_config.json": {
+          "size": 841,
+          "sha256": "ffb4b9461a1dad746be8f0f9c8330ed7743a1ba5fba4f75c232cd281b3d4c64a"
+        }
+      },
+      "notices": {
+        "README.md": {
+          "url": "https://huggingface.co/PekingU/rtdetr_r18vd/resolve/ac77a11ff0170a41b771c03264987f8ce2b0d753/README.md",
+          "size": 9102,
+          "sha256": "0d6d6065595011f4897e724f11d2b86494764eba68e3514cc6c70f0a851e539e"
+        }
+      }
+    },
+    "pose": {
+      "repo": "usyd-community/vitpose-base-simple",
+      "revision": "a93ac0c67e0b7e2c55287d21d4c460c8f3c54d45",
+      "license": "Apache-2.0",
+      "files": {
+        "model.safetensors": {
+          "size": 343673076,
+          "sha256": "85375373893ddd3641f3912821073e53f5435f9e966e1dca59d004454bfe4fdf"
+        },
+        "config.json": {
+          "size": 1798,
+          "sha256": "72fc2f0fc29eef43e87aa0ddd4c1269c5226ae157a99d0057019dd40129fed7c"
+        },
+        "preprocessor_config.json": {
+          "size": 363,
+          "sha256": "9b11cadc98c30b968a70cc1658ce1fbd74b721b0f21402a2ff8bc1dc9d1474a0"
+        }
+      },
+      "notices": {
+        "README.md": {
+          "url": "https://huggingface.co/usyd-community/vitpose-base-simple/resolve/a93ac0c67e0b7e2c55287d21d4c460c8f3c54d45/README.md",
+          "size": 11366,
+          "sha256": "5e5c36e4905746e856f2913910fcfe4cb3965e771857154e7075c3d06e6bf98e"
+        }
+      }
+    }
+  }
+}

@@ -71,3 +71,20 @@ CUDA 13/cu130 needs driver 580+. The base is approximately 6.57 GB compressed; a
 6. Restart only after the tiny job completes/quiesces, then read back DB inode/original SHA/caption/selection/export/HF revision. Unexpected mid-job restart can leave a stale native running row (existing advisory); verify process death and use native Mark stopped plus explicit reconciliation rather than claiming automatic resume.
 
 Cloud storage, live HF, actual inference and restart proof remain pending until these checks execute on an authorized instance. Local synthetic checks do not prove them.
+
+### Automatic-analysis release prerequisites
+
+This new source adds automatic analysis; the previously prepared image is a prior release. Source fixtures/import gates are not GPU inference evidence. Provision and verify only on a new authorized dedicated Studio host, never the protected campaign pods.
+
+The image preserves upstream 0.13.23, Torch2.13.0+cu130, Transformers5.5.3, NumPy1.26.4 and OpenCV4.11.0.86. It adds CPU `onnxruntime==1.30.0` and `flatbuffers==25.12.19` with `--no-deps`. The final image gate imports the actual extension/model interfaces and verifies these versions without downloading/loading weights. Real face recognition runs on cloud CPU; depth/person/pose run on dedicated CUDA. Native queue serialization prevents caption/analysis GPU overlap.
+
+After root authorization for that exact host and storage/budget, configure private environment `DATASET_STUDIO_ANALYSIS_ENABLED=1`. With the already verified `DATASET_STUDIO_ROOT`, explicitly provision:
+
+```sh
+cd /app/ai-toolkit
+python -m extensions_built_in.dataset_studio_analysis.provision
+```
+
+This command fetches only pinned permitted files and publisher notices, verifies sizes/SHA, and refuses changed existing files. Inference and web requests never provision automatically. Default model binaries total approximately 785 MB; reserve at least 2 GB for models/temporary downloads plus staged originals and cached maps. Provisioning/staging enforce the persistent free-space reserve (default24 GB); do not delete originals/campaign storage to make space.
+
+Upload uncategorized permissioned portrait/body/context images; verify actual detections/embeddings, pose and depth maps, thirds proposal and visible shortages. Review an inclusion/category/caption, reload, then perform a controlled completed-job restart. For interrupted analysis, test persisted completed cache and same-job resume with proven process identity/death; unknown ownership is blocked, never guessed. Verify public HTTPS/auth/media denial, volume readback and unique private HF export/readback as separate live gates. Current local source checks do not mark these gates PASS.
