@@ -156,7 +156,7 @@ def source_manifest(toolkit):
         files.extend(p for p in source.rglob('*') if p.is_file() or p.is_symlink())
     files.extend(toolkit / name for name in ['ui/package.json', 'ui/package-lock.json', 'ui/prisma/schema.prisma',
                  'ui/tsconfig.json', 'ui/tsconfig.worker.json', 'ui/next.config.ts', 'ui/next-env.d.ts',
-                 'ui/postcss.config.mjs', 'ui/tailwind.config.ts', 'scripts/dataset_studio_cloud.py', '.github/workflows/dataset-studio.yml'])
+                 'ui/postcss.config.mjs', 'ui/tailwind.config.ts', 'scripts/dataset_studio_cloud.py', 'scripts/dataset_studio_access.py', '.github/workflows/dataset-studio.yml'])
     rows = []
     for file in sorted(files):
         relative = file.relative_to(toolkit).as_posix()
@@ -182,6 +182,16 @@ def acquire_lock(root):
         raise StartupError('Another Studio instance owns this persistent database') from error
     return lock
 
+def child_commands(toolkit, env, gateway):
+    # The auth companion receives only its app secret, never the HF token.
+    auth_env = {'AI_TOOLKIT_AUTH': env['AI_TOOLKIT_AUTH'], 'PYTHONDONTWRITEBYTECODE': '1'}
+    next_env = dict(env)
+    next_env.pop('AI_TOOLKIT_AUTH', None)
+    return [([sys.executable, str(toolkit / 'scripts/dataset_studio_access.py'), 'serve'], auth_env),
+            (['node', 'dist/cron/worker.js'], env),
+            (['node', 'node_modules/next/dist/bin/next', 'start', '--hostname', '127.0.0.1', '--port', '8676'], next_env),
+            (['nginx', '-c', str(gateway), '-g', 'daemon off;'], next_env)]
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['serve', 'check', 'manifest'])
@@ -199,11 +209,6 @@ def main():
     print(json.dumps(receipt(root, db, args.toolkit)), flush=True)
     if args.action == 'check':
         return
-    auth_file = Path('/run/dataset-studio-auth')
-    hashed = subprocess.run(['openssl', 'passwd', '-6', '-stdin'], input=env['AI_TOOLKIT_AUTH'] + '\n', text=True,
-                            capture_output=True, check=True).stdout.strip()
-    auth_file.write_text('studio:' + hashed + '\n')
-    auth_file.chmod(0o600)
     gateway = Path('/run/dataset-studio-nginx.conf')
     gateway.write_text(Path('/etc/nginx/dataset-studio.conf').read_text())
     gateway.chmod(0o600)
@@ -215,13 +220,7 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        next_env = dict(env)
-        # Outer gateway owns authentication; native bearer login would conflict
-        # with the browser's Basic Authorization header. This child is loopback.
-        next_env.pop('AI_TOOLKIT_AUTH', None)
-        commands = [(['node', 'dist/cron/worker.js'], env),
-                    (['node', 'node_modules/next/dist/bin/next', 'start', '--hostname', '127.0.0.1', '--port', '8676'], next_env),
-                    (['nginx', '-c', str(gateway), '-g', 'daemon off;'], next_env)]
+        commands = child_commands(args.toolkit, env, gateway)
         for command, child_env in commands:
             processes.append(subprocess.Popen(command, cwd=args.toolkit / 'ui', env=child_env, start_new_session=True))
         import time
@@ -235,7 +234,6 @@ def main():
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
-        auth_file.unlink(missing_ok=True)
         gateway.unlink(missing_ok=True)
     sys.exit(code)
 

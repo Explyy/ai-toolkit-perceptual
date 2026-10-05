@@ -42,6 +42,25 @@ class StartupTests(unittest.TestCase):
         with patch.object(cloud.os, 'statvfs', return_value=space):
             return cloud.prepare(env or self.env, self.toolkit, lambda _: mounted, self.initialize)
 
+    def test_auth_child_is_loopback_and_does_not_receive_hf_secret(self):
+        commands = cloud.child_commands(self.toolkit, self.env, Path('/run/test-gateway.conf'))
+        auth_command, auth_env = commands[0]
+        self.assertEqual(auth_command, [sys.executable, str(self.toolkit / 'scripts/dataset_studio_access.py'), 'serve'])
+        self.assertEqual(auth_env, {'AI_TOOLKIT_AUTH': self.env['AI_TOOLKIT_AUTH'], 'PYTHONDONTWRITEBYTECODE': '1'})
+        self.assertEqual(commands[1][1]['HF_TOKEN'], self.env['HF_TOKEN'])
+        for command, env in commands[2:]:
+            self.assertNotIn('AI_TOOLKIT_AUTH', env)
+        self.assertIn('127.0.0.1', commands[2][0])
+        self.assertIn('8676', commands[2][0])
+
+    def test_release_manifest_binds_access_module_bytes(self):
+        before = cloud.source_manifest(REPO)
+        rows = {row['path']: row['sha256'] for row in before['files']}
+        import hashlib
+        self.assertEqual(rows['scripts/dataset_studio_access.py'], hashlib.sha256((REPO / 'scripts/dataset_studio_access.py').read_bytes()).hexdigest())
+        self.assertIn('docker/dataset-studio/test_access.py', rows)
+        self.assertFalse(any('.private' in path or path.endswith('.db') for path in rows))
+
     def test_restart_preserves_db_dataset_and_metadata(self):
         root, db = self.prepare()
         inode = db.stat().st_ino

@@ -8,15 +8,15 @@ test('cloud startup guards and persistent native DB recovery (real Prisma)', () 
   execFileSync('python3', ['../docker/dataset-studio/test_startup.py'], { cwd: process.cwd(), stdio: 'pipe' });
 });
 
-test('gateway covers every path and keeps Next private', () => {
+test('gateway session protocol uses real HTTP and keeps Next private', () => {
+  execFileSync('python3', ['../docker/dataset-studio/test_access.py'], { cwd: process.cwd(), stdio: 'pipe' });
   const gateway = fs.readFileSync('../docker/dataset-studio/nginx.conf', 'utf8');
-  assert.match(gateway, /auth_basic_user_file \/run\/dataset-studio-auth/);
-  assert.equal((gateway.match(/location /g) ?? []).length, 1);
-  assert.match(gateway, /location \/ \{/);
-  assert.match(gateway, /proxy_pass http:\/\/127.0.0.1:8676/);
+  assert.match(gateway, /auth_request \/_studio_auth/);
+  assert.match(gateway, /location = \/_studio_auth \{\s*internal;/);
+  assert.match(gateway, /proxy_pass http:\/\/127\.0\.0\.1:8676/);
   assert.match(gateway, /proxy_set_header Authorization ""/);
+  assert.match(gateway, /proxy_set_header Cookie ""/);
   assert.match(gateway, /if \(\$readonly_settings\) \{ return 403; \}/);
-  assert.doesNotMatch(gateway, /auth_basic off/);
 });
 
 test('workflow login and image publication require the exact reviewed release ref', () => {
