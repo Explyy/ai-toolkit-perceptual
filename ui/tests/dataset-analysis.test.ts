@@ -506,3 +506,139 @@ test('proposal membership CAS advances even when counts/deficits unchanged; pixe
     await f.cleanup();
   }
 });
+
+// Isolate TOOLKIT_ROOT with a tiny verified artifact fixture. This exercises the
+// real preparation path and Prisma's global name constraint without ML imports,
+// model downloads, or changing the repository's pinned model manifest.
+async function importIdentityRegression(scenario: 'fresh' | 'legacy') {
+  const f = await fixture();
+  try {
+    await fs.mkdir(path.join(f.root, 'toolkit', 'ui'), { recursive: true });
+    const toolkit = await fs.realpath(path.join(f.root, 'toolkit'));
+    await fs.symlink(path.resolve('node_modules'), path.join(toolkit, 'ui', 'node_modules'));
+    const script = path.join(f.root, 'identity-regression.cjs');
+    await fs.writeFile(
+      script,
+      String.raw`
+const assert=require('node:assert/strict'), fs=require('node:fs/promises'), path=require('node:path');
+const {execFileSync}=require('node:child_process');
+const {PrismaClient}=require(${JSON.stringify(path.resolve('node_modules/@prisma/client'))});
+const sharp=require(${JSON.stringify(path.resolve('node_modules/sharp'))});
+const {StudioStore,hash}=require(${JSON.stringify(path.resolve('src/datasetStudio/store.ts'))});
+const {stableJSON}=require(${JSON.stringify(path.resolve('src/datasetStudio/domain.ts'))});
+const {MODEL_ANALYZER}=require(${JSON.stringify(path.resolve('src/datasetStudio/analysisPolicy.ts'))});
+const {prepareAnalysis,reconcileAnalysis,analysisConfiguration}=require(${JSON.stringify(path.resolve('src/datasetStudio/analysisFlow.ts'))});
+const root=${JSON.stringify(toolkit)}, scenario=${JSON.stringify(scenario)};
+const sqlite=path.join(root,'native.db'), host={platform:'linux',gpu0:true,preview:false};
+let db;
+(async()=>{
+ const marker=Buffer.from('fixture!'), manifest={version:MODEL_ANALYZER,models:{fixture:{files:{'fixture.bin':{size:marker.length,sha256:hash(marker)}}}}};
+ await fs.mkdir(path.join(root,'extensions_built_in/dataset_studio_analysis'),{recursive:true});
+ await fs.writeFile(path.join(root,'extensions_built_in/dataset_studio_analysis/models.json'),JSON.stringify(manifest));
+ await fs.mkdir(path.join(root,'cache/analysis-models/fixture'),{recursive:true});
+ await fs.writeFile(path.join(root,'cache/analysis-models/fixture/fixture.bin'),marker);
+ const schema=path.join(root,'schema.prisma');await fs.writeFile(sqlite,Buffer.alloc(0));
+ await fs.writeFile(schema,(await fs.readFile(${JSON.stringify(path.resolve('prisma/schema.prisma'))},'utf8')).replace(/url\s*=\s*"[^"]+"/,'url = "file:'+sqlite+'"'));
+ execFileSync(process.execPath,[${JSON.stringify(path.resolve('node_modules/prisma/build/index.js'))},'db','push','--schema',schema,'--skip-generate'],{timeout:30000,stdio:'pipe'});
+ db=new PrismaClient({datasourceUrl:'file:'+sqlite});const {config}=await analysisConfiguration();
+ const original=await fs.readFile(${JSON.stringify(path.join(f.st.datasetRoot, 'a.png'))});
+ async function store(name,filename='a.png'){
+  const folder=path.join(root,'datasets',name);await fs.mkdir(folder,{recursive:true});
+  await fs.writeFile(path.join(folder,filename),original);await fs.writeFile(path.join(folder,filename.replace('.png','.txt')),'original caption');
+  const st=await new StudioStore(path.join(root,'data'),path.join(root,'datasets'),name).init();await st.read();return st;
+ }
+ async function legacy(st){
+  const state=await st.read(),scope=structuredClone(state.images),digest=hash(stableJSON({config,items:scope.map(x=>({id:x.id,sha:x.sha}))}));
+  const folder=path.join(st.folder,'analysis',digest),name='studio-analysis-'+digest.slice(0,24);
+  const link={kind:'analysis',state:'intent',name,folder,scope,config:{job:'extension',config:{name,process:[{type:'dataset_studio_analysis',request:path.join(folder,'request.json'),sqlite_db_path:sqlite}]}},automatic:{id:st.name+'-legacy',digest,gpu:'0',phase:'prepared',createdAt:new Date().toISOString()}};
+  state.jobs.push(link);await st.save(state);return link;
+ }
+ const active=state=>state.jobs.find(x=>x.kind==='analysis'&&x.automatic.phase!=='dismissed');
+ async function complete(st){
+  const state=await st.read(),link=active(state),img=state.images[0],output=path.join(link.folder,'result-000000');
+  await fs.mkdir(output,{recursive:true});const depth=await sharp({create:{width:8,height:8,channels:3,background:'#444444'}}).png().toBuffer();
+  await fs.writeFile(path.join(output,'depth.png'),depth);const embedding=Array(512).fill(0);embedding[0]=1;
+  await fs.writeFile(path.join(output,'result.json'),JSON.stringify({version:MODEL_ANALYZER,sha:img.sha,config,faces:[{box:[.2,.1,.7,.7],confidence:.95,embedding}],persons:[],depth:{grid:Array(64).fill(.5),map:'depth.png',sha:hash(depth),relative:true},runtime:{device:'fixture, no inference'}}));
+  await db.job.update({where:{id:link.jobId},data:{status:'completed',step:1,total_steps:1}});
+  return reconcileAnalysis(st,link.automatic.id,db,host);
+ }
+ const a=await store('alpha'),b=await store('beta');
+ assert.equal((await a.read()).images[0].id,(await b.read()).images[0].id);assert.notEqual(a.datasetRoot,b.datasetRoot);
+ let first;
+ if(scenario==='legacy'){const link=await legacy(a);first=await reconcileAnalysis(a,link.automatic.id,db,host);}
+ else first=await prepareAnalysis(a,db,sqlite,host);
+ assert.equal(first.analysisFlow.phase,'active',first.analysisFlow.reason);first=await complete(a);
+ first=await a.edit(first.revision,[first.images[0].id],{category:'variety',excluded:1});
+ const rowA=await db.job.findUnique({where:{id:active(first).jobId}}),stateA=await fs.readFile(path.join(a.folder,'state.json'));
+ const resultA=await fs.readFile(path.join(active(first).folder,'result-000000/result.json'));
+ let second,old,requestBefore;
+ if(scenario==='legacy'){
+  old=await legacy(b);second=await reconcileAnalysis(b,old.automatic.id,db,host);
+  assert.equal(second.analysisFlow.phase,'failed');assert.match(second.analysisFlow.reason,/identity\/config differs/);
+  requestBefore=await fs.readFile(path.join(old.folder,'request.json'));
+  const noRetry=await prepareAnalysis(b,db,sqlite,host);assert.equal(noRetry.jobs.length,1);assert.equal(noRetry.jobs[0].automatic.phase,'failed');assert.equal(await db.job.count(),1);
+ }
+ second=await prepareAnalysis(b,db,sqlite,host,scenario==='legacy');
+ assert.equal(second.analysisFlow.phase,'active','second independent import must get its own native job');
+ const managed=active(second);assert.notEqual(managed.name,rowA.name);assert.notEqual(managed.jobId,rowA.id);
+ assert.equal((await db.job.findUnique({where:{id:managed.jobId}})).job_ref,b.datasetRoot);
+ assert.equal(managed.automatic.digest,active(first).automatic.digest,'content/config digest remains unchanged');
+ if(old){
+  const archived=second.jobs.find(x=>x.automatic.id===old.automatic.id);assert.equal(archived.automatic.phase,'dismissed');
+  assert.equal(archived.name,old.name);assert.deepEqual(archived.config,old.config);assert.deepEqual(archived.scope,old.scope);
+  assert.notEqual(managed.folder,old.folder);assert.ok(managed.folder.startsWith(old.folder+path.sep));
+  assert.deepEqual(await fs.readFile(path.join(old.folder,'request.json')),requestBefore);
+ }
+ await prepareAnalysis(b,db,sqlite,host);await prepareAnalysis(b,db,sqlite,host,true);
+ assert.equal(await db.job.count(),2,'same-store prepare/retry must deduplicate');
+ assert.equal((await b.read()).jobs.filter(x=>x.automatic.phase!=='dismissed').length,1);
+ await complete(b);
+ assert.deepEqual(await db.job.findUnique({where:{id:rowA.id}}),rowA);
+ assert.deepEqual(await fs.readFile(path.join(a.folder,'state.json')),stateA);
+ assert.deepEqual(await fs.readFile(path.join(active(first).folder,'result-000000/result.json')),resultA);
+ assert.equal(hash(await fs.readFile(path.join(a.datasetRoot,'a.png'))),hash(original));
+ if(scenario==='legacy'){
+  const own=await store('owned-legacy','own.png'),ownLink=await legacy(own);
+  let ownState=await reconcileAnalysis(own,ownLink.automatic.id,db,host);const ownID=active(ownState).jobId;
+  const ownRequest=await fs.readFile(path.join(ownLink.folder,'request.json'));
+  ownState=await prepareAnalysis(own,db,sqlite,host,true);assert.equal(active(ownState).jobId,ownID);assert.equal(active(ownState).name,ownLink.name);assert.deepEqual(active(ownState).config,ownLink.config);
+  assert.deepEqual(await fs.readFile(path.join(ownLink.folder,'request.json')),ownRequest);await complete(own);
+  const malformed=await store('malformed'),bad=await legacy(malformed);await reconcileAnalysis(malformed,bad.automatic.id,db,host);
+  const badRequest=path.join(bad.folder,'request.json'),tampered=JSON.parse(await fs.readFile(badRequest,'utf8'));tampered.dataset=a.datasetRoot;await fs.writeFile(badRequest,JSON.stringify(tampered));
+  const badBytes=await fs.readFile(badRequest);let refused=await prepareAnalysis(malformed,db,sqlite,host,true);assert.equal(refused.jobs.length,1);assert.equal(refused.jobs[0].automatic.phase,'failed');assert.deepEqual(await fs.readFile(badRequest),badBytes);
+  const linked=await store('linked-foreign'),foreign=await legacy(linked);const linkedState=await linked.read();linkedState.jobs[0].jobId=rowA.id;linkedState.jobs[0].state='linked';linkedState.jobs[0].automatic.phase='failed';await linked.save(linkedState);
+  refused=await prepareAnalysis(linked,db,sqlite,host,true);assert.equal(refused.jobs.length,1);assert.equal(refused.jobs[0].automatic.phase,'failed');assert.equal(refused.jobs[0].jobId,rowA.id);
+  const unknown=await store('unknown','unknown.png'),unknownLink=await legacy(unknown);
+  await db.job.create({data:{name:unknownLink.name,gpu_ids:'0',job_type:'analysis',job_ref:null,job_config:JSON.stringify(unknownLink.config),status:'completed'}});
+  await reconcileAnalysis(unknown,unknownLink.automatic.id,db,host);refused=await prepareAnalysis(unknown,db,sqlite,host,true);assert.equal(refused.jobs.length,1);assert.equal(refused.jobs[0].automatic.phase,'failed');
+  assert.equal(await db.job.count(),4);assert.deepEqual(await db.job.findUnique({where:{id:rowA.id}}),rowA);
+  assert.deepEqual(await fs.readFile(path.join(a.folder,'state.json')),stateA);assert.deepEqual(await fs.readFile(path.join(old.folder,'request.json')),requestBefore);
+ }
+ console.log('identity-regression '+scenario+' passed');
+})().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{await db?.$disconnect()});
+`,
+    );
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    await promisify(execFile)(
+      process.execPath,
+      ['--import', path.resolve('node_modules/tsx/dist/loader.mjs'), script],
+      {
+        cwd: path.join(toolkit, 'ui'),
+        env: {
+          ...process.env,
+          TSX_TSCONFIG_PATH: path.resolve('tsconfig.json'),
+          DATASET_STUDIO_ROOT: toolkit,
+          DATASET_STUDIO_ANALYSIS_ENABLED: '1',
+        },
+        timeout: 60000,
+      },
+    );
+  } finally {
+    await f.cleanup();
+  }
+}
+test('independent identical imports use distinct native SQLite identities and preserve the first review', () =>
+  importIdentityRegression('fresh'));
+test('explicit retry recovers only a proven unlinked legacy collision; old own and unknown identities remain intact', () =>
+  importIdentityRegression('legacy'));

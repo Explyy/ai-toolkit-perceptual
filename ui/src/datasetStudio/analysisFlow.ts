@@ -76,6 +76,74 @@ export function applyProposal(s: State, config: string) {
   if (changed && !summaryChanged) s.revision++;
   return summaryChanged || changed;
 }
+async function unlinkedLegacyCollision(
+  st: StudioStore,
+  link: JobLink,
+  db: any,
+  config: string,
+  digest: string,
+  missing: State['images'],
+  sqlite: string,
+) {
+  // Only an explicit retry may archive a failed intent. Existing linked jobs,
+  // unknown identities and immutable request artifacts are never rewritten.
+  if (link.jobId || link.state !== 'intent' || link.automatic?.phase !== 'failed') return false;
+  try {
+    const name = 'studio-analysis-' + digest.slice(0, 24),
+      folder = path.join(st.folder, 'analysis', digest);
+    if (link.name !== name || link.folder !== folder || link.automatic.digest !== digest) return false;
+    const expectedConfig = {
+      job: 'extension',
+      config: {
+        name,
+        process: [
+          { type: 'dataset_studio_analysis', request: path.join(folder, 'request.json'), sqlite_db_path: sqlite },
+        ],
+      },
+    };
+    if (stableJSON(link.config) !== stableJSON(expectedConfig) || link.scope?.length !== missing.length) return false;
+    if (
+      !link.scope.every(
+        (image, i) =>
+          image.id === missing[i].id &&
+          image.sha === missing[i].sha &&
+          image.relative === missing[i].relative &&
+          image.project === hash(st.name),
+      )
+    )
+      return false;
+    const items = link.scope.map((image, i) => ({
+      id: image.id,
+      sha: image.sha,
+      input: 'input-' + String(i).padStart(6, '0') + path.extname(image.filename).toLowerCase(),
+      output: 'result-' + String(i).padStart(6, '0'),
+    }));
+    const request = await contained(st.folder, path.join(folder, 'request.json'));
+    if ((await fs.stat(request)).size > 1500000) return false;
+    if (
+      stableJSON(JSON.parse(await fs.readFile(request, 'utf8'))) !==
+      stableJSON({ name, dataset: st.datasetRoot, config, items })
+    )
+      return false;
+    for (const item of items) {
+      const input = await contained(st.folder, path.join(folder, item.input));
+      if (hash(await fs.readFile(input)) !== item.sha) return false;
+    }
+    const foreign = await db.job.findUnique({ where: { name } });
+    return (
+      !!foreign &&
+      foreign.name === name &&
+      foreign.job_type === 'analysis' &&
+      foreign.gpu_ids === '0' &&
+      typeof foreign.job_ref === 'string' &&
+      path.isAbsolute(foreign.job_ref) &&
+      foreign.job_ref !== st.datasetRoot &&
+      (await fs.realpath(foreign.job_ref)) === foreign.job_ref
+    );
+  } catch {
+    return false;
+  }
+}
 export async function prepareAnalysis(st: StudioStore, db: any, sqlite: string, host: CaptionHost, retry = false) {
   const { manifest, config } = await analysisConfiguration();
   let s = await st.read();
@@ -89,7 +157,9 @@ export async function prepareAnalysis(st: StudioStore, db: any, sqlite: string, 
       return state;
     });
   const digest = hash(stableJSON({ config, items: missing.map(x => ({ id: x.id, sha: x.sha })) }));
-  const previous = s.jobs.find(x => x.kind === 'analysis' && x.automatic?.digest === digest);
+  const previous = s.jobs.find(
+    x => x.kind === 'analysis' && x.automatic?.digest === digest && x.automatic.phase !== 'dismissed',
+  );
   if (previous && !retry) return reconcileAnalysis(st, previous.automatic!.id, db, host);
   try {
     ensure(
@@ -128,14 +198,20 @@ export async function prepareAnalysis(st: StudioStore, db: any, sqlite: string, 
   let link: JobLink;
   s = await st.locked(async () => {
     const state = await st.scan(await st.raw());
-    const old = state.jobs.find(x => x.kind === 'analysis' && x.automatic?.digest === digest);
+    const old = state.jobs.find(
+      x => x.kind === 'analysis' && x.automatic?.digest === digest && x.automatic.phase !== 'dismissed',
+    );
     if (old) {
-      link = old;
-      return state;
+      if (!retry || !(await unlinkedLegacyCollision(st, old, db, config, digest, missing, sqlite))) {
+        link = old;
+        return state;
+      }
+      old.automatic!.phase = 'dismissed';
+      old.automatic!.reason = 'Previous intent collided with another dataset; immutable evidence preserved.';
     }
     const id = randomUUID(),
-      folder = path.join(st.folder, 'analysis', digest),
-      name = 'studio-analysis-' + digest.slice(0, 24);
+      folder = old ? path.join(st.folder, 'analysis', digest, 'retry-' + id) : path.join(st.folder, 'analysis', digest),
+      name = 'studio-analysis-' + hash(st.datasetRoot).slice(0, 16) + '-' + digest.slice(0, 24);
     const cfg = {
       job: 'extension',
       config: {
