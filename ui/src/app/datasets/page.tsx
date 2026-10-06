@@ -1,7 +1,7 @@
 'use client';
 import Catalog from '@/datasetStudio/DatasetCatalog';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Modal } from '@/components/Modal';
 import Link from 'next/link';
 import { TextInput } from '@/components/formInputs';
@@ -17,6 +17,14 @@ import { useRouter } from 'next/navigation';
 export default function Datasets() {
   const router = useRouter();
   const { datasets, status, refreshDatasets } = useDatasetList();
+  const [titles, setTitles] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let active = true;
+    void apiClient.get('/api/dataset-studio/catalog').then(r => {
+      if (active) setTitles(Object.fromEntries(r.data.local.map((x: { name: string; title?: string }) => [x.name, x.title ?? x.name])));
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [datasets]);
   const [newDatasetName, setNewDatasetName] = useState('');
   const [isNewDatasetModalOpen, setIsNewDatasetModalOpen] = useState(false);
 
@@ -31,8 +39,8 @@ export default function Datasets() {
       title: 'Dataset Name',
       key: 'name',
       render: row => (
-        <Link href={`/datasets/${row.name}`} className="text-gray-200 hover:text-gray-100">
-          {row.name}
+        <Link href={`/datasets/${encodeURIComponent(row.name)}`} className="text-gray-200 hover:text-gray-100">
+          {titles[row.name] ?? row.name}
         </Link>
       ),
     },

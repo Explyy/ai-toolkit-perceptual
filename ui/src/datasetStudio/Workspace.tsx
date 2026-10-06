@@ -635,7 +635,7 @@ export default function Workspace({ dataset, onNativeView }: { dataset: string; 
         <Link className="mr-4 shrink-0" href="/datasets">
           ← Dataset
         </Link>
-        <h1 className="truncate flex-1 min-w-0">{dataset}</h1>
+        <h1 className="truncate flex-1 min-w-0">{state?.displayTitle ?? state?.managedBinding?.title ?? dataset}</h1>
       </TopBar>
       <MainContent belowTopBar>
         <div style={{ maxWidth: 1500 }} className="mx-auto min-w-0 p-3 sm:p-6 space-y-6">

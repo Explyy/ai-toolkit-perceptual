@@ -103,6 +103,9 @@ export async function POST(request: Request) {
       st = await store(x.dataset);
     let s;
     switch (x.action) {
+      case 'title':
+        s = await st.title(x.revision, x.title);
+        break;
       case 'captionDraft':
         s = await st.captionDraft(x.revision, x.id, x.draft, x.draftRevision);
         break;

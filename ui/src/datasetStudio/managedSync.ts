@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { StudioStore, State } from './store';
-import { atomic, contained, hash } from './store';
+import { atomic, contained, hash, datasetTitle } from './store';
 import { ensure, stableJSON, settings, repoId, revision, integer, text, CATEGORIES } from './domain';
 import { preferences } from './captionModels';
 import { Hub } from './hf';
@@ -78,7 +78,7 @@ export function managedProjection(s: State): ManagedProjection {
   const value: ManagedProjection = {
     schema: 1,
     key,
-    dataset: s.managedBinding?.title ?? s.dataset,
+    dataset: s.displayTitle ?? s.managedBinding?.title ?? s.dataset,
     settings: {
       ...structuredClone(s.settings),
       // Legacy caption settings may contain a host-only model path. Keep it
@@ -918,7 +918,7 @@ export function validateProjection(value: any): ManagedProjection {
   return {
     schema: 1,
     key: value.key,
-    dataset: text(value.dataset, 128),
+    dataset: datasetTitle(value.dataset),
     settings: settings(value.settings),
     captionPreferences: value.captionPreferences ? preferences(value.captionPreferences) : undefined,
     images,

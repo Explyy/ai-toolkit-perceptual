@@ -134,6 +134,39 @@ test('dataset and file realpath containment reject sibling-prefix, traversal and
     await f.cleanup();
   }
 });
+test('logical title is CAS saved without renaming canonical storage or altering protected curation', async () => {
+  const f = await fixture();
+  try {
+    let s = await exported(f.st);
+    s = await f.st.approve(s.revision, {
+      approve: true, name: 'Original approval', subject: 'Subject A', trigger: 'token',
+      settings: s.settings, captioner: 'Qwen3VLCaptioner', captionModel: 'Qwen/Qwen3-VL-2B-Instruct',
+      training: training(),
+    });
+    s = await f.st.edit(s.revision, [s.images[0].id], { excluded: 1 });
+    s = await f.st.captionDraft(s.revision, s.images[1].id,
+      { caption: 'Protected unsaved caption', baseRevision: s.images[1].revision }, 0);
+    const before = structuredClone(s), root = f.st.datasetRoot, folder = f.st.folder;
+    const files = await Promise.all(s.images.map(x => f.st.source(x)));
+    s = await f.st.title(s.revision, 'eleonora ghostwell');
+    assert.equal(s.displayTitle, 'eleonora ghostwell');
+    assert.equal(s.dataset, 'Subject A');
+    assert.equal(s.revision, before.revision + 1);
+    const { displayTitle, revision, ...rest } = s;
+    const { revision: oldRevision, ...original } = before;
+    assert.deepEqual(rest, original);
+    const reopened = await new StudioStore(path.join(f.root, 'data'), path.join(f.root, 'datasets'), 'Subject A').init();
+    assert.equal(reopened.datasetRoot, root);
+    assert.equal(reopened.folder, folder);
+    assert.equal((await reopened.read()).displayTitle, 'eleonora ghostwell');
+    await reopened.verifySnapshot(s.snapshots[0]);
+    for (const [i, image] of s.images.entries()) assert.deepEqual(await reopened.source(image), files[i]);
+    await assert.rejects(reopened.title(oldRevision, 'Stale tab title'), /Stale/);
+    for (const invalid of ['', '  ', ' padded ', 'bad\nline', 'bad\tline', 'bad\x7f', 'bad\u0080', 'bad\u0085', 'bad\u009f', '.'.repeat(129), 123])
+      await assert.rejects(reopened.title(s.revision, invalid), /title|text/i);
+    assert.deepEqual(await reopened.raw(), s);
+  } finally { await f.cleanup(); }
+});
 test('templates require approval and native caption/model+architecture pairs; later approvals preserve prior values', async () => {
   const f = await fixture();
   try {

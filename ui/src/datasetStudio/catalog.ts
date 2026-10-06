@@ -24,7 +24,7 @@ export async function nativeCatalog(datasets: string, data: string) {
       if (await fs.lstat(path.join(dir, '.studio-materializing.json')).catch(() => null)) continue;
       const st = await new StudioStore(data, root, d.name).init(),
         s = await st.raw();
-      rows.push({ name: d.name, source: s.sourceBinding, managed: s.managedBinding });
+      rows.push({ name: d.name, title: s.displayTitle ?? s.managedBinding?.title ?? s.dataset, source: s.sourceBinding, managed: s.managedBinding });
     }
   return rows;
 }
@@ -271,6 +271,7 @@ export async function materialize(hub: Hub, data: string, datasets: string, entr
     let s = await st.read();
     s.sourceBinding = { repo: entry.repo, folder: entry.folder, revision: entry.revision, inventory: id };
     if (projection) {
+      s.displayTitle = projection.dataset;
       s.settings = projection.settings;
       s.captionPreferences = projection.captionPreferences;
       s.managedBinding = { repo: entry.repo, key: projection.key, title: projection.dataset, baseDigest: digest };

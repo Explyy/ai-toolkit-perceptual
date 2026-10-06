@@ -17,7 +17,7 @@ import {
   validateProjection,
   syncStatus,
 } from '../src/datasetStudio/managedSync';
-import { folders, materialize } from '../src/datasetStudio/catalog';
+import { folders, materialize, nativeCatalog } from '../src/datasetStudio/catalog';
 import { defaultCaptionModel } from '../src/datasetStudio/captionModels';
 function server() {
   let serial = 1,
@@ -235,6 +235,50 @@ test('canonical root catalog still refuses foreign, changed-scope and repeated p
     await assert.rejects(hub.entries('daverave/Personal', pinned, '', true), sample.error);
     assert.equal(calls, 1);
   }
+});
+test('logical title sync changes metadata only and restores with the original canonical managed key', async () => {
+  const f = await fixture('shinra'), h = server();
+  try {
+    let s = await f.st.read();
+    assert.equal(managedProjection(s).dataset, 'shinra', 'legacy state has a canonical title fallback');
+    assert.equal((await nativeCatalog(f.datasets, f.data))[0].title, 'shinra');
+    s = await f.st.edit(s.revision, [s.images[0].id], { excluded: 1, caption: 'Saved caption' });
+    s = await f.st.captionDraft(s.revision, s.images[1].id,
+      { caption: 'Protected draft', baseRevision: s.images[1].revision }, 0);
+    await drainManaged(f.st, h.hub, Date.now() + 10000);
+    const prior = (await readOutbox(f.st))!, key = prior.key,
+      images = structuredClone(s.images), uploadCount = h.uploads.length;
+    s = await f.st.title(s.revision, 'eleonora ghostwell');
+    assert.equal(s.dataset, 'shinra');
+    assert.equal(managedProjection(s).key, key);
+    assert.equal(managedProjection(s).dataset, 'eleonora ghostwell');
+    for (const invalid of ['', ' padded ', 'unsafe\nname', 'unsafe\u0080name', 'unsafe\u0085name', 'unsafe\u009fname'])
+      assert.throws(() => validateProjection({ ...managedProjection(s), dataset: invalid }), /title/);
+    assert.deepEqual(s.images, images);
+    const pending = (await readOutbox(f.st))!;
+    assert.equal(pending.baseDigest, prior.baseDigest);
+    assert.notEqual(pending.desired, prior.desired);
+    await drainManaged(f.st, h.hub, Date.now() + 10000);
+    assert.equal(h.uploads.slice(uploadCount).filter(x => x.includes('/blobs/')).length, 0);
+    assert.equal((await readOutbox(f.st))!.phase, 'synced');
+    const entry = (await folders(h.hub, 'daverave/Personal')).find(x => x.kind === 'managed' && x.key === key)!;
+    const imported = await materialize(h.hub, f.data, f.datasets, entry);
+    const st = await new StudioStore(f.data, f.datasets, imported.name).init(), restored = await st.read();
+    assert.notEqual(restored.dataset, 'shinra', 'restored folder remains collision-safe');
+    assert.equal(restored.displayTitle, 'eleonora ghostwell');
+    assert.equal(managedProjection(restored).key, key);
+    assert.equal(managedProjection(restored).dataset, 'eleonora ghostwell');
+    assert.deepEqual(restored.images.map(x => [x.sha, x.caption, x.captionDraft, x.excluded]),
+      images.map(x => [x.sha, x.caption, x.captionDraft, x.excluded]));
+    const local = await nativeCatalog(f.datasets, f.data);
+    assert.equal(local.find(x => x.name === 'shinra')!.title, 'eleonora ghostwell');
+    assert.equal(local.find(x => x.name === imported.name)!.title, 'eleonora ghostwell');
+    const priorBinding = structuredClone(restored.managedBinding);
+    const retitled = await st.title(restored.revision, 'Second logical title');
+    assert.deepEqual(retitled.managedBinding, priorBinding);
+    assert.equal(managedProjection(retitled).key, key);
+    assert.equal(managedProjection(retitled).dataset, 'Second logical title');
+  } finally { await f.cleanup(); }
 });
 test('original pixels, saved captions/drafts/preferences/manual review restore; caption edit uploads no unchanged pixels', async () => {
   const f = await fixture(),

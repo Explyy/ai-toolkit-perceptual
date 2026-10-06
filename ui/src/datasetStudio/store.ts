@@ -111,6 +111,7 @@ export type State = {
   captionPreferencesRevision?: number;
   revision: number;
   dataset: string;
+  displayTitle?: string;
   images: Image[];
   settings: Settings;
   templates: Template[];
@@ -118,6 +119,11 @@ export type State = {
   jobs: JobLink[];
 };
 export const hash = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
+export function datasetTitle(value: unknown) {
+  const title = text(value, 128);
+  ensure(title.length > 0 && title.trim() === title && !/\p{Cc}/u.test(title), 'Invalid dataset title');
+  return title;
+}
 export function datasetName(value: unknown) {
   const name = text(value, 128);
   ensure(
@@ -366,6 +372,10 @@ export class StudioStore {
     const bytes = await fs.readFile(file);
     ensure(hash(bytes) === image.sha, 'Original image changed; refresh before continuing', 409);
     return bytes;
+  }
+  async title(rev: number, value: unknown) {
+    const title = datasetTitle(value);
+    return this.mutate(rev, s => { s.displayTitle = title; });
   }
   async edit(rev: number, ids: string[], patch: any) {
     ensure(
